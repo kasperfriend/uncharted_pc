@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "common/bit_array.h"
+#include "video_core/buffer_cache/region_definitions.h"
 
 namespace {
 
@@ -212,6 +213,57 @@ void Exercise(unsigned seed) {
     }
 }
 
+/// The page masks the buffer cache's region manager builds (region_definitions.h), against the
+/// arithmetic they have to mean. The write mask is a plain XOR of "CPU wrote" and "CPU may write";
+/// complementing it instead (the tempting symmetry with the read mask) marks every page that did
+/// not change, which drifts the page manager's watcher counts until an unprotect finds a page with
+/// no watcher and the GPU library stops with "Not enough watchers". Nothing else in the port
+/// exercised that formula, so it is pinned here.
+void CheckRegionManagerMasks(unsigned seed) {
+    using Bits = VideoCore::RegionBits;
+    static_assert(Bits{}.Size() == 1024, "RegionBits is a 4 MiB region of 4 KiB pages");
+    constexpr std::size_t N = 1024;
+    std::mt19937 rng(seed);
+    Bits gpu, readable, cpu, writeable;
+    Reference gpu_ref(N), readable_ref(N), cpu_ref(N), writeable_ref(N);
+    for (int k = 0; k < 24; ++k) {
+        const std::size_t first = rng() % N;
+        const std::size_t last = std::min<std::size_t>(N, first + rng() % 200);
+        const int target = rng() % 4;
+        Bits* bits = target == 0 ? &gpu : target == 1 ? &readable : target == 2 ? &cpu : &writeable;
+        Reference* ref = target == 0   ? &gpu_ref
+                         : target == 1 ? &readable_ref
+                         : target == 2 ? &cpu_ref
+                                       : &writeable_ref;
+        if (rng() & 1) {
+            bits->SetRange(first, last);
+            ref->SetRange(first, last);
+        } else {
+            bits->UnsetRange(first, last);
+            ref->UnsetRange(first, last);
+        }
+    }
+    const Bits read_mask = VideoCore::ProtectionChangeMask(true, gpu, readable, cpu, writeable);
+    const Bits write_mask = VideoCore::ProtectionChangeMask(false, gpu, readable, cpu, writeable);
+    const Bits window_mask = VideoCore::WriteFaultWindowMask(gpu, writeable);
+    for (std::size_t i = 0; i < N; i += 1 + rng() % 3) {
+        const bool g = gpu_ref.Get(i), r = readable_ref.Get(i);
+        const bool c = cpu_ref.Get(i), w = writeable_ref.Get(i);
+        CHECK(read_mask.Get(i) == !(g ^ r));   // ~(gpu ^ readable)
+        CHECK(write_mask.Get(i) == (c ^ w));   // cpu ^ writeable, NOT ~(cpu ^ writeable)
+        CHECK(window_mask.Get(i) == !(g || w)); // ~(gpu | writeable)
+    }
+    // The whole arrays, not only the sampled bits.
+    CHECK(write_mask == (cpu ^ writeable));
+    CHECK(!(write_mask == Bits::NotXor(cpu, writeable)));
+    CHECK(read_mask == (~gpu ^ readable));
+    CHECK(window_mask == ~(gpu | writeable));
+    // "Nothing changed" must come back empty: that early exit is on the hot path.
+    CHECK(VideoCore::ProtectionChangeMask(false, gpu, readable, cpu, cpu).None());
+    CHECK(VideoCore::ProtectionChangeMask(true, gpu, readable, cpu, writeable).None() ==
+          (gpu == readable));
+}
+
 } // namespace
 
 int main() {
@@ -227,6 +279,9 @@ int main() {
         Exercise<64>(seed);    // one word
         Exercise<128>(seed);   // two
         Exercise<1024>(seed);  // NUM_PAGES_PER_REGION: the buffer cache's RegionBits
+    }
+    for (unsigned seed = 1; seed <= 8; ++seed) {
+        CheckRegionManagerMasks(seed);
     }
     if (failures != 0) {
         std::printf("%d failures\n", failures);

@@ -25,6 +25,25 @@ enum class Type {
 
 using RegionBits = Common::BitArray<NUM_PAGES_PER_REGION>;
 
+/// bbport: the pages whose protection has to follow a change of the tracked bits
+/// (RegionManager::UpdateProtection). The read mask is the complement of the difference
+/// (~(gpu ^ readable)); the write mask is the *plain* difference (cpu ^ writeable) and must not
+/// be complemented: complementing it marks every page that did not change, the page manager's
+/// watcher counts then drift and an unprotect finds a page without a watcher ("Not enough
+/// watchers" in page_manager.cpp). Kept here as a named function so tests/test_bit_array.cpp can
+/// check it against a scalar reference.
+inline RegionBits ProtectionChangeMask(bool is_read, const RegionBits& gpu,
+                                       const RegionBits& readable, const RegionBits& cpu,
+                                       const RegionBits& writeable) {
+    return is_read ? RegionBits::NotXor(gpu, readable) : cpu ^ writeable;
+}
+
+/// bbport: pages of a write-fault window that can be unprotected at once: writable by the CPU
+/// already and holding no GPU-written data (RegionManager::ExtendWriteFault).
+inline RegionBits WriteFaultWindowMask(const RegionBits& gpu, const RegionBits& writeable) {
+    return RegionBits::NotOr(gpu, writeable);
+}
+
 /// bbport: guest flips so far (Rasterizer::OnGuestFlip); the age of GPU data in pages.
 inline std::atomic<u32> g_guest_frames{0};
 

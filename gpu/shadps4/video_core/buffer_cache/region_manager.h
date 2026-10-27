@@ -160,7 +160,7 @@ public:
         if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
             return;
         }
-        RegionBits add(RegionBits::NotOr(gpu, writeable), start_page, end_page);
+        RegionBits add(WriteFaultWindowMask(gpu, writeable), start_page, end_page);
         if (add.None()) {
             return;
         }
@@ -247,9 +247,9 @@ private:
     template <bool track, bool is_read>
     void UpdateProtection() {
         RENDERER_TRACE;
-        // bbport: one pass over the words instead of a temporary ~gpu (or cpu) copy and an XOR.
-        RegionBits mask = is_read ? RegionBits::NotXor(gpu, readable)
-                                  : RegionBits::NotXor(cpu, writeable);
+        // bbport: the read mask in one pass over the words instead of a temporary ~gpu copy and
+        // an XOR; the write mask is a plain XOR (see ProtectionChangeMask for why the two differ).
+        RegionBits mask = ProtectionChangeMask(is_read, gpu, readable, cpu, writeable);
         if (mask.None()) {
             return;
         }

@@ -219,6 +219,17 @@ hottest data structures; none of them was indexed.
   independent of where a caller starts and stops, so a packet split differently in two places
   still hashes the same.
 
+- **What that walk must not do (a fixed regression).** The region manager's write mask was
+  briefly rewritten as the fused `~(cpu ^ writeable)` to match the read mask's `~(gpu ^ readable)`
+  form. The two are not symmetric: the read mask *is* the complement of the difference, the write
+  mask is the plain difference. Complementing it marked every page that had not changed, so the
+  page manager's watcher counts drifted and an unprotect eventually found a page with no watcher —
+  the GPU library stopped with `page_manager.cpp: Not enough watchers` on the first seconds of a
+  launch. Both masks now live in `region_definitions.h` as named functions, and
+  `tests/test_bit_array.cpp` checks each against the arithmetic it has to mean (the test fails with
+  4163 checks on the inverted form), which is the part the bit-array tests alone never covered:
+  they verified `NotXor` against its own definition, not against the call site.
+
 - **Blocks that only the game build sees.** `tests/ci` now compiles the runtime with the port's
   own `-O3 -Werror` and instruction set, which is where two Linux-only breakages were hiding:
   a thread-priority helper that only Windows uses (`-Wunused-function`) and an `snprintf` into a
