@@ -35,13 +35,51 @@ MINGW*|MSYS*)
     pgo_dir=$(cygpath -w "$PWD/pgo" 2>/dev/null || printf '%s' "$PWD/pgo")
     # Extra CMake options (CI passes ccache here): BB_CMAKE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache".
     read -r -a extra_cmake <<< "${BB_CMAKE_ARGS:-}"
-    if ! cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-        -DBB_ARCH="${BB_ARCH:-avx}" -DBB_LTO="${BB_LTO:-THIN}" -DBB_PGO="$pgo" \
-        -DBB_PGO_DIR="$pgo_dir" -DBB_FRAME_POINTERS="${BB_FRAME_POINTERS:-ON}" \
-        "${extra_cmake[@]}" \
-        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ > out/gpu-configure.log 2>&1; then
+    # With a compiler cache the compiler is named by its mixed form ("D:/.../clang++.exe"): a
+    # POSIX ccache can stat that, but treats a name with backslashes only as a bare name to look
+    # up in PATH and exits. Without a cache the plain tool names are enough.
+    cc_compiler=clang
+    cxx_compiler=clang++
+    if [[ ${BB_CMAKE_ARGS:-} == *COMPILER_LAUNCHER* ]] && command -v cygpath >/dev/null; then
+        cc_compiler=$(cygpath -m "$(command -v clang)" 2>/dev/null || echo clang)
+        cxx_compiler=$(cygpath -m "$(command -v clang++)" 2>/dev/null || echo clang++)
+    fi
+    configure_gpu() {
+        cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBB_ARCH="${BB_ARCH:-avx}" -DBB_LTO="${BB_LTO:-THIN}" -DBB_PGO="$pgo" \
+            -DBB_PGO_DIR="$pgo_dir" -DBB_FRAME_POINTERS="${BB_FRAME_POINTERS:-ON}" \
+            "${extra_cmake[@]}" \
+            -DCMAKE_C_COMPILER="$cc_compiler" -DCMAKE_CXX_COMPILER="$cxx_compiler" \
+            > out/gpu-configure.log 2>&1
+    }
+    if ! configure_gpu; then
         tail -40 out/gpu-configure.log >&2
         echo 'CMake configure failed (full log: out/gpu-configure.log)' >&2; exit 1
+    fi
+    # A compiler cache (ccache, passed in BB_CMAKE_ARGS) is only useful if it can start the
+    # compiler CMake actually records: a POSIX ccache treats "D:\...\clang++.exe" as a bare name
+    # and searches PATH for it, and a shell wrapper around it is not something ninja can start.
+    # Probe the recorded compiler once and configure again without the launcher if it fails, so a
+    # cache problem can never fail the build.
+    if [[ ${BB_CMAKE_ARGS:-} == *COMPILER_LAUNCHER* ]]; then
+        recorded_cxx=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=\(.*\)$/\1/p' out/gpu/CMakeCache.txt | head -1)
+        probe_dir=$(mktemp -d)
+        printf 'int bbprobe;\n' > "$probe_dir/p.c"
+        if [[ -z $recorded_cxx ]] || ! ccache "$recorded_cxx" -c "$probe_dir/p.c" -o "$probe_dir/p.o" >/dev/null 2>&1; then
+            echo 'ccache cannot start the compiler CMake recorded; building without a compiler cache'
+            kept=()
+            for arg in "${extra_cmake[@]}"; do
+                [[ $arg == -DCMAKE_C_COMPILER_LAUNCHER=* || $arg == -DCMAKE_CXX_COMPILER_LAUNCHER=* ]] || kept+=("$arg")
+            done
+            extra_cmake=("${kept[@]}")
+            extra_cmake+=(-DCMAKE_C_COMPILER_LAUNCHER= -DCMAKE_CXX_COMPILER_LAUNCHER=)
+            if ! configure_gpu; then
+                tail -40 out/gpu-configure.log >&2
+                echo 'CMake configure failed (full log: out/gpu-configure.log)' >&2; exit 1
+            fi
+        else
+            echo "Compiler cache: ccache ($(ccache --version | head -1))"
+        fi
     fi
     echo "GPU library and loader: ${BB_ARCH:-avx} code generation, LTO ${BB_LTO:-THIN}, PGO $pgo"
     if ! ninja -C out/gpu bb-probe bb-gpu-capabilities bb-play > out/gpu-build.log 2>&1; then
