@@ -64,7 +64,18 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # A tag that does not exist yet is created at this commit by the release step, so build the
+      # current ref for it; an existing tag is rebuilt exactly, which is what a re-release needs.
+      - name: Which commit to build
+        shell: bash
+        run: |
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+              echo "Building the existing tag ${TAG} at $(git rev-parse --short "${TAG}^{commit}")"
+              git checkout --force --detach "refs/tags/${TAG}"
+          else
+              echo "Building $(git rev-parse --short HEAD) on ${GITHUB_REF_NAME:-${GITHUB_REF}}; the tag ${TAG} will be created here"
+          fi
 
       - name: Build
         id: build
