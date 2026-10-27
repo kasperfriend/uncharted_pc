@@ -127,8 +127,8 @@ jobs:
                   printf '%s\n\n' "$NOTES"
               fi
               printf '**Windows package** (`uncharted-windows.zip`): unpack it anywhere and run `Uncharted.exe`. '
-              printf 'A Vulkan 1.3 driver is required; the port needs a 64-bit x86 CPU with AVX (Sandy Bridge and '
-              printf 'newer, Bulldozer and newer). `SHA-256` of the download is in `uncharted-windows.zip.sha256`.\n\n'
+              printf 'A Vulkan 1.3 driver is required, and a 64-bit x86 CPU with AVX and F16C. '
+              printf '`SHA-256` of the download is in `uncharted-windows.zip.sha256`.\n\n'
               printf 'Built from `%s` with the MSYS2 CLANG64 toolchain.\n' "$(git rev-parse --short HEAD)"
           } > out/release/notes.md
           cat out/release/notes.md
