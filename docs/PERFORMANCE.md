@@ -167,6 +167,17 @@ hottest data structures; none of them was indexed.
   | 64 | 20.7 ns | 1.1 ns | 19× |
   | 128 | 58.4 ns | 0.6 ns | 94× |
 
+- **Blocking waits.** A blocking wait on a guest semaphore used to create and destroy a
+  condition variable (plus its attribute object and clock setting) around *every* wait; on
+  winpthreads those calls are not cheap. A thread blocks on one semaphore at a time, so each
+  thread now keeps one condition variable, created on its first blocking wait and reused after
+  that, and the FIFO list appends at a tail pointer instead of walking to the end (job queues
+  keep many waiters). Waiter bookkeeping keeps the FIFO semantics exactly: the waiter still owns
+  its slot, and only that slot is signalled. `tests/test_runtime_sync.c` covers timeouts, cancel,
+  delete-with-waiter and concurrent readers; 8 waiters and 2 signallers over 4 semaphores with
+  mixed timeouts and signals leave no waiter behind. The setup cost removed from each wait is the
+  `13.2 ns` line of `out/runtime-bench` (it is paid once per thread now).
+
 - **Region cache.** `runtime_memory.c` keeps a per-thread cache of recently resolved guest
   mappings (`cached_region`), consulted for every GPU-side `clamp`/`region`/`is_mapped` query —
   that is, for every buffer and texture binding. It was 8 entries probed one by one and replaced

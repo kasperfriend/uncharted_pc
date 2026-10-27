@@ -322,7 +322,7 @@ int main(void) {
     }
 
     printf("Blocking wait:\n");
-    printf("  condition variable created+destroyed per wait: %6.1f ns\n",
+    printf("  condition variable set up per wait, as before: %6.1f ns (now once per thread)\n",
            best_of(5, bench_cond_setup));
     printf("  wakeup handoff between two threads:            %6.1f ns\n",
            best_of(3, bench_ping_pong));
