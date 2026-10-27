@@ -59,9 +59,39 @@ runs:
         export CCACHE_DIR="$(cygpath -u "$GITHUB_WORKSPACE")/.ccache"
         mkdir -p "$CCACHE_DIR"
         ccache --max-size=3G
+        # CMake hands the launcher the compiler as an absolute Windows path ("D:\...\clang++.exe").
+        # A POSIX ccache only looks for a directory separator "/", so such a path is treated as a bare
+        # name and searched in PATH, which fails the build. Probe the exact form CMake will use and,
+        # if it fails, hand ccache a wrapper that rewrites the path into POSIX form; if that fails
+        # too, build without a compiler cache rather than fail.
+        launcher=""
+        probe="$(mktemp -d)"
+        printf 'int probe;\n' > "$probe/p.c"
+        cc_win="$(cygpath -w "$(command -v clang++)")"
+        if ccache "$cc_win" -c "$probe/p.c" -o "$probe/p.o" >/dev/null 2>&1; then
+          launcher="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          echo "ccache is used directly"
+        else
+          wrapper="$CCACHE_DIR/ccache-posix.sh"
+          {
+            echo '#!/usr/bin/env bash'
+            echo '# Rewrite the Windows-form compiler path CMake passes into POSIX form, so a POSIX'
+            echo '# ccache can stat it instead of searching PATH for the literal path.'
+            echo 'comp="$(cygpath -u "$1" 2>/dev/null || printf %s "$1")"'
+            echo 'shift'
+            echo 'exec ccache "$comp" "$@"'
+          } > "$wrapper"
+          chmod +x "$wrapper"
+          if bash "$wrapper" "$cc_win" -c "$probe/p.c" -o "$probe/p.o" >/dev/null 2>&1; then
+            launcher="-DCMAKE_C_COMPILER_LAUNCHER=$wrapper -DCMAKE_CXX_COMPILER_LAUNCHER=$wrapper"
+            echo "ccache is used through a path-rewriting wrapper"
+          else
+            echo "ccache cannot reach the compiler; building without a compiler cache"
+          fi
+        fi
         {
           echo "CCACHE_DIR=$CCACHE_DIR"
-          echo "BB_CMAKE_ARGS=-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          echo "BB_CMAKE_ARGS=$launcher"
         } >> "$GITHUB_ENV"
 
     - name: Build
