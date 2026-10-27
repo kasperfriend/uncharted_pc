@@ -72,7 +72,22 @@ runs:
         if [[ -n ${BB_CMAKE_ARGS_EXTRA// /} ]]; then
           export BB_CMAKE_ARGS="${BB_CMAKE_ARGS:-} $BB_CMAKE_ARGS_EXTRA"
         fi
-        bash build.sh
+        set +e
+        bash build.sh 2>&1 | tee build.log
+        status=${PIPESTATUS[0]}
+        set -e
+        if [[ $status -ne 0 ]]; then
+          # The full log is only reachable through a signed URL, so put what broke into the
+          # annotations of this run (and the tail into the job summary) before failing.
+          summary="$GITHUB_STEP_SUMMARY"
+          { echo '### build.sh failed'; echo '```'; tail -n 40 build.log; echo '```'; } >> "$summary" || true
+          emit() { printf '::error title=build.sh::%s\n' "${1//$'\r'/}" ; }
+          grep -m 12 -E 'error:|error C[0-9]|CMake Error|fatal error|undefined reference|FAILED:|No such file|cannot find|does not name a type|expected' build.log \
+            | while IFS= read -r line; do emit "${line:0:900}"; done || true
+          [[ -f out/gpu-build.log ]] && { tail -n 15 out/gpu-build.log | while IFS= read -r line; do emit "ninja: ${line:0:900}"; done; } || true
+          emit "build.sh exited with status $status"
+          exit 1
+        fi
 
     - name: Report the build configuration
       shell: msys2 {0}

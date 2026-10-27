@@ -35,11 +35,14 @@ MINGW*|MSYS*)
     pgo_dir=$(cygpath -w "$PWD/pgo" 2>/dev/null || printf '%s' "$PWD/pgo")
     # Extra CMake options (CI passes ccache here): BB_CMAKE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache".
     read -r -a extra_cmake <<< "${BB_CMAKE_ARGS:-}"
-    cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    if ! cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DBB_ARCH="${BB_ARCH:-avx}" -DBB_LTO="${BB_LTO:-THIN}" -DBB_PGO="$pgo" \
         -DBB_PGO_DIR="$pgo_dir" -DBB_FRAME_POINTERS="${BB_FRAME_POINTERS:-ON}" \
         "${extra_cmake[@]}" \
-        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ >/dev/null
+        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ > out/gpu-configure.log 2>&1; then
+        tail -40 out/gpu-configure.log >&2
+        echo 'CMake configure failed (full log: out/gpu-configure.log)' >&2; exit 1
+    fi
     echo "GPU library and loader: ${BB_ARCH:-avx} code generation, LTO ${BB_LTO:-THIN}, PGO $pgo"
     if ! ninja -C out/gpu bb-probe bb-gpu-capabilities bb-play > out/gpu-build.log 2>&1; then
         grep -v '^\[' out/gpu-build.log | tail -40 >&2
@@ -113,10 +116,13 @@ for patch in gpu/patches/fsr-vulkan/*.patch; do
     fi
 done
 read -r -a extra_cmake <<< "${BB_CMAKE_ARGS:-}"
-cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
+if ! cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
     -DBB_ARCH="${BB_ARCH:-avx}" -DBB_LTO="${BB_LTO:-THIN}" -DBB_PGO_DIR="$PWD/pgo" \
     -DBB_FRAME_POINTERS="${BB_FRAME_POINTERS:-ON}" "${extra_cmake[@]}" \
-    -DVulkan_INCLUDE_DIR="$vulkan_headers" >/dev/null
+    -DVulkan_INCLUDE_DIR="$vulkan_headers" > out/gpu-configure.log 2>&1; then
+    tail -40 out/gpu-configure.log >&2
+    echo 'CMake configure failed (full log: out/gpu-configure.log)' >&2; exit 1
+fi
 echo "GPU library: PGO $pgo, LTO ${BB_LTO:-THIN}, code generation ${BB_ARCH:-avx}"
 # A failed GPU build must stop here: an older libbbgpu.so would otherwise be used silently.
 if ! ninja ${BB_JOBS:+-j"$BB_JOBS"} -C out/gpu bbgpu > out/gpu-build.log 2>&1; then
