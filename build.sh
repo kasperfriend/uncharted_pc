@@ -41,9 +41,25 @@ MINGW*|MSYS*)
     cc_compiler=clang
     cxx_compiler=clang++
     if [[ ${BB_CMAKE_ARGS:-} == *COMPILER_LAUNCHER* ]] && command -v cygpath >/dev/null; then
-        cc_compiler=$(cygpath -m "$(command -v clang)" 2>/dev/null || echo clang)
-        cxx_compiler=$(cygpath -m "$(command -v clang++)" 2>/dev/null || echo clang++)
+        # MSYS2's PATH lookup answers /clang64/bin/clang without the extension CMake needs.
+        cc_path=$(command -v clang); cxx_path=$(command -v clang++)
+        [[ $cc_path == *.exe ]] || cc_path=$cc_path.exe
+        [[ $cxx_path == *.exe ]] || cxx_path=$cxx_path.exe
+        cc_compiler=$(cygpath -m "$cc_path" 2>/dev/null || echo clang)
+        cxx_compiler=$(cygpath -m "$cxx_path" 2>/dev/null || echo clang++)
     fi
+    # Drops the compiler-cache launcher from the CMake arguments (see the probe below).
+    without_launcher() {
+        kept=()
+        for arg in "${extra_cmake[@]}"; do
+            [[ $arg == -DCMAKE_C_COMPILER_LAUNCHER=* || $arg == -DCMAKE_CXX_COMPILER_LAUNCHER=* ]] || kept+=("$arg")
+        done
+        extra_cmake=("${kept[@]}")
+        extra_cmake+=(-DCMAKE_C_COMPILER_LAUNCHER= -DCMAKE_CXX_COMPILER_LAUNCHER=)
+        cc_compiler=clang
+        cxx_compiler=clang++
+        launcher_dropped=1
+    }
     configure_gpu() {
         cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DBB_ARCH="${BB_ARCH:-avx}" -DBB_LTO="${BB_LTO:-THIN}" -DBB_PGO="$pgo" \
@@ -53,26 +69,32 @@ MINGW*|MSYS*)
             > out/gpu-configure.log 2>&1
     }
     if ! configure_gpu; then
-        tail -40 out/gpu-configure.log >&2
-        echo 'CMake configure failed (full log: out/gpu-configure.log)' >&2; exit 1
+        # The compiler path form in the cache setup is the only thing that can differ from a
+        # plain configure here, so retry without it before giving up.
+        if [[ ${BB_CMAKE_ARGS:-} == *COMPILER_LAUNCHER* ]]; then
+            echo 'Configuring with the compiler cache failed; retrying without it' >&2
+            without_launcher
+            if ! configure_gpu; then
+                tail -40 out/gpu-configure.log >&2
+                echo 'CMake configure failed (full log: out/gpu-configure.log)' >&2; exit 1
+            fi
+        else
+            tail -40 out/gpu-configure.log >&2
+            echo 'CMake configure failed (full log: out/gpu-configure.log)' >&2; exit 1
+        fi
     fi
     # A compiler cache (ccache, passed in BB_CMAKE_ARGS) is only useful if it can start the
     # compiler CMake actually records: a POSIX ccache treats "D:\...\clang++.exe" as a bare name
     # and searches PATH for it, and a shell wrapper around it is not something ninja can start.
     # Probe the recorded compiler once and configure again without the launcher if it fails, so a
     # cache problem can never fail the build.
-    if [[ ${BB_CMAKE_ARGS:-} == *COMPILER_LAUNCHER* ]]; then
+    if [[ ${BB_CMAKE_ARGS:-} == *COMPILER_LAUNCHER* && -z ${launcher_dropped:-} ]]; then
         recorded_cxx=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=\(.*\)$/\1/p' out/gpu/CMakeCache.txt | head -1)
         probe_dir=$(mktemp -d)
         printf 'int bbprobe;\n' > "$probe_dir/p.c"
         if [[ -z $recorded_cxx ]] || ! ccache "$recorded_cxx" -c "$probe_dir/p.c" -o "$probe_dir/p.o" >/dev/null 2>&1; then
             echo 'ccache cannot start the compiler CMake recorded; building without a compiler cache'
-            kept=()
-            for arg in "${extra_cmake[@]}"; do
-                [[ $arg == -DCMAKE_C_COMPILER_LAUNCHER=* || $arg == -DCMAKE_CXX_COMPILER_LAUNCHER=* ]] || kept+=("$arg")
-            done
-            extra_cmake=("${kept[@]}")
-            extra_cmake+=(-DCMAKE_C_COMPILER_LAUNCHER= -DCMAKE_CXX_COMPILER_LAUNCHER=)
+            without_launcher
             if ! configure_gpu; then
                 tail -40 out/gpu-configure.log >&2
                 echo 'CMake configure failed (full log: out/gpu-configure.log)' >&2; exit 1

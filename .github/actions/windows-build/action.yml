@@ -86,9 +86,11 @@ runs:
           summary="$GITHUB_STEP_SUMMARY"
           { echo '### build.sh failed'; echo '```'; tail -n 40 build.log; echo '```'; } >> "$summary" || true
           emit() { printf '::error title=build.sh::%s\n' "${1//$'\r'/}" ; }
-          grep -m 12 -E 'error:|error C[0-9]|CMake Error|fatal error|undefined reference|FAILED:|No such file|cannot find|does not name a type|expected' build.log \
-            | while IFS= read -r line; do emit "${line:0:900}"; done || true
-          [[ -f out/gpu-build.log ]] && { tail -n 15 out/gpu-build.log | while IFS= read -r line; do emit "ninja: ${line:0:900}"; done; } || true
+          # The matching line plus what follows it: CMake and compiler messages continue on the
+          # next lines, and that continuation is where the actual reason usually is.
+          grep -A3 -m 5 -E 'error:|error C[0-9]|CMake Error|fatal error|undefined reference|FAILED:|No such file|cannot find|does not name a type|expected' build.log \
+            | grep -v '^--$' | while IFS= read -r line; do emit "${line:0:900}"; done || true
+          [[ -f out/gpu-build.log ]] && { tail -n 12 out/gpu-build.log | while IFS= read -r line; do emit "ninja: ${line:0:900}"; done; } || true
           emit "build.sh exited with status $status"
           exit 1
         fi
