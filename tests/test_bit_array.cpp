@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: Common::BitArray against a scalar reference implementation.
+//
+// The buffer cache asks the bit array for the ranges of the pages a buffer covers
+// (FirstRangeFrom/LastRangeFrom) for every upload, and those scans have a vector path: 4 words
+// per instruction with AVX2, 2 words with SSE2 (the cores this port targets have no AVX2).
+// Both are checked here against the plain word loops, over random patterns, every range
+// boundary and every starting position -- the same code must give the same answer at -O0 and
+// -O3, with and without AVX2.
+#include <algorithm>
+#include <cstdio>
+#include <random>
+#include <utility>
+#include <vector>
+
+#include "common/bit_array.h"
+
+namespace {
+
+int failures = 0;
+
+void Check(bool ok, const char* what, int line) {
+    if (!ok) {
+        std::printf("FAIL line %d: %s\n", line, what);
+        ++failures;
+    }
+}
+#define CHECK(condition) Check((condition), #condition, __LINE__)
+
+/// The bit array's answer, computed the slow way.
+class Reference {
+public:
+    explicit Reference(std::size_t size) : bits(size, false) {}
+
+    void Set(std::size_t at) {
+        bits[at] = true;
+    }
+    void SetRange(std::size_t first, std::size_t last) {
+        for (std::size_t i = first; i < last; ++i) {
+            bits[i] = true;
+        }
+    }
+    void UnsetRange(std::size_t first, std::size_t last) {
+        for (std::size_t i = first; i < last; ++i) {
+            bits[i] = false;
+        }
+    }
+    void Clear() {
+        std::fill(bits.begin(), bits.end(), false);
+    }
+    void Fill() {
+        std::fill(bits.begin(), bits.end(), true);
+    }
+    bool Get(std::size_t at) const {
+        return bits[at];
+    }
+    bool Any(std::size_t first, std::size_t last) const {
+        for (std::size_t i = first; i < last; ++i) {
+            if (bits[i]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    bool None() const {
+        return !Any(0, bits.size());
+    }
+    std::size_t Ones() const {
+        return static_cast<std::size_t>(std::count(bits.begin(), bits.end(), true));
+    }
+    std::pair<std::size_t, std::size_t> First(std::size_t from) const {
+        std::size_t at = from;
+        while (at < bits.size() && !bits[at]) {
+            ++at;
+        }
+        if (at == bits.size()) {
+            return {bits.size(), bits.size()};
+        }
+        std::size_t end = at;
+        while (end < bits.size() && bits[end]) {
+            ++end;
+        }
+        return {at, end};
+    }
+    std::pair<std::size_t, std::size_t> Last(std::size_t end) const {
+        if (end > bits.size()) {
+            end = bits.size();
+        }
+        if (end == 0) {
+            return {0, 0};
+        }
+        std::ptrdiff_t at = static_cast<std::ptrdiff_t>(end) - 1;
+        while (at >= 0 && !bits[at]) {
+            --at;
+        }
+        if (at < 0) {
+            return {0, 0};
+        }
+        std::ptrdiff_t first = at;
+        while (first >= 0 && bits[first]) {
+            --first;
+        }
+        return {static_cast<std::size_t>(first + 1), static_cast<std::size_t>(at + 1)};
+    }
+
+private:
+    std::vector<bool> bits;
+};
+
+/// A random mix of operations, then every query against the reference.
+template <std::size_t N>
+void Exercise(unsigned seed) {
+    std::mt19937 rng(seed);
+    Common::BitArray<N> array;
+    Reference reference(N);
+    for (int round = 0; round < 60; ++round) {
+        const std::size_t first = rng() % N;
+        const std::size_t last = std::min<std::size_t>(N, first + 1 + rng() % (N / 2));
+        switch (rng() % 5) {
+        case 0:
+            array.SetRange(first, last);
+            reference.SetRange(first, last);
+            break;
+        case 1:
+            array.UnsetRange(first, last);
+            reference.UnsetRange(first, last);
+            break;
+        case 2:
+            array.Clear();
+            reference.Clear();
+            for (int k = 0; k < 8; ++k) {
+                const std::size_t a = rng() % N;
+                const std::size_t b = std::min<std::size_t>(N, a + 1 + rng() % 96);
+                array.SetRange(a, b);
+                reference.SetRange(a, b);
+            }
+            break;
+        case 3:
+            array.Fill();
+            reference.Fill();
+            break;
+        default: {
+            const std::size_t at = rng() % N;
+            array.Set(at);
+            reference.Set(at);
+        } break;
+        }
+        for (std::size_t i = 0; i < N; i += 1 + rng() % 5) {
+            CHECK(array.Get(i) == reference.Get(i));
+        }
+        CHECK(array.Any() == !reference.None());
+        CHECK(array.None() == reference.None());
+        for (int k = 0; k < 4; ++k) {
+            const std::size_t a = rng() % N;
+            const std::size_t b = std::min<std::size_t>(N, a + 1 + rng() % (N / 2));
+            CHECK(array.AnyInRange(a, b) == reference.Any(a, b));
+        }
+        for (int k = 0; k < 4; ++k) {
+            const std::size_t from = rng() % (N + 1);
+            CHECK(array.FirstRangeFrom(from) == reference.First(from));
+        }
+        for (int k = 0; k < 4; ++k) {
+            const std::size_t end = rng() % (N + 1);
+            CHECK(array.LastRangeFrom(end) == reference.Last(end));
+        }
+        CHECK(array.FirstRange() == reference.First(0));
+        CHECK(array.LastRange() == reference.Last(N));
+        // The iterator must visit exactly the set bits, in order.
+        std::size_t covered = 0, previous = 0;
+        for (const auto& range : array) {
+            CHECK(range.first >= previous && range.second > range.first);
+            CHECK(reference.Any(range.first, range.second));
+            covered += range.second - range.first;
+            previous = range.second;
+        }
+        CHECK(covered == reference.Ones());
+        // Copies, masking and the bitwise operators.
+        Common::BitArray<N> part(array, first, last);
+        for (std::size_t i = 0; i < N; i += 1 + rng() % 3) {
+            CHECK(part.Get(i) == (i >= first && i < last && reference.Get(i)));
+        }
+        Common::BitArray<N> whole(array, 0, N);
+        CHECK(whole == array);
+        CHECK((~array).Any() == (reference.Ones() != N));
+        Common::BitArray<N> xored = array;
+        xored ^= array;
+        CHECK(xored.None());
+    }
+}
+
+} // namespace
+
+int main() {
+#if defined(BIT_ARRAY_USE_AVX)
+    std::printf("bit array: AVX2 path, 4 words per instruction\n");
+#elif defined(BIT_ARRAY_USE_SSE)
+    std::printf("bit array: SSE2 path, 2 words per instruction\n");
+#else
+    std::printf("bit array: no vector path (scalar words)\n");
+#endif
+    for (unsigned seed = 1; seed <= 3; ++seed) {
+        Exercise<64>(seed);    // one word
+        Exercise<128>(seed);   // two
+        Exercise<1024>(seed);  // NUM_PAGES_PER_REGION: the buffer cache's RegionBits
+    }
+    if (failures != 0) {
+        std::printf("%d failures\n", failures);
+        return 1;
+    }
+    std::printf("bit array: all checks passed\n");
+    return 0;
+}

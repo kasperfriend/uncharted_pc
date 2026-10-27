@@ -20,6 +20,7 @@
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/spin_wait.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -273,13 +274,19 @@ void Scheduler::WaitDeferredSignals() {
     }
     BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
     KickRecording(true);
+    u32 spins = 0;
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
         if (VideoCore::LandingGate::Stopped()) {
             break; // shutdown: the labels waiting on the landing thread were dropped
         }
         // Helps the copy threads the signals wait for.
         BbCopy::WaitAsync();
-        std::this_thread::yield();
+        // Pause instead of a system call: the signal usually lands within a few hundred cycles,
+        // and giving the core away here costs the GPU thread a reschedule.
+        Common::CpuRelax();
+        if (!(++spins & 1023)) {
+            std::this_thread::yield();
+        }
     }
 }
 
@@ -288,8 +295,12 @@ void Scheduler::WaitHostCopies() {
         BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
         KickRecording(true);
+        u32 spins = 0;
         while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
-            std::this_thread::yield();
+            Common::CpuRelax();
+            if (!(++spins & 1023)) {
+                std::this_thread::yield();
+            }
         }
     }
     BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};

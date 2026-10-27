@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "bbport_toggles.h"
+#include "common/spin_wait.h"
 #include "common/thread.h"
 
 namespace BbCopy {
@@ -56,6 +57,7 @@ public:
             const u64 epoch = epoch_base + epochs.size() - 1;
             ++epochs.back().pending;
             ++pending;
+            in_flight.fetch_add(1, std::memory_order_relaxed);
             async_tasks.push_back({std::move(task), epoch});
         }
         cv.notify_one();
@@ -90,9 +92,12 @@ public:
             }
             if (task.run) {
                 RunAsync(task);
-            } else {
-                std::this_thread::yield();
+                continue;
             }
+            // Nothing to help with. Wait on the atomic copy counter -- with pauses, not with a
+            // syscall -- and only look at the queue (and at the callbacks that may be draining
+            // the epochs) again when the copies are done or the spin has lasted a while.
+            Common::SpinWaitShort([&] { return in_flight.load(std::memory_order_acquire) == 0; });
         }
     }
 
@@ -108,9 +113,7 @@ public:
         cv.notify_all();
         Work(*job);
         // Workers only call the task for indices below count, all done before this returns.
-        while (job->done.load(std::memory_order_acquire) < count) {
-            std::this_thread::yield();
-        }
+        Common::SpinWait([&] { return job->done.load(std::memory_order_acquire) >= count; });
         std::scoped_lock lk{mutex};
         if (current == job) {
             current.reset();
@@ -149,6 +152,7 @@ private:
         std::unique_lock lk{mutex};
         --epochs[epoch - epoch_base].pending;
         --pending;
+        in_flight.fetch_sub(1, std::memory_order_release);
         if (draining) {
             return;
         }
@@ -177,9 +181,21 @@ private:
     static void Work(Job& job) {
         const bool was = in_copy_thread;
         in_copy_thread = true;
-        for (std::size_t i; (i = job.next.fetch_add(1, std::memory_order_relaxed)) < job.count;) {
-            (*job.task)(i);
-            job.done.fetch_add(1, std::memory_order_release);
+        // A claimed run of items per atomic operation: the counters of a parallel copy are
+        // shared by the caller and up to four workers, and an atomic add on them is a locked
+        // instruction whose cache line bounces between cores. Items are chunks of up to
+        // 512 KiB (MemoryManager::CopySparseMemory), so a run of 4 keeps the load balanced.
+        const std::size_t run = job.count >= 8 ? 4 : 1;
+        for (;;) {
+            const std::size_t first = job.next.fetch_add(run, std::memory_order_relaxed);
+            if (first >= job.count) {
+                break;
+            }
+            const std::size_t last = std::min(first + run, job.count);
+            for (std::size_t i = first; i < last; ++i) {
+                (*job.task)(i);
+            }
+            job.done.fetch_add(last - first, std::memory_order_release);
         }
         in_copy_thread = was;
     }
@@ -221,6 +237,9 @@ private:
     std::deque<Epoch> epochs; ///< back() is open for new copies
     u64 epoch_base = 0;       ///< epoch number of epochs.front()
     std::size_t pending = 0;
+    /// Copies started and not finished (the same count as `pending`, readable without the lock
+    /// so WaitAll() does not have to take it to notice that a copy finished).
+    std::atomic<std::size_t> in_flight{0};
     bool draining = false;
 };
 

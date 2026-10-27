@@ -64,6 +64,10 @@ SNIP(bextr64,"bextr %rdx,%rsi,%rax")
 SNIP(bextr32_mem,"bextr %ecx,(%r12),%eax")
 SNIP(bextr_same,"bextr %eax,%eax,%eax")
 SNIP(movbe_l32,"movbe (%r12),%eax")
+SNIP(movbe_l32_disp8,"movbe 8(%r12),%ecx")
+SNIP(movbe_l32_index,"movbe (%r12,%r13,4),%eax")
+SNIP(movbe_l32_disp32,"movbe 0x100(%r12),%edx")
+SNIP(movbe_l32_high,"movbe (%r12),%r10d")
 SNIP(movbe_l64,"movbe (%r12),%rax")
 SNIP(movbe_l16,"movbe (%r12),%ax")
 SNIP(movbe_s32,"movbe %ecx,8(%r12)")
@@ -74,8 +78,9 @@ SNIP(movbe_index,"movbe %r13,(%r12,%r13,8)")
 
 enum { CF=0x1, PF=0x4, AF=0x10, ZF=0x40, SF=0x80, OF=0x800, ALL=CF|PF|AF|ZF|SF|OF };
 enum { COUNT=CF|ZF, LOGIC=SF|ZF|CF|OF, BEXTR_FLAGS=ZF|CF|OF };
-/* expect: J jump at the instruction, P jump at the one before, B breakpoint, - any. rip: the
- * last instruction of the body (1) or of post (2) reads the data at +16 RIP-relative. */
+/* expect: J jump at the instruction, I rewritten in place (no MOVBE left, no jump), P jump at
+ * the one before, B breakpoint, - any. rip: the last instruction of the body (1) or of post (2)
+ * reads the data at +16 RIP-relative. */
 typedef struct {
     const char *name; const unsigned char *pre, *pre_end, *body, *body_end, *post, *post_end;
     unsigned flags; char expect; int rip;
@@ -123,7 +128,12 @@ static const Case cases[]={
     {"bextr r64",PART(none),PART(bextr64),PART(none),BEXTR_FLAGS,'J',0},
     {"bextr mem",PART(none),PART(bextr32_mem),PART(none),BEXTR_FLAGS,'J',0},
     {"bextr same",PART(none),PART(bextr_same),PART(none),BEXTR_FLAGS,'J',0},
-    {"movbe load32",PART(none),PART(movbe_l32),PART(none),ALL,'J',0},
+    {"movbe load32",PART(none),PART(movbe_l32),PART(none),ALL,'I',0},
+    {"movbe load32 disp8",PART(none),PART(movbe_l32_disp8),PART(none),ALL,'I',0},
+    {"movbe load32 index",PART(none),PART(movbe_l32_index),PART(none),ALL,'I',0},
+    {"movbe load32 disp32",PART(none),PART(movbe_l32_disp32),PART(none),ALL,'I',0},
+    /* r10d needs a REX prefix on its BSWAP too: 7 bytes, one more than the MOVBE -> thunk. */
+    {"movbe load32 r10d",PART(none),PART(movbe_l32_high),PART(none),ALL,'J',0},
     {"movbe load64",PART(none),PART(movbe_l64),PART(none),ALL,'J',0},
     {"movbe load16",PART(none),PART(movbe_l16),PART(none),ALL,'J',0},
     {"movbe store32",PART(none),PART(movbe_s32),PART(none),ALL,'J',0},
@@ -269,12 +279,25 @@ int main(void) {
 #else
     setenv("BB_CPU_PATCH","all",1);
 #endif
-    const uint64_t ranges[1][2]={{0x1000,CODE_END-0x1000}};
-    cpu_patch_image(image,IMAGE_SIZE,ranges,1);
+    /* Four contiguous ranges: the sweep runs on several threads (cpu_patch.c), and the
+     * results must be those of one thread scanning the same bytes in the same order. */
+    enum { RANGES = 4 };
+    const uint64_t span=(CODE_END-0x1000)/RANGES;
+    uint64_t ranges[RANGES][2];
+    for (int r=0;r<RANGES;++r) {
+        ranges[r][0]=0x1000+(uint64_t)r*span;
+        ranges[r][1]=r==RANGES-1 ? CODE_END-ranges[r][0] : span;
+    }
+    cpu_patch_image(image,IMAGE_SIZE,ranges,RANGES);
     for (size_t i=0;i<CASES;++i) {
         const unsigned char at_body=image[body[i]], before=image[body[i]-1];
         const char e=cases[i].expect;
-        if ((e=='J' && at_body!=0xe9) || (e=='B' && at_body!=0xcc) || (e=='P' && before!=0xe9)) {
+        /* In place: the MOVBE opcode (0f 38 f0) is gone and no jump replaced it. */
+        int movbe_left=0;
+        for (int b=0;b+2<9;++b)
+            if (image[body[i]+b]==0x0f && image[body[i]+b+1]==0x38 && image[body[i]+b+2]==0xf0) movbe_left=1;
+        if ((e=='J' && at_body!=0xe9) || (e=='B' && at_body!=0xcc) || (e=='P' && before!=0xe9) ||
+            (e=='I' && (movbe_left || at_body==0xe9))) {
             printf("FAIL %s: expected %c, found %02x (before %02x)\n",cases[i].name,e,at_body,before);
             return 1;
         }

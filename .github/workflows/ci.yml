@@ -1,0 +1,86 @@
+name: CI
+
+# Every test and build that can run without a GPU:
+#   * windows - the MSYS2 CLANG64 build players get (the shared .github/actions/windows-build),
+#     with the x86-64 code generation the port asks for (AVX, no AVX2).
+#   * host-tests - the C and C++ parts of the port with gcc on Linux: the guest instruction
+#     rewriting against the CPU's own instructions, the HLE file/content/display code, the
+#     bit-array scans on each vector path and the streaming copy, plus the launcher's tests.
+# Releases are built by .github/workflows/release.yml from this same action.
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows build (MSYS2 CLANG64)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - name: Build
+        id: build
+        uses: ./.github/actions/windows-build
+      - name: Upload the executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-executables-${{ steps.build.outputs.version }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            out/bb-probe.exe
+            out/bb-gpu-capabilities.exe
+            out/bb-play.exe
+
+  host-tests:
+    name: Host tests (Linux, gcc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential curl python3 python3-pil python3-tk
+
+      - name: Guest instructions, HLE runtime, bit array, streaming copy
+        run: bash tools/ci/linux-tests.sh
+
+      # test_mods, test_run_settings and test_launcher_stop need a built port or Windows,
+      # test_uncharted_i18n wants the launcher's new texts translated first.
+      - name: Launcher and preparation scripts
+        working-directory: tests
+        run: |
+          python3 -m unittest \
+            test_cheats test_content test_display test_launcher_cache_cleanup \
+            test_launcher_diagnostics test_launcher_input test_launcher_input_errors \
+            test_link_libc test_patches test_prepare test_probe test_runtime test_sema \
+            test_trophies test_upscaler_assets test_packaged_vulkan
+
+      - name: Logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-test-logs
+          if-no-files-found: ignore
+          path: |
+            out/tests/zydis-build.log
+            out/tests/*.log

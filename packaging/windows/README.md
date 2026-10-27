@@ -78,5 +78,11 @@ and the presented image of the next frame to `BB_DUMP_DIR` (raw 32-bit pixels), 
 works for menus and movies.
 
 Not ported: the watchdog/`--timeout` thread dumps (Linux signals), userfaultfd tracking
-(`BB_UFFD`), MangoHud, PGO (GCC flags), the GTK launcher (`launcher/bbport_launcher_win.py`, Tkinter, replaces it), and
-the `tests/` programs (several use Linux-only APIs).
+(`BB_UFFD`), MangoHud, the GTK launcher (`launcher/bbport_launcher_win.py`, Tkinter, replaces it),
+and the `tests/` programs that use Linux-only APIs (`tools/ci/linux-tests.sh` runs the rest on
+Linux; `bash build.sh --test` runs what Windows can).
+
+The build options (`BB_ARCH`, `BB_LTO`, `BB_PGO`, ...) and the optimizations behind them are in
+`docs/PERFORMANCE.md`. PGO works on Windows too: `bash tools/pgo.sh generate`, play,
+`bash tools/pgo.sh merge`, then `bash build.sh` (clang writes `pgo/bbport.profdata`). CI builds
+every push and the release workflow makes the zip: `.github/workflows/`.

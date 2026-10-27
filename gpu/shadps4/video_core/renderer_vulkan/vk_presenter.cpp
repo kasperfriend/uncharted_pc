@@ -6,6 +6,7 @@
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
+#include "common/spin_wait.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
@@ -742,14 +743,20 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         generated = 0;
     }
     const auto wait_until = [](std::chrono::steady_clock::time_point at) {
-        // The system sleep is coarse: sleep most of the way, then spin.
+        // The system sleep is coarse: sleep most of the way, then spin. The spin is pauses with
+        // the clock read one time in 32: a yield per iteration gave the core away (and asked
+        // the scheduler) hundreds of times in the last microsecond of every frame.
         constexpr auto spin = std::chrono::microseconds(1500);
         const auto now = std::chrono::steady_clock::now();
         if (at - now > spin) {
             std::this_thread::sleep_for(at - now - spin);
         }
+        u32 pauses = 0;
         while (std::chrono::steady_clock::now() < at) {
-            std::this_thread::yield();
+            Common::CpuRelax();
+            if (!(++pauses & 32)) {
+                std::this_thread::yield();
+            }
         }
     };
     u32 shown = 0;

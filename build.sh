@@ -3,7 +3,7 @@ set -euo pipefail
 cd -- "$(dirname -- "$0")"
 mkdir -p out
 # Windows: MSYS2 CLANG64 (packages in packaging/windows/README.md). The GPU library is static
-# there and CMake links bb-probe.exe as well; no PGO (GCC-only flags), LTO off by default.
+# there and CMake links bb-probe.exe as well (ThinLTO through lld, PGO through tools/pgo.sh).
 case $(uname -s) in
 MINGW*|MSYS*)
     # shellcheck source=msys2-env.sh
@@ -20,9 +20,27 @@ MINGW*|MSYS*)
             git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
         fi
     done
-    cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO=off \
-        -DBB_LTO="${BB_LTO:-OFF}" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ >/dev/null
-    echo "GPU library and loader: LTO ${BB_LTO:-OFF}"
+    # Host code generation: BB_ARCH (default avx: every PC the game runs on, and no AVX2),
+    # BB_LTO (default THIN: ThinLTO through lld) and BB_PGO (generate, then use after
+    # tools/pgo.sh merged the profile; it also builds the loader with it).
+    pgo=${BB_PGO:-}
+    if [[ -z $pgo ]]; then
+        # tools/pgo.sh merge leaves the profile here: use it without being asked.
+        [[ -f pgo/bbport.profdata ]] && pgo=use || pgo=off
+    fi
+    if [[ $pgo == use && ! -f pgo/bbport.profdata ]]; then
+        echo 'BB_PGO=use needs pgo/bbport.profdata: bash tools/pgo.sh generate, run the game, bash tools/pgo.sh merge' >&2
+        exit 1
+    fi
+    pgo_dir=$(cygpath -w "$PWD/pgo" 2>/dev/null || printf '%s' "$PWD/pgo")
+    # Extra CMake options (CI passes ccache here): BB_CMAKE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache".
+    read -r -a extra_cmake <<< "${BB_CMAKE_ARGS:-}"
+    cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DBB_ARCH="${BB_ARCH:-avx}" -DBB_LTO="${BB_LTO:-THIN}" -DBB_PGO="$pgo" \
+        -DBB_PGO_DIR="$pgo_dir" -DBB_FRAME_POINTERS="${BB_FRAME_POINTERS:-ON}" \
+        "${extra_cmake[@]}" \
+        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ >/dev/null
+    echo "GPU library and loader: ${BB_ARCH:-avx} code generation, LTO ${BB_LTO:-THIN}, PGO $pgo"
     if ! ninja -C out/gpu bb-probe bb-gpu-capabilities bb-play > out/gpu-build.log 2>&1; then
         grep -v '^\[' out/gpu-build.log | tail -40 >&2
         echo 'Build failed (full log: out/gpu-build.log)' >&2; exit 1
@@ -32,6 +50,20 @@ MINGW*|MSYS*)
     exit 0
     ;;
 esac
+# Host code generation for the C runtime and the tools; the GPU library gets the same flags
+# from gpu/CMakeLists.txt (see BB_ARCH there). The port's floor is AVX without AVX2: the guest
+# game code needs AVX and the loader rewrites the BMI1/LZCNT/MOVBE instructions older CPUs lack.
+arch_flags=()
+if [[ $(uname -m) == x86_64 ]]; then
+    case ${BB_ARCH:-avx} in
+    native) arch_flags=(-march=native) ;;
+    generic) arch_flags=() ;;
+    avx2) arch_flags=(-march=x86-64-v3 -mtune=core-avx-i) ;;
+    avx) arch_flags=(-march=x86-64-v2 -mavx -mf16c -mno-avx2 -mno-fma -mno-bmi -mno-bmi2
+                     -mtune=core-avx-i -mprefer-vector-width=128) ;;
+    *) arch_flags=(-march="${BB_ARCH:-avx}") ;;
+    esac
+fi
 if [[ -z ${CC:-} ]]; then
     CC=$(command -v cc || command -v gcc || true)
     if [[ -z $CC ]]; then
@@ -58,10 +90,16 @@ includes=(-I"$vulkan_headers" "${includes[@]}")
 read -r -a libraries <<< "$(pkg-config --libs vulkan sdl3)"
 # GPU library (shadPS4 video core + drivers), built by CMake into out/gpu/libbbgpu.so.
 # BB_PGO: generate (instrumented build that writes pgo/ while the game runs), use, off.
-# Default: use the profile in pgo/ when there is one. BB_LTO=OFF disables link-time optimization.
+# Default: use the profile in pgo/ when there is one. BB_LTO: THIN (default), ON, OFF.
+# BB_ARCH: avx (default, AVX without AVX2), avx2, native, generic or an -march= value.
 pgo=${BB_PGO:-}
 if [[ -z $pgo ]]; then
-    if [[ -n $(find pgo -name '*.gcda' -print -quit 2>/dev/null) ]]; then pgo=use; else pgo=off; fi
+    # clang: pgo/bbport.profdata (tools/pgo.sh merge); GCC: the pgo/*.gcda files.
+    if [[ -f pgo/bbport.profdata || -n $(find pgo -name '*.gcda' -print -quit 2>/dev/null) ]]; then
+        pgo=use
+    else
+        pgo=off
+    fi
 fi
 mkdir -p pgo
 # Submodules (git clone --recursive, or: git submodule update --init) and this port's changes
@@ -74,9 +112,12 @@ for patch in gpu/patches/fsr-vulkan/*.patch; do
         git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
     fi
 done
+read -r -a extra_cmake <<< "${BB_CMAKE_ARGS:-}"
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
-    -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" -DVulkan_INCLUDE_DIR="$vulkan_headers" >/dev/null
-echo "GPU library: PGO $pgo, LTO ${BB_LTO:-ON}"
+    -DBB_ARCH="${BB_ARCH:-avx}" -DBB_LTO="${BB_LTO:-THIN}" -DBB_PGO_DIR="$PWD/pgo" \
+    -DBB_FRAME_POINTERS="${BB_FRAME_POINTERS:-ON}" "${extra_cmake[@]}" \
+    -DVulkan_INCLUDE_DIR="$vulkan_headers" >/dev/null
+echo "GPU library: PGO $pgo, LTO ${BB_LTO:-THIN}, code generation ${BB_ARCH:-avx}"
 # A failed GPU build must stop here: an older libbbgpu.so would otherwise be used silently.
 if ! ninja ${BB_JOBS:+-j"$BB_JOBS"} -C out/gpu bbgpu > out/gpu-build.log 2>&1; then
     grep -v '^\[' out/gpu-build.log | tail -40 >&2
@@ -92,7 +133,14 @@ if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/l
     for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
     ar rcs out/libatrac9.a out/atrac9/*.o
 fi
-"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c src/cpu_patch.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm -lZydis "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
+# The C runtime is called from the guest on every file read, thread and memory operation:
+# -O3 and the host instruction set (checked once: an older GCC/clang without -march=x86-64-v2
+# falls back to the explicit feature flags).
+cc_flags=("${arch_flags[@]}")
+if [[ ${#cc_flags[@]} -gt 0 ]] && ! "$CC" "${cc_flags[@]}" -x c -E /dev/null >/dev/null 2>&1; then
+    cc_flags=(-msse4.2 -mpopcnt -mcx16 -mavx -mf16c)
+fi
+"$CC" -std=c11 -O3 -g -Wall -Wextra -Werror -pthread -no-pie "${cc_flags[@]}" "${includes[@]}" -I. -Isrc src/probe.c src/cpu_patch.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm -lZydis "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
 echo "Built $PWD/out/bb-probe"
 # GPU check for run.sh (live_resolution=auto): links only the Vulkan loader.
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
@@ -109,4 +157,17 @@ if [[ ${1:-} == --test ]]; then
     out/content-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_cpu_patch.c src/cpu_patch.c -lZydis -o out/cpu-patch-test
     out/cpu-patch-test
+    # Host-side helpers; the C++ compiler of the toolchain builds them. Two builds of the bit
+    # array: this machine's code generation and the SSE2-only one (cores without AVX2).
+    cxx=$(command -v clang++ || command -v g++ || true)
+    if [[ -n $cxx ]]; then
+        "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_bit_array.cpp -o out/bit-array-test
+        out/bit-array-test
+        if [[ -n ${cc_flags[*]:-} ]]; then
+            "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror "${cc_flags[@]}" -Igpu/shadps4 tests/test_bit_array.cpp -o out/bit-array-test-target
+            out/bit-array-test-target
+        fi
+        "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shim tests/test_stream_copy.cpp gpu/shim/bbport_memcpy.cpp -o out/stream-copy-test
+        out/stream-copy-test
+    fi
 fi

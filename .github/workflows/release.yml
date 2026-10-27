@@ -1,0 +1,165 @@
+name: Release
+
+# Builds the Windows package and attaches it to a GitHub release, for players to download:
+# dist/uncharted-windows.zip (Uncharted.exe, Play Uncharted.exe, bb-probe.exe with the DLLs it
+# needs, the scripts, the licenses) and its SHA-256.
+#
+# Run it from the Actions tab ("Run workflow"): pick the tag to release (v<VERSION>, the version
+# in launcher/uncharted_launcher.py) and whether the release is a draft or a pre-release. Pushing
+# a v* tag releases that tag with the defaults. The build is the same action CI uses, so the
+# binaries are the ones the tests saw.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release, e.g. v0.3.9 (created at this commit when it does not exist)'
+        required: true
+        type: string
+      draft:
+        description: 'Keep the release as a draft'
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: 'Mark the release as a pre-release'
+        required: false
+        type: boolean
+        default: false
+      xess:
+        description: 'Download Intel XeSS and ship it (any GPU, no MSVC needed)'
+        required: false
+        type: boolean
+        default: true
+      fsr4:
+        description: 'Download the FSR 4 assets and ship them (about 120 MB)'
+        required: false
+        type: boolean
+        default: false
+      notes:
+        description: 'Extra release notes (plain text or Markdown)'
+        required: false
+        type: string
+        default: ''
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows package
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Build
+        id: build
+        uses: ./.github/actions/windows-build
+
+      - name: Check the tag against the launcher's version
+        shell: msys2 {0}
+        run: |
+          built=${{ steps.build.outputs.version }}
+          tag=${TAG#v}
+          echo "version in the sources: $built, tag: $TAG"
+          if [[ $tag != "$built" ]]; then
+              echo "::warning::The tag $TAG does not match VERSION=$built in launcher/uncharted_launcher.py (the launcher's update check compares the digits of the tag)."
+          fi
+
+      # Optional graphics upscalers packaged next to the game when their DLLs are present:
+      # XeSS needs no MSVC (Intel's DLL is fetched), DLSS would need the NVIDIA SDK and MSVC.
+      - name: XeSS
+        if: ${{ github.event_name == 'push' || inputs.xess }}
+        shell: msys2 {0}
+        run: bash packaging/windows/fetch_xess.sh
+
+      - name: FSR 4 assets
+        if: ${{ github.event_name == 'push' || inputs.fsr4 }}
+        shell: msys2 {0}
+        run: bash tools/fetch_fsr4_assets.sh
+
+      - name: Windows Python for PyInstaller
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+
+      - name: Cache the PyInstaller environment
+        uses: actions/cache@v4
+        with:
+          path: out/pyenv
+          key: pyenv-${{ runner.os }}-3.12-${{ hashFiles('launcher/uncharted_launcher.py', 'packaging/windows/package.sh') }}
+          restore-keys: pyenv-${{ runner.os }}-3.12-
+
+      - name: Package
+        shell: msys2 {0}
+        env:
+          WINPYTHON: ${{ env.pythonLocation }}\python.exe
+        run: |
+          export WINPYTHON="$(cygpath -u "$WINPYTHON")"
+          bash packaging/windows/package.sh
+          ls -la dist/
+          # The checksum players can compare after downloading.
+          cd dist && sha256sum uncharted-windows.zip > uncharted-windows.zip.sha256 && cat uncharted-windows.zip.sha256
+
+      - name: Release notes
+        shell: msys2 {0}
+        env:
+          NOTES: ${{ inputs.notes }}
+        run: |
+          mkdir -p out/release
+          {
+              if [[ -n $NOTES ]]; then
+                  printf '%s\n\n' "$NOTES"
+              fi
+              printf '**Windows package** (`uncharted-windows.zip`): unpack it anywhere and run `Uncharted.exe`. '
+              printf 'A Vulkan 1.3 driver is required; the port needs a 64-bit x86 CPU with AVX (Sandy Bridge and '
+              printf 'newer, Bulldozer and newer). `SHA-256` of the download is in `uncharted-windows.zip.sha256`.\n\n'
+              printf 'Built from `%s` with the MSYS2 CLANG64 toolchain.\n' "$(git rev-parse --short HEAD)"
+          } > out/release/notes.md
+          cat out/release/notes.md
+
+      - name: Create the release
+        shell: msys2 {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          [[ "${{ inputs.draft }}" == "true" ]] && flags+=(--draft)
+          [[ "${{ inputs.prerelease }}" == "true" ]] && flags+=(--prerelease)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+              # A re-run of the same tag: replace the assets, keep the release.
+              gh release upload "$TAG" dist/uncharted-windows.zip dist/uncharted-windows.zip.sha256 --clobber
+          else
+              gh release create "$TAG" \
+                  dist/uncharted-windows.zip dist/uncharted-windows.zip.sha256 \
+                  --target "$(git rev-parse HEAD)" \
+                  --title "${TAG}" \
+                  --notes-file out/release/notes.md \
+                  "${flags[@]}"
+          fi
+          gh release view "$TAG" --json url,assets --jq '"\(.url)\n" + (.assets[] | "  \(.name) \(.size) bytes")'
+
+      - name: Keep the zip as a workflow artifact too
+        uses: actions/upload-artifact@v4
+        with:
+          name: uncharted-windows-${{ steps.build.outputs.version }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            dist/uncharted-windows.zip
+            dist/uncharted-windows.zip.sha256

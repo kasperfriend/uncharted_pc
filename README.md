@@ -60,6 +60,9 @@ code runs directly on your PC and the graphics are translated to Vulkan. Unpack 
 - **Older CPUs:** the games use instructions of the PS4's processor (AVX, BMI1, MOVBE, LZCNT).
   Since 0.3.7 they are rewritten on CPUs that lack them, so Intel Core 3rd generation (Ivy Bridge)
   runs, as does AMD FX. Sandy Bridge (2nd generation) also lacks F16C and is not supported.
+  32-bit MOVBE loads and stores are now rewritten in place (no jump to a thunk), the sweep runs
+  on all cores (`BB_CPU_PATCH_THREADS`), and the host code is built for exactly this instruction
+  set: AVX and SSE4.2, no AVX2.
 - **Random crashes with "execute access to 0" or a fault at `0x63f5d0` (U1):** Windows wrote its
   exception data over values the game keeps just below the stack pointer. Fixed in 0.3.7.
 - **Uncharted 2, train wreck:** `IsFinite(deltaTransform)` in character-leg-ik.cpp, fixed in 0.3.6
@@ -70,6 +73,10 @@ code runs directly on your PC and the graphics are translated to Vulkan. Unpack 
 
 MSYS2 CLANG64 on Windows: `bash build.sh` builds `out\bb-probe.exe`, and
 `bash packaging/windows/package.sh` makes `dist\uncharted-windows` and the zip.
+`BB_ARCH` (CPU generation), `BB_LTO`, `BB_PGO` and the other build options, the optimizations
+above and how to measure them are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+GitHub Actions builds every push (`.github/workflows/ci.yml`) and makes the release zip on
+demand (`.github/workflows/release.yml`).
 
 ## Credits
 
