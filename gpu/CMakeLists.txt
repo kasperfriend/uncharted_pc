@@ -455,19 +455,19 @@ target_link_libraries(camera-motion-test PRIVATE bbgpu)
 add_dependencies(camera-motion-test host_shaders)
 
 # bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
-# bbport: the host-side work the port does itself, checked without a GPU: the bit array's
-# range scans (AVX2 and the SSE2 path this build uses) and the streaming guest-memory copy.
+add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
+    shim/bbport_settings.cpp)
+target_include_directories(upscaler-support-test PRIVATE shim)
+target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
+
+# bbport: the host-side work the port does itself, checked without a GPU: the bit array's range
+# scans (AVX2 and the SSE2 path this build uses) and the streaming guest-memory copy.
 add_executable(bit-array-test EXCLUDE_FROM_ALL ../tests/test_bit_array.cpp)
 target_compile_options(bit-array-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(bit-array-test PRIVATE shadps4)
 add_executable(stream-copy-test EXCLUDE_FROM_ALL ../tests/test_stream_copy.cpp shim/bbport_memcpy.cpp)
 target_compile_options(stream-copy-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(stream-copy-test PRIVATE shim)
-
-add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
-    shim/bbport_settings.cpp)
-target_include_directories(upscaler-support-test PRIVATE shim)
-target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
 add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
     shadps4/video_core/renderer_vulkan/fsr411/fsr411.cpp)
