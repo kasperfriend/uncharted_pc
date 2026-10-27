@@ -134,14 +134,44 @@ buffer-cache copies; the GPU thread waits for them only at a fence that needs th
   short wait, then a yield, never a sleep.
 - The presenter paces frames with pauses and one clock read in 32 instead of a yield per
   iteration, which cost a reschedule per frame.
+- Debug markers (`BB_VK_MARKERS`) used to be checked *after* `DrainDrawPipe()`: with markers
+  off — the default — every marker call still flushed the parallel draw pipeline, and the three
+  host sites in the rasterizer built their label with `fmt::format` first. The clear/resolve/
+  depth-copy paths now drain explicitly, once each instead of twice through their begin/end
+  markers, and the label is only formatted when it is written.
 
 ## Bit arrays (`gpu/shadps4/common/bit_array.h`)
 
-`BitArray` (the buffer cache's 1024-page region bitmap: which pages of a 4 MiB region the CPU or
-the GPU wrote) scans and fills 4 words per instruction with AVX2, 2 words with SSE2, and falls
-back to a scalar loop. `BIT_ARRAY_USE_AVX`/`BIT_ARRAY_USE_SSE`/`BIT_ARRAY_USE_VECTOR` say which
-one a build compiled; `tests/test_bit_array.cpp` checks all of them (ranges, iterators,
-copy/and/xor) against a scalar model, in `tools/ci/linux-tests.sh` for each build variant.
+`BitArray` is the buffer cache's page bitmap: for every 4 MiB region it records which of its 1024
+pages the CPU wrote (`cpu`), the GPU wrote (`gpu`), and which are readable/writeable, and the
+region manager asks it something on **every buffer binding** and every change of page
+protection.
+
+The 256-bit path needs **AVX1 only**, which is not obvious: AVX1 has no 256-bit *integer*
+instructions (those arrived with AVX2), but the scans only ever load, store, AND, OR, XOR and
+test, and all of those exist on 256 bits in AVX1 — `vptest` for the tests, and the bitwise
+single-precision forms (`vandps`, `vorps`, `vxorps`, `vandnps`) for the rest, which are pure
+bitwise operations with no arithmetic, exceptions or NaN handling. So on this instruction set:
+
+| Loop | SSE2 (2 words) | AVX (4 words) | Speed-up |
+|---|---|---|---|
+| `AnyInRange` (a buffer binding's pages) | 3.8–4.8 ns | 1.2–1.6 ns | **~3×** |
+| `None` (did anything change) | 3.0–3.2 ns | 0.6–0.8 ns | **~4×** |
+| `NotXor` (pages whose protection changes) | 6.1–6.5 ns | 3.3–4.1 ns | **~1.6×** |
+| `==` | 1.5–2.1 ns | 0.5–0.6 ns | **~3×** |
+
+Each test is a single `vptest` for four words; before, SSE2 spent `pcmpeq` + `pmovmskb` + `cmp`
+per two words, and the set operators (`|=`, `&=`, `^=`, `~`, `==`) were 16 scalar word loops that
+GCC could only vectorize to 128 bits without AVX2. `None()` combines whole vectors into one
+accumulator and tests once, so the common "nothing changed" answer has no branch in it, and
+`NotXor`/`NotOr` (the two De Morgan forms the region manager needs — they differ where both
+operands are set) fuse what used to be a temporary array, a copy and two walks.
+
+`BIT_ARRAY_USE_AVX` (any `-mavx` build, AVX2 included), `BIT_ARRAY_USE_SSE` and
+`BIT_ARRAY_USE_VECTOR` say which path a build compiled. `tests/test_bit_array.cpp` checks all of
+them against a scalar model (ranges, iterators, the set operators, the fused forms);
+`tests/bench_bit_array.cpp` prints the timings above for the build at hand, and
+`tools/ci/linux-tests.sh` builds it twice (AVX and SSE2) so the difference is visible in CI.
 
 ## Measuring
 

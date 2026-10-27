@@ -185,6 +185,30 @@ void Exercise(unsigned seed) {
         Common::BitArray<N> xored = array;
         xored ^= array;
         CHECK(xored.None());
+        // The fused forms the region manager uses must equal the operators they replace, and
+        // must not be confused with each other (~(a|b) clears where both are set, ~(a^b) does
+        // not).
+        Common::BitArray<N> other_array;
+        Reference other_reference(N);
+        for (int k = 0; k < 12; ++k) {
+            const std::size_t a = rng() % N;
+            const std::size_t b = std::min<std::size_t>(N, a + 1 + rng() % 128);
+            if (rng() & 1) {
+                other_array.SetRange(a, b);
+                other_reference.SetRange(a, b);
+            } else {
+                other_array.UnsetRange(a, b);
+                other_reference.UnsetRange(a, b);
+            }
+        }
+        CHECK(Common::BitArray<N>::NotXor(array, other_array) == (~array ^ other_array));
+        CHECK(Common::BitArray<N>::NotOr(array, other_array) == ~(array | other_array));
+        for (std::size_t i = 0; i < N; i += 1 + rng() % 3) {
+            const bool a = reference.Get(i), b = other_reference.Get(i);
+            CHECK(Common::BitArray<N>::NotXor(array, other_array).Get(i) == !(a ^ b));
+            CHECK(Common::BitArray<N>::NotOr(array, other_array).Get(i) == !(a || b));
+        }
+        CHECK(Common::BitArray<N>::NotXor(array, array).None() == false);
     }
 }
 
@@ -192,7 +216,8 @@ void Exercise(unsigned seed) {
 
 int main() {
 #if defined(BIT_ARRAY_USE_AVX)
-    std::printf("bit array: AVX2 path, 4 words per instruction\n");
+    // AVX1 is enough for this path (vptest, vmovdqu, vandps/vorps/vxorps on 256 bits).
+    std::printf("bit array: AVX path, 4 words per instruction\n");
 #elif defined(BIT_ARRAY_USE_SSE)
     std::printf("bit array: SSE2 path, 2 words per instruction\n");
 #else

@@ -75,13 +75,21 @@ gcc "${c11[@]}" -I. -Isrc tests/test_display.c src/runtime_display.c -o "$out/di
 
 # --- host helpers the port adds ---------------------------------------------------------------
 cxx=${CXX:-g++}
-echo '== bit array (vector scans: AVX2, SSE2, scalar)'
-for variant in "-O0" "-O2" "-O2 -mavx2" "-O2 -msse4.2 -mno-avx"; do
+echo '== bit array (vector scans: AVX 256-bit, SSE2, scalar)'
+for variant in "-O0" "-O2" "-O2 -mavx -mno-avx2" "-O2 -mavx2" "-O2 -msse4.2 -mno-avx"; do
     # shellcheck disable=SC2086
     "$cxx" -std=c++20 -g -Wall -Wextra -Werror $variant -Igpu/shadps4 tests/test_bit_array.cpp \
         -o "$out/bit-array-test"
     printf '   %-22s ' "$variant"
     "$out/bit-array-test" | tail -1
+done
+echo '== bit array timings (AVX 256-bit against SSE2, same source)'
+for variant in "-mavx -mno-avx2" "-mno-avx"; do
+    # shellcheck disable=SC2086
+    "$cxx" -std=c++20 -O2 -g $variant -Igpu/shadps4 tests/bench_bit_array.cpp \
+        -o "$out/bench-bit-array"
+    printf '   %-18s ' "$variant"
+    "$out/bench-bit-array"
 done
 echo '== streaming guest-memory copy'
 "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -mavx -Igpu/shim tests/test_stream_copy.cpp \

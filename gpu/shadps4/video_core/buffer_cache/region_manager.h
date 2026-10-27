@@ -160,7 +160,7 @@ public:
         if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
             return;
         }
-        RegionBits add(~(gpu | writeable), start_page, end_page);
+        RegionBits add(RegionBits::NotOr(gpu, writeable), start_page, end_page);
         if (add.None()) {
             return;
         }
@@ -247,7 +247,9 @@ private:
     template <bool track, bool is_read>
     void UpdateProtection() {
         RENDERER_TRACE;
-        RegionBits mask = is_read ? (~gpu ^ readable) : (cpu ^ writeable);
+        // bbport: one pass over the words instead of a temporary ~gpu (or cpu) copy and an XOR.
+        RegionBits mask = is_read ? RegionBits::NotXor(gpu, readable)
+                                  : RegionBits::NotXor(cpu, writeable);
         if (mask.None()) {
             return;
         }

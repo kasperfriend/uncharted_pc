@@ -468,6 +468,10 @@ target_include_directories(bit-array-test PRIVATE shadps4)
 add_executable(stream-copy-test EXCLUDE_FROM_ALL ../tests/test_stream_copy.cpp shim/bbport_memcpy.cpp)
 target_compile_options(stream-copy-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(stream-copy-test PRIVATE shim)
+# Timings of the bit array loops with this build's vector path (ninja -C out/gpu bit-array-bench).
+add_executable(bit-array-bench EXCLUDE_FROM_ALL ../tests/bench_bit_array.cpp)
+target_compile_options(bit-array-bench PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(bit-array-bench PRIVATE shadps4)
 
 add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
     shadps4/video_core/renderer_vulkan/fsr411/fsr411.cpp)

@@ -6,21 +6,33 @@
 #include <array>
 #include <bit>
 #include <cstddef>
+#include <type_traits>
 #include <utility>
 #include "common/types.h"
 
-#ifdef __AVX2__
+// bbport: the port's floor is AVX without AVX2, so the 256-bit path must not need AVX2. The
+// scans below (FirstRangeFrom, LastRangeFrom, AnyInRange, None, the set operators -- the buffer
+// cache's region manager runs them on every buffer binding) only ever load, store, AND, OR,
+// XOR and *test* 256 bits, and every one of those exists in AVX1: vptest replaces the AVX2
+// vpcmpeqq+vmovmskpd pair with a single instruction, which is where the gain is on a core that
+// executes a 256-bit operation as two 128-bit halves. (AVX2 builds take the same path.)
+#if defined(__AVX__)
 #define BIT_ARRAY_USE_AVX
 #include <immintrin.h>
 #elif defined(__SSE2__)
-// bbport: the cores this port targets have no AVX2. Their SSE unit still handles two 64-bit
-// words per instruction, which is what the scans below (FirstRangeFrom, LastRangeFrom,
-// AnyInRange: the buffer cache asks them for every uploaded buffer) run on.
+// No AVX: the SSE unit still handles two 64-bit words per instruction.
 #define BIT_ARRAY_USE_SSE
 #include <emmintrin.h>
 #endif
 #if defined(BIT_ARRAY_USE_AVX) || defined(BIT_ARRAY_USE_SSE)
 #define BIT_ARRAY_USE_VECTOR
+#endif
+#if defined(BIT_ARRAY_USE_AVX)
+#define BIT_ARRAY_PATH "AVX 256-bit"
+#elif defined(BIT_ARRAY_USE_SSE)
+#define BIT_ARRAY_PATH "SSE2 128-bit"
+#else
+#define BIT_ARRAY_PATH "scalar"
 #endif
 
 #ifdef BIT_ARRAY_USE_VECTOR
@@ -40,11 +52,37 @@ inline Vector Ones() {
 inline Vector Zeros() {
     return _mm256_setzero_si256();
 }
+/// True when every bit is set: CF from vptest is (Ones & ~v) == 0.
 inline bool AllOnes(Vector v) {
-    return _mm256_movemask_epi8(_mm256_cmpeq_epi64(v, Ones())) == -1;
+    return _mm256_testc_si256(v, Ones());
 }
+/// True when any bit is set: ZF from vptest is (v & v) == 0.
 inline bool AnySet(Vector v) {
     return !_mm256_testz_si256(v, v);
+}
+/// True when the two vectors are equal: ZF from vptest on their XOR.
+inline bool Equal(Vector a, Vector b) {
+    const Vector difference = _mm256_castps_si256(
+        _mm256_xor_ps(_mm256_castsi256_ps(a), _mm256_castsi256_ps(b)));
+    return _mm256_testz_si256(difference, difference);
+}
+// AVX1 has no 256-bit *integer* bitwise instructions (those are AVX2); the single-precision
+// versions are bitwise operations on the same 256 bits -- no arithmetic, no exceptions, no NaN
+// or denormal handling -- so they are exactly what the words need. On AVX2 builds clang and GCC
+// select the integer forms for these anyway.
+inline Vector And(Vector a, Vector b) {
+    return _mm256_castps_si256(
+        _mm256_and_ps(_mm256_castsi256_ps(a), _mm256_castsi256_ps(b)));
+}
+inline Vector Or(Vector a, Vector b) {
+    return _mm256_castps_si256(_mm256_or_ps(_mm256_castsi256_ps(a), _mm256_castsi256_ps(b)));
+}
+inline Vector Xor(Vector a, Vector b) {
+    return _mm256_castps_si256(
+        _mm256_xor_ps(_mm256_castsi256_ps(a), _mm256_castsi256_ps(b)));
+}
+inline Vector Not(Vector v) {
+    return _mm256_castps_si256(_mm256_xor_ps(_mm256_castsi256_ps(v), _mm256_castsi256_ps(Ones())));
 }
 #else
 inline constexpr size_t WordsPerVector = 2;
@@ -66,6 +104,21 @@ inline bool AllOnes(Vector v) {
 }
 inline bool AnySet(Vector v) {
     return _mm_movemask_epi8(_mm_cmpeq_epi8(v, Zeros())) != 0xFFFF;
+}
+inline bool Equal(Vector a, Vector b) {
+    return _mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) == 0xFFFF;
+}
+inline Vector And(Vector a, Vector b) {
+    return _mm_and_si128(a, b);
+}
+inline Vector Or(Vector a, Vector b) {
+    return _mm_or_si128(a, b);
+}
+inline Vector Xor(Vector a, Vector b) {
+    return _mm_xor_si128(a, b);
+}
+inline Vector Not(Vector v) {
+    return _mm_xor_si128(v, Ones());
 }
 #endif
 } // namespace Common::BitArrayDetail
@@ -254,9 +307,27 @@ public:
     }
 
     inline constexpr bool None() const {
+        size_t i = 0;
+#ifdef BIT_ARRAY_USE_VECTOR
+        // Whole vectors at a time, combined into one accumulator and tested once at the end: no
+        // branch per vector (the region manager asks this after every change to the tracked
+        // pages, and an answer of "no bits" is the common one).
+        if (!std::is_constant_evaluated()) {
+            if (WORD_COUNT >= WORDS_PER_VECTOR) {
+                BitArrayDetail::Vector any = BitArrayDetail::Load(&data[0]);
+                for (i = WORDS_PER_VECTOR; i + WORDS_PER_VECTOR <= WORD_COUNT;
+                     i += WORDS_PER_VECTOR) {
+                    any = BitArrayDetail::Or(any, BitArrayDetail::Load(&data[i]));
+                }
+                if (BitArrayDetail::AnySet(any)) {
+                    return false;
+                }
+            }
+        }
+#endif
         u64 result = 0;
-        for (const auto& word : data) {
-            result |= word;
+        for (; i < WORD_COUNT; ++i) {
+            result |= data[i];
         }
         return result == 0;
     }
@@ -274,19 +345,29 @@ public:
         const u64 end_mask = end_bit == BITS_PER_WORD - 1 ? ~0ULL : (1ULL << (end_bit + 1)) - 1;
         if (first_word == last_word) {
             return data[first_word] & (start_mask & end_mask);
-        } else {
-            if (data[first_word] & start_mask) {
-                return true;
-            }
-            size_t i = first_word + 1;
-            for (; i < last_word; ++i) {
-                if (data[i]) {
+        }
+        if (data[first_word] & start_mask) {
+            return true;
+        }
+        size_t i = first_word + 1;
+#ifdef BIT_ARRAY_USE_VECTOR
+        // The words strictly inside the range, four at a time: this is the check the region
+        // manager makes for every buffer binding (IsRegionModified / ForEachModifiedRange).
+        if (!std::is_constant_evaluated()) {
+            for (; i + WORDS_PER_VECTOR <= last_word; i += WORDS_PER_VECTOR) {
+                if (BitArrayDetail::AnySet(BitArrayDetail::Load(&data[i]))) {
                     return true;
                 }
             }
-            if (data[last_word] & end_mask) {
+        }
+#endif
+        for (; i < last_word; ++i) {
+            if (data[i]) {
                 return true;
             }
+        }
+        if (data[last_word] & end_mask) {
+            return true;
         }
         return false;
     }
@@ -418,21 +499,51 @@ public:
     }
 
     inline constexpr BitArray& operator|=(const BitArray& other) {
-        for (size_t i = 0; i < WORD_COUNT; ++i) {
+        size_t i = 0;
+#ifdef BIT_ARRAY_USE_VECTOR
+        if (!std::is_constant_evaluated()) {
+            for (; i + WORDS_PER_VECTOR <= WORD_COUNT; i += WORDS_PER_VECTOR) {
+                BitArrayDetail::Store(&data[i],
+                                      BitArrayDetail::Or(BitArrayDetail::Load(&data[i]),
+                                                         BitArrayDetail::Load(&other.data[i])));
+            }
+        }
+#endif
+        for (; i < WORD_COUNT; ++i) {
             data[i] |= other.data[i];
         }
         return *this;
     }
 
     inline constexpr BitArray& operator&=(const BitArray& other) {
-        for (size_t i = 0; i < WORD_COUNT; ++i) {
+        size_t i = 0;
+#ifdef BIT_ARRAY_USE_VECTOR
+        if (!std::is_constant_evaluated()) {
+            for (; i + WORDS_PER_VECTOR <= WORD_COUNT; i += WORDS_PER_VECTOR) {
+                BitArrayDetail::Store(&data[i],
+                                      BitArrayDetail::And(BitArrayDetail::Load(&data[i]),
+                                                          BitArrayDetail::Load(&other.data[i])));
+            }
+        }
+#endif
+        for (; i < WORD_COUNT; ++i) {
             data[i] &= other.data[i];
         }
         return *this;
     }
 
     inline constexpr BitArray& operator^=(const BitArray& other) {
-        for (size_t i = 0; i < WORD_COUNT; ++i) {
+        size_t i = 0;
+#ifdef BIT_ARRAY_USE_VECTOR
+        if (!std::is_constant_evaluated()) {
+            for (; i + WORDS_PER_VECTOR <= WORD_COUNT; i += WORDS_PER_VECTOR) {
+                BitArrayDetail::Store(&data[i],
+                                      BitArrayDetail::Xor(BitArrayDetail::Load(&data[i]),
+                                                          BitArrayDetail::Load(&other.data[i])));
+            }
+        }
+#endif
+        for (; i < WORD_COUNT; ++i) {
             data[i] ^= other.data[i];
         }
         return *this;
@@ -458,15 +569,35 @@ public:
 
     inline constexpr BitArray operator~() const {
         BitArray result = *this;
-        for (size_t i = 0; i < WORD_COUNT; ++i) {
-            result.data[i] = ~result.data[i];
+        size_t i = 0;
+#ifdef BIT_ARRAY_USE_VECTOR
+        if (!std::is_constant_evaluated()) {
+            for (; i + WORDS_PER_VECTOR <= WORD_COUNT; i += WORDS_PER_VECTOR) {
+                BitArrayDetail::Store(&result.data[i],
+                                      BitArrayDetail::Not(BitArrayDetail::Load(&data[i])));
+            }
+        }
+#endif
+        for (; i < WORD_COUNT; ++i) {
+            result.data[i] = ~data[i];
         }
         return result;
     }
 
     inline constexpr bool operator==(const BitArray& other) const {
+        size_t i = 0;
+#ifdef BIT_ARRAY_USE_VECTOR
+        if (!std::is_constant_evaluated()) {
+            for (; i + WORDS_PER_VECTOR <= WORD_COUNT; i += WORDS_PER_VECTOR) {
+                if (!BitArrayDetail::Equal(BitArrayDetail::Load(&data[i]),
+                                           BitArrayDetail::Load(&other.data[i]))) {
+                    return false;
+                }
+            }
+        }
+#endif
         u64 result = 0;
-        for (size_t i = 0; i < WORD_COUNT; ++i) {
+        for (; i < WORD_COUNT; ++i) {
             result |= data[i] ^ other.data[i];
         }
         return result == 0;
@@ -474,6 +605,49 @@ public:
 
     inline constexpr bool operator!=(const BitArray& other) const {
         return !(*this == other);
+    }
+
+    /// bbport: (~a ^ b) in one pass. The buffer cache's region manager derives the pages whose
+    /// protection changes from exactly this expression on every update; writing it as operator~
+    /// followed by operator^ copied the array twice and walked it twice.
+    static constexpr BitArray NotXor(const BitArray& a, const BitArray& b) {
+        BitArray result = a;
+        size_t i = 0;
+#ifdef BIT_ARRAY_USE_VECTOR
+        if (!std::is_constant_evaluated()) {
+            for (; i + WORDS_PER_VECTOR <= WORD_COUNT; i += WORDS_PER_VECTOR) {
+                BitArrayDetail::Store(&result.data[i],
+                                      BitArrayDetail::Not(BitArrayDetail::Xor(
+                                          BitArrayDetail::Load(&a.data[i]),
+                                          BitArrayDetail::Load(&b.data[i]))));
+            }
+        }
+#endif
+        for (; i < WORD_COUNT; ++i) {
+            result.data[i] = ~(a.data[i] ^ b.data[i]);
+        }
+        return result;
+    }
+
+    /// bbport: ~(a | b) in one pass (De Morgan's other half -- NOT the same as NotXor, which
+    /// clears where both operands are set).
+    static constexpr BitArray NotOr(const BitArray& a, const BitArray& b) {
+        BitArray result = a;
+        size_t i = 0;
+#ifdef BIT_ARRAY_USE_VECTOR
+        if (!std::is_constant_evaluated()) {
+            for (; i + WORDS_PER_VECTOR <= WORD_COUNT; i += WORDS_PER_VECTOR) {
+                BitArrayDetail::Store(&result.data[i],
+                                      BitArrayDetail::Not(BitArrayDetail::Or(
+                                          BitArrayDetail::Load(&a.data[i]),
+                                          BitArrayDetail::Load(&b.data[i]))));
+            }
+        }
+#endif
+        for (; i < WORD_COUNT; ++i) {
+            result.data[i] = ~(a.data[i] | b.data[i]);
+        }
+        return result;
     }
 
 private:

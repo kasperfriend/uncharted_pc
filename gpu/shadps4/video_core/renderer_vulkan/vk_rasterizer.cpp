@@ -497,10 +497,16 @@ void Rasterizer::EliminateFastClear() {
     auto& image = texture_cache.GetImage(image_id);
     const auto clear_value = LiverpoolToVK::ColorBufferClearValue(col_buf);
 
-    ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
-                                 col_buf.CmaskAddress()));
+    // bbport: the drain the marker used to do, now explicit (and done once instead of twice).
+    DrainDrawPipe();
+    if (host_markers_enabled) {
+        ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
+                                     col_buf.CmaskAddress()));
+    }
     runtime.ClearImage(&image, desc.view_info.range, clear_value);
-    ScopeMarkerEnd();
+    if (host_markers_enabled) {
+        ScopeMarkerEnd();
+    }
 }
 
 // bbport: two-stage draw pipeline (vk_draw_pipe.h). Packet layout, 8-byte aligned parts:
@@ -4113,12 +4119,17 @@ void Rasterizer::Resolve() {
     auto& mrt0_image = texture_cache.GetImage(texture_cache.FindImage(mrt0_desc, true));
     auto& mrt1_image = texture_cache.GetImage(texture_cache.FindImage(mrt1_desc, true));
 
-    ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
-                                 Regs().color_buffers[0].Address(),
-                                 Regs().color_buffers[1].Address()));
+    DrainDrawPipe();
+    if (host_markers_enabled) {
+        ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
+                                     Regs().color_buffers[0].Address(),
+                                     Regs().color_buffers[1].Address()));
+    }
     runtime.ResolveImage(&mrt0_image, &mrt1_image, mrt0_desc.view_info.range,
                          mrt1_desc.view_info.range);
-    ScopeMarkerEnd();
+    if (host_markers_enabled) {
+        ScopeMarkerEnd();
+    }
 }
 
 void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
@@ -4138,14 +4149,17 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
     sub_range.base.layer = Regs().depth_view.slice_start;
     sub_range.extent.layers = Regs().depth_view.NumSlices() - sub_range.base.layer;
 
-    ScopeMarkerBegin(fmt::format(
-        "DepthStencilCopy:DR={:#x}:SR={:#x}:DW={:#x}:SW={:#x}", regs.depth_buffer.DepthAddress(),
-        regs.depth_buffer.StencilAddress(), regs.depth_buffer.DepthWriteAddress(),
-        regs.depth_buffer.StencilWriteAddress()));
-
+    DrainDrawPipe();
+    if (host_markers_enabled) {
+        ScopeMarkerBegin(fmt::format(
+            "DepthStencilCopy:DR={:#x}:SR={:#x}:DW={:#x}:SW={:#x}", regs.depth_buffer.DepthAddress(),
+            regs.depth_buffer.StencilAddress(), regs.depth_buffer.DepthWriteAddress(),
+            regs.depth_buffer.StencilWriteAddress()));
+    }
     runtime.CopyDepthStencil(&read_image, &write_image, sub_range);
-
-    ScopeMarkerEnd();
+    if (host_markers_enabled) {
+        ScopeMarkerEnd();
+    }
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
@@ -4664,11 +4678,13 @@ void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) cons
 }
 
 void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) {
-    DrainDrawPipe();
-    if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||
-        (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
+    // bbport: markers are off unless BB_VK_MARKERS is set, and the check comes first: a marker
+    // that will not be written must not drain the parallel draw pipe (with host markers on there
+    // is no draw pipe at all, so the drain only ever matters on the path that emits).
+    if (from_guest ? !guest_markers_enabled : !host_markers_enabled) {
         return;
     }
+    DrainDrawPipe();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
@@ -4676,21 +4692,19 @@ void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) 
 }
 
 void Rasterizer::ScopeMarkerEnd(bool from_guest) {
-    DrainDrawPipe();
-    if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||
-        (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
+    if (from_guest ? !guest_markers_enabled : !host_markers_enabled) {
         return;
     }
+    DrainDrawPipe();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.endDebugUtilsLabelEXT();
 }
 
 void Rasterizer::ScopedMarkerInsert(const std::string_view& str, bool from_guest) {
-    DrainDrawPipe();
-    if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||
-        (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
+    if (from_guest ? !guest_markers_enabled : !host_markers_enabled) {
         return;
     }
+    DrainDrawPipe();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
@@ -4699,11 +4713,10 @@ void Rasterizer::ScopedMarkerInsert(const std::string_view& str, bool from_guest
 
 void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 color,
                                          bool from_guest) {
-    DrainDrawPipe();
-    if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||
-        (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
+    if (from_guest ? !guest_markers_enabled : !host_markers_enabled) {
         return;
     }
+    DrainDrawPipe();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
