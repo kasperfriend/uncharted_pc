@@ -277,5 +277,7 @@ if [[ ${1:-} == --test ]]; then
         fi
         "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shim tests/test_stream_copy.cpp gpu/shim/bbport_memcpy.cpp -o out/stream-copy-test
         out/stream-copy-test
+        "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_block_mask.cpp -o out/block-mask-test
+        out/block-mask-test
     fi
 fi

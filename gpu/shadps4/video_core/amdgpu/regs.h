@@ -8,6 +8,7 @@
 #include <bit>
 #include <cstring>
 #include <vector>
+#include "video_core/amdgpu/block_mask.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -197,58 +198,8 @@ union Regs {
 // bbport: register blocks written by a stretch of packets, and their values at its end. The
 // draw-preparation scanner records one per submission so a worker reaches the state at the
 // start of any later submission without replaying the packets in between.
-/// One bit per register block, in words. `std::bitset` has no portable way to visit only the set
-/// bits, and the mask is walked on every submission (`RegDelta::Capture`), where testing all
-/// 1664 blocks costs more than the copy of the blocks themselves.
-struct BlockMask {
-    static constexpr u32 Words = (Regs::NumRegs / 32 + 63) / 64;
-    std::array<u64, Words> words{};
-
-    void Set(u32 block) {
-        words[block >> 6] |= u64{1} << (block & 63);
-    }
-    /// Marks the closed range [first, last] with a handful of word writes instead of one per bit.
-    void SetRange(u32 first, u32 last) {
-        u32 word = first >> 6;
-        const u32 last_word = last >> 6;
-        const u64 head = ~u64{0} << (first & 63);
-        const u64 tail = ~u64{0} >> (63 - (last & 63));
-        if (word == last_word) {
-            words[word] |= head & tail;
-            return;
-        }
-        words[word++] |= head;
-        for (; word < last_word; ++word) {
-            words[word] = ~u64{0};
-        }
-        words[last_word] |= tail;
-    }
-    bool Test(u32 block) const {
-        return (words[block >> 6] >> (block & 63)) & 1;
-    }
-    bool Any() const {
-        for (const u64 word : words) {
-            if (word) {
-                return true;
-            }
-        }
-        return false;
-    }
-    void Reset() {
-        words.fill(0);
-    }
-    /// Calls fn(block) for every set block, skipping the empty words in between.
-    template <typename F>
-    void ForEachSet(F&& fn) const {
-        for (u32 index = 0; index < Words; ++index) {
-            u64 word = words[index];
-            while (word) {
-                fn(index * 64 + u32(std::countr_zero(word)));
-                word &= word - 1;
-            }
-        }
-    }
-};
+/// One bit per register block (see block_mask.h; the mask itself is host-independent).
+struct BlockMask : AmdGpu::RegBlockMask<Regs::NumRegs / 32> {};
 
 struct RegDirty {
     static constexpr u32 BlockWords = 32;

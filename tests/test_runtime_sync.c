@@ -72,7 +72,9 @@ struct WaiterArgs {
 
 static void *wait_thread(void *arg) {
     struct WaiterArgs *waiter = arg;
-    waiter->result = sem_wait_fn(waiter->id, waiter->need, waiter->timed ? &waiter->timeout_us : NULL);
+    const int32_t result = sem_wait_fn(waiter->id, waiter->need,
+                                       waiter->timed ? &waiter->timeout_us : NULL);
+    __atomic_store_n(&waiter->result, result, __ATOMIC_RELEASE);
     return NULL;
 }
 
@@ -139,7 +141,7 @@ static void test_semaphores(SemCreate sem_create) {
     }
     for (int i = 0; i < WAITERS; ++i) {
         pthread_join(threads[i], NULL);
-        if (waiters[i].result != 0) {
+        if (__atomic_load_n(&waiters[i].result, __ATOMIC_ACQUIRE) != 0) {
             fprintf(stderr, "FAIL: waiter %d returned %#x\n", i, (unsigned)waiters[i].result);
             ++failures;
         }
@@ -162,7 +164,7 @@ static void test_semaphores(SemCreate sem_create) {
     clock_gettime(CLOCK_MONOTONIC, &after);
     const long elapsed_us =
         (after.tv_sec - before.tv_sec) * 1000000L + (after.tv_nsec - before.tv_nsec) / 1000L;
-    if (timed.result != ERR(60)) {
+    if (__atomic_load_n(&timed.result, __ATOMIC_ACQUIRE) != ERR(60)) {
         fprintf(stderr, "FAIL: timed wait returned %#x, expected ETIMEDOUT\n",
                 (unsigned)timed.result);
         ++failures;
@@ -185,7 +187,7 @@ static void test_semaphores(SemCreate sem_create) {
     usleep(5000);
     OK(sem_delete_fn(id));
     pthread_join(thread, NULL);
-    if (blocked.result != ERR(13)) {
+    if (__atomic_load_n(&blocked.result, __ATOMIC_ACQUIRE) != ERR(13)) {
         fprintf(stderr, "FAIL: waiter of a deleted semaphore returned %#x\n",
                 (unsigned)blocked.result);
         ++failures;
@@ -205,7 +207,7 @@ static void test_semaphores(SemCreate sem_create) {
     int32_t woken = 0;
     OK(sem_cancel_fn(id, 3, &woken));
     pthread_join(thread, NULL);
-    if (cancelled.result != ERR(85) || woken != 1) {
+    if (__atomic_load_n(&cancelled.result, __ATOMIC_ACQUIRE) != ERR(85) || woken != 1) {
         fprintf(stderr, "FAIL: cancel result %#x, woken %d\n", (unsigned)cancelled.result, woken);
         ++failures;
     }
@@ -220,6 +222,9 @@ static RwHandleOp rw_read_fn, rw_write_fn, rw_tryread_fn, rw_trywrite_fn, rw_unl
     rw_destroy_fn;
 static RwTimedOp rw_timedread_fn;
 
+/* `result` and `release` are handed between the test's threads, which is synchronized by the
+ * guest lock under test and by the usual "give the thread time" sleeps -- so they are accessed
+ * atomically: otherwise ThreadSanitizer reports the plain reads below as races. */
 struct RwArgs {
     void *handle;
     int32_t result;
@@ -227,8 +232,9 @@ struct RwArgs {
 
 static void *read_thread(void *arg) {
     struct RwArgs *args = arg;
-    args->result = rw_read_fn(&args->handle);
-    if (args->result == 0) {
+    const int32_t result = rw_read_fn(&args->handle);
+    __atomic_store_n(&args->result, result, __ATOMIC_RELEASE);
+    if (result == 0) {
         rw_unlock_fn(&args->handle);
     }
     return NULL;
@@ -242,8 +248,9 @@ struct WriterArgs {
 
 static void *writer_thread(void *arg) {
     struct WriterArgs *args = arg;
-    args->result = rw_write_fn(&args->handle);
-    if (args->result == 0) {
+    const int32_t result = rw_write_fn(&args->handle);
+    __atomic_store_n(&args->result, result, __ATOMIC_RELEASE);
+    if (result == 0) {
         while (!__atomic_load_n(&args->release, __ATOMIC_ACQUIRE)) {
             usleep(1000);
         }
@@ -339,7 +346,7 @@ static void test_rwlocks(void) {
     usleep(5000);
     OK(rw_unlock_fn(&handle));
     pthread_join(thread, NULL);
-    if (reader.result != 0) {
+    if (__atomic_load_n(&reader.result, __ATOMIC_ACQUIRE) != 0) {
         fprintf(stderr, "FAIL: reader behind a writer returned %#x\n", (unsigned)reader.result);
         ++failures;
     }
@@ -367,8 +374,9 @@ static void test_rwlocks(void) {
     struct WriterArgs writer = {.handle = handle, .release = 0};
     pthread_create(&thread, NULL, writer_thread, &writer);
     usleep(5000);
-    if (writer.result != 0) {
-        fprintf(stderr, "FAIL: writer thread returned %#x\n", (unsigned)writer.result);
+    const int32_t writer_result = __atomic_load_n(&writer.result, __ATOMIC_ACQUIRE);
+    if (writer_result != 0) {
+        fprintf(stderr, "FAIL: writer thread returned %#x\n", (unsigned)writer_result);
         ++failures;
     }
     const GuestTime past = {.seconds = 1, .nanoseconds = 0};

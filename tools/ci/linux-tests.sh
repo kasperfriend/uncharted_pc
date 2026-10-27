@@ -113,8 +113,39 @@ echo '== guest semaphores and rwlocks'
 gcc "${c11[@]}" -pthread -I. -Isrc tests/test_runtime_sync.c src/runtime_sema.c \
     src/runtime_rwlock.c -o "$out/runtime-sync-test"
 "$out/runtime-sync-test" | tail -1
+# The register-block mask the draw pipe and the draw-preparation workers walk on every
+# submission (video_core/amdgpu/block_mask.h): header-only, so it needs nothing else of the GPU.
+"$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_block_mask.cpp \
+    -o "$out/block-mask-test"
+"$out/block-mask-test"
 gcc -std=c11 -O2 -g -Wall -Wextra -Werror -pthread tests/bench_runtime_sync.c -o "$out/runtime-sync-bench"
 "$out/runtime-sync-bench"
+# The same two files under 10 threads at once (timeouts racing signals, delete with waiters).
+gcc "${c11[@]}" -pthread -I. -Isrc tests/stress_runtime_sync.c src/runtime_sema.c \
+    -o "$out/runtime-sync-stress"
+"$out/runtime-sync-stress" | tail -1
+# ThreadSanitizer, when the compiler carries it: the semaphore and rwlock state is shared by guest
+# threads and by the GPU side, and a data race there is a hang or a lost wakeup in the game rather
+# than a crash here. Any report fails the run (halt_on_error + exitcode).
+if gcc -fsanitize=thread -x c -c /dev/null -o /dev/null 2>/dev/null; then
+    echo "== ThreadSanitizer"
+    tsan=(-fsanitize=thread -g -O1 -pthread -I. -Isrc)
+    gcc -std=c11 "${tsan[@]}" tests/test_runtime_sync.c src/runtime_sema.c src/runtime_rwlock.c \
+        -o "$out/runtime-sync-tsan"
+    gcc -std=c11 "${tsan[@]}" tests/stress_runtime_sync.c src/runtime_sema.c \
+        -o "$out/runtime-sync-stress-tsan"
+    export TSAN_OPTIONS="halt_on_error=0 exitcode=66 second_deadlock_stack=1"
+    "$out/runtime-sync-tsan" >"$out/runtime-sync-tsan.log" 2>&1 || true
+    "$out/runtime-sync-stress-tsan" >>"$out/runtime-sync-tsan.log" 2>&1 || true
+    if grep -q 'WARNING: ThreadSanitizer' "$out/runtime-sync-tsan.log"; then
+        grep -m 5 'WARNING: ThreadSanitizer' -A 20 "$out/runtime-sync-tsan.log" >&2
+        echo 'ThreadSanitizer reported a data race (out/runtime-sync-tsan.log)' >&2
+        exit 1
+    fi
+    echo "   no data races reported"
+else
+    echo '== ThreadSanitizer not available in this compiler, skipped'
+fi
 
 echo '== streaming guest-memory copy'
 "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -mavx -Igpu/shim tests/test_stream_copy.cpp \
