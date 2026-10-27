@@ -1475,11 +1475,11 @@ u64 BufferCache::AllocateArenaMemory(u64 size, vk::DeviceMemory& memory) {
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
     // bbport: a buffer is bound by several draws in a row and the buffers of a pass sit next to
     // each other in the arena, so the span the last search proved resident is remembered and
-    // widened over the neighbours it touches (Common::ResidentSpan). The search bisects every
-    // resident range of the port -- hundreds of them after a few minutes of play, 7-18 ns a call
-    // for the pass's own residents and 36-140 ns for another pass's -- for every buffer binding;
-    // a repeat binding inside the span is one compare (tests/bench_resident_hint.cpp). The span is
-    // per thread.
+    // widened over the neighbours it touches (ResidentSpan, common/interval_set.h). The
+    // search bisects every resident range of the port -- hundreds of them after a few minutes of
+    // play, 7-18 ns a call for the pass's own residents and 36-140 ns for another pass's -- for
+    // every buffer binding; a repeat binding inside the span is one compare
+    // (tests/bench_resident_hint.cpp). The span is per thread.
     static thread_local ResidentSpan hint;
     if (ResidentSpanCovers(hint, residency_hint_id, first_block, last_block)) {
         return;
