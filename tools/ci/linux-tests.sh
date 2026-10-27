@@ -73,6 +73,22 @@ echo '== display configuration patch'
 gcc "${c11[@]}" -I. -Isrc tests/test_display.c src/runtime_display.c -o "$out/display-test"
 "$out/display-test"
 
+# --- guest runtime build shape ----------------------------------------------------------------
+echo '== guest runtime compiles with the port code generation'
+# The HLE runtime is plain C and is built at -O3 with -Werror: warnings that only appear with
+# that optimization level and the build's instruction set (a helper that is used on Windows
+# only, snprintf truncation into a fixed guest field) break the game build. The files that
+# need SDL3/libavcodec headers are built by build.sh, not here.
+rt_flags=(-std=c11 -O3 -g -Wall -Wextra -Werror -pthread -I. -Isrc "${zydis_inc[@]}")
+if [[ $(uname -m) == x86_64 ]]; then
+    rt_flags+=(-march=x86-64-v2 -mavx -mf16c -mno-avx2 -mno-fma -mno-bmi -mno-bmi2
+               -mtune=core-avx-i -mprefer-vector-width=128)
+fi
+for source in src/probe.c src/cpu_patch.c $(ls src/runtime_*.c | grep -v -e runtime_audio.c -e runtime_pad.c -e runtime_ajm.c); do
+    gcc "${rt_flags[@]}" -fsyntax-only "$source"
+done
+echo '   ok'
+
 # --- host helpers the port adds ---------------------------------------------------------------
 cxx=${CXX:-g++}
 echo '== bit array (vector scans: AVX 256-bit, SSE2, scalar)'
@@ -91,6 +107,15 @@ for variant in "-mavx -mno-avx2" "-mno-avx"; do
     printf '   %-18s ' "$variant"
     "$out/bench-bit-array"
 done
+echo '== guest semaphores and rwlocks'
+# Both files are self-contained C: the test drives them through the same resolver the guest
+# import table uses (many live objects, FIFO waiters, timeouts, cancel, delete, rwlock owner rules).
+gcc "${c11[@]}" -pthread -I. -Isrc tests/test_runtime_sync.c src/runtime_sema.c \
+    src/runtime_rwlock.c -o "$out/runtime-sync-test"
+"$out/runtime-sync-test" | tail -1
+gcc -std=c11 -O2 -g -Wall -Wextra -Werror -pthread tests/bench_runtime_sync.c -o "$out/runtime-sync-bench"
+"$out/runtime-sync-bench"
+
 echo '== streaming guest-memory copy'
 "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -mavx -Igpu/shim tests/test_stream_copy.cpp \
     gpu/shim/bbport_memcpy.cpp -o "$out/stream-copy-test"

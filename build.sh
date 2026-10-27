@@ -140,7 +140,41 @@ cc_flags=("${arch_flags[@]}")
 if [[ ${#cc_flags[@]} -gt 0 ]] && ! "$CC" "${cc_flags[@]}" -x c -E /dev/null >/dev/null 2>&1; then
     cc_flags=(-msse4.2 -mpopcnt -mcx16 -mavx -mf16c)
 fi
-"$CC" -std=c11 -O3 -g -Wall -Wextra -Werror -pthread -no-pie "${cc_flags[@]}" "${includes[@]}" -I. -Isrc src/probe.c src/cpu_patch.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm -lZydis "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
+# The runtime is one program spread over a dozen files: compile it once into out/rt (an
+# unchanged file is not compiled again) and link with LTO, so the small helpers (error
+# translation, file lookups, region queries) inline into the HLE functions that call them
+# instead of crossing a file boundary, and the caller does not pay for the dead argument
+# setup. -fno-plt keeps the calls into the GPU library down to one indirect call each, which
+# matters for bbgpu_handle_fault: every guest write fault goes through it. BB_RT_LTO=OFF
+# builds the runtime without LTO.
+runtime_flags=(-std=c11 -O3 -g -Wall -Wextra -Werror -pthread "${cc_flags[@]}" "${includes[@]}" -I. -Isrc)
+runtime_link=(-no-pie)
+runtime_lto=off
+if [[ ${BB_RT_LTO:-AUTO} != OFF ]] && ! "$CC" --version 2>/dev/null | grep -qi clang; then
+    for candidate in -flto=auto -flto; do
+        if "$CC" "$candidate" -x c -c /dev/null -o /dev/null >/dev/null 2>&1; then
+            runtime_lto=$candidate
+            break
+        fi
+    done
+fi
+if [[ $runtime_lto != off ]]; then
+    runtime_flags+=("$runtime_lto")
+    runtime_link+=("$runtime_lto")
+fi
+if "$CC" -fno-plt -x c -E /dev/null >/dev/null 2>&1; then
+    runtime_flags+=(-fno-plt)
+fi
+mkdir -p out/rt
+runtime_objects=()
+for source in src/probe.c src/cpu_patch.c "${runtime[@]}" src/vulkan_smoke.c; do
+    object="out/rt/$(basename "${source%.c}").o"
+    runtime_objects+=("$object")
+    if [[ ! -f $object || $source -nt $object || -n $(find src -name '*.h' -newer "$object" -print -quit) ]]; then
+        "$CC" "${runtime_flags[@]}" -c "$source" -o "$object"
+    fi
+done
+"$CC" "${runtime_link[@]}" "${runtime_objects[@]}" out/libatrac9.a -lm -lZydis "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
 echo "Built $PWD/out/bb-probe"
 # GPU check for run.sh (live_resolution=auto): links only the Vulkan loader.
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
@@ -157,6 +191,14 @@ if [[ ${1:-} == --test ]]; then
     out/content-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_cpu_patch.c src/cpu_patch.c -lZydis -o out/cpu-patch-test
     out/cpu-patch-test
+    # Guest sync and memory-tracking fast paths (registry lookups, wait setup, region cache).
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread tests/bench_runtime_sync.c -o out/runtime-bench
+    out/runtime-bench
+    # Guest semaphores and rwlocks: both files are self-contained, so they are tested on their
+    # own (the whole-runtime tests above need the audio and pad libraries).
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_runtime_sync.c \
+        src/runtime_sema.c src/runtime_rwlock.c -o out/runtime-sync-test
+    out/runtime-sync-test
     # Host-side helpers; the C++ compiler of the toolchain builds them. Two builds of the bit
     # array: this machine's code generation and the SSE2-only one (cores without AVX2).
     cxx=$(command -v clang++ || command -v g++ || true)

@@ -51,6 +51,16 @@ The C runtime (`src/`, the HLE system calls the guest calls) is built with the s
 `-O3` by `build.sh`; on Windows CMake builds it together with the loader, so it gets the same
 treatment through the same options.
 
+On Linux `build.sh` also compiles the runtime once into `out/rt/` (an unchanged file is not
+compiled again) and links it with LTO and `-fno-plt` (`BB_RT_LTO=OFF` turns the LTO off):
+
+- The runtime is a dozen separate files of small helpers — error translation, file lookups,
+  range queries — that the HLE calls walk through on every guest operation. LTO inlines them
+  into their callers: on the runtime's own sources it removes **8.6 % of the call sites**
+  (2118 → 1936) and 5.7 % of the text.
+- `-fno-plt` turns the call into the GPU library (`bbgpu_handle_fault`, the entry every guest
+  write fault goes through) into one GOT-indirect call instead of a PLT stub jump.
+
 ## Profile-guided optimization
 
 ```bash
@@ -139,6 +149,47 @@ buffer-cache copies; the GPU thread waits for them only at a fence that needs th
   host sites in the rasterizer built their label with `fmt::format` first. The clear/resolve/
   depth-copy paths now drain explicitly, once each instead of twice through their begin/end
   markers, and the label is only formatted when it is written.
+
+## Guest synchronization and range queries (`src/`)
+
+The guest's rwlocks, semaphores and the GPU side's guest-range queries are the runtime's three
+hottest data structures; none of them was indexed.
+
+- **Registry lookups.** The PS4 rwlock and semaphore handles live in a registry that was walked
+  in full on *every* operation (read lock, write lock, unlock, wait, signal, poll) while holding
+  a global mutex. Both registries are now hashed buckets chained through the objects' own `next`
+  pointer: one bucket probe instead of the whole list. `tests/bench_runtime_sync.c`:
+
+  | Live objects | List scan | Hashed | |
+  |---|---|---|---|
+  | 4 | 1.5 ns | 0.6 ns | 2.3× |
+  | 16 | 4.9 ns | 1.1 ns | 4.5× |
+  | 64 | 20.7 ns | 1.1 ns | 19× |
+  | 128 | 58.4 ns | 0.6 ns | 94× |
+
+- **Region cache.** `runtime_memory.c` keeps a per-thread cache of recently resolved guest
+  mappings (`cached_region`), consulted for every GPU-side `clamp`/`region`/`is_mapped` query —
+  that is, for every buffer and texture binding. It was 8 entries probed one by one and replaced
+  round-robin, so unrelated mappings evicted each other and every miss took the runtime's
+  read lock. It is now 32 slots indexed by the address (page bits mixed, so consecutive pages
+  spread out): **7.9 ns → 1.0 ns** per query, and four times as many regions stay cached.
+
+- **Register deltas.** `AmdGpu::RegDelta::Capture` (`video_core/amdgpu/regs.h`) copies the
+  registers a submission wrote into the draw-preparation worker's delta, out of a bitmap of the
+  register file's 1664 blocks. It tested all 1664 blocks, on every standard library (`std::bitset`
+  has no portable set-bit walk; the draw pipe's own copy of the walk was libstdc++-only). The
+  bitmap is now a 26-word mask of its own with `ForEachSet`, which the register writes mark with
+  a few word writes (`SetRange`) instead of one per bit: **~1.4 µs → ~50 ns** per submission
+  (≈25×), checked against the block scan for empty, partial, tail, field and reset captures, and
+  the draw pipe fills its packet from the same walk on every platform, Windows included.
+
+- **Blocks that only the game build sees.** `tests/ci` now compiles the runtime with the port's
+  own `-O3 -Werror` and instruction set, which is where two Linux-only breakages were hiding:
+  a thread-priority helper that only Windows uses (`-Wunused-function`) and an `snprintf` into a
+  128-byte guest trophy field (`-Wformat-truncation`).
+
+`tests/bench_runtime_sync.c` prints all of the numbers above (`out/runtime-bench`, or the
+`guest synchronization and memory-tracking fast paths` block of `tools/ci/linux-tests.sh`).
 
 ## Bit arrays (`gpu/shadps4/common/bit_array.h`)
 

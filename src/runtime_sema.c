@@ -24,11 +24,17 @@ typedef struct Sema {
     struct Sema *next;
 } Sema;
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
-static Sema *registry;
+/* Looked up on every wait, signal and poll: hashed buckets (objects chain through their own
+   `next`) instead of a list walked in full. */
+enum { REGISTRY_BUCKETS = 64 };
+static Sema *registry[REGISTRY_BUCKETS];
 static uint32_t next_id=1;
 static size_t created, deleted, acquired, signaled, timed_out;
+static inline unsigned registry_bucket(uint32_t id) {
+    return (unsigned)((id*2654435761u)>>26) & (REGISTRY_BUCKETS-1);
+}
 static Sema *find(uint32_t id) {
-    for (Sema *s=registry;s;s=s->next) if (s->id==id) return s;
+    for (Sema *s=registry[registry_bucket(id)];s;s=s->next) if (s->id==id) return s;
     return NULL;
 }
 static void host_check(int e) {
@@ -55,7 +61,8 @@ static ABI int32_t sem_create(uint32_t *out,const char *name,uint32_t attr,
     pthread_mutex_lock(&lock);
     if (next_id==UINT32_MAX) { pthread_mutex_unlock(&lock); free(s); return ERR(28); }
     s->id=next_id++; s->attr=attr; s->count=s->initial=initial; s->maximum=maximum;
-    s->next=registry; registry=s; *out=s->id; ++created;
+    const unsigned bucket=registry_bucket(s->id);
+    s->next=registry[bucket]; registry[bucket]=s; *out=s->id; ++created;
     printf("Runtime: semaphore id=%u, attr=%u, initial=%d, max=%d\n",s->id,attr,initial,maximum);
     pthread_mutex_unlock(&lock);
     return 0;
@@ -150,7 +157,7 @@ static ABI int32_t sem_cancel(uint32_t id,int32_t count,int32_t *waiters) {
 }
 static ABI int32_t sem_delete(uint32_t id) {
     pthread_mutex_lock(&lock);
-    Sema **p=&registry;
+    Sema **p=&registry[registry_bucket(id)];
     while (*p && (*p)->id!=id) p=&(*p)->next;
     if (!*p) { pthread_mutex_unlock(&lock); return ERR(3); }
     Sema *s=*p; *p=s->next; s->deleted=1; ++deleted;

@@ -4,7 +4,8 @@
 #pragma once
 
 #include <algorithm>
-#include <bitset>
+#include <array>
+#include <bit>
 #include <cstring>
 #include <vector>
 #include "video_core/amdgpu/regs_color.h"
@@ -196,10 +197,63 @@ union Regs {
 // bbport: register blocks written by a stretch of packets, and their values at its end. The
 // draw-preparation scanner records one per submission so a worker reaches the state at the
 // start of any later submission without replaying the packets in between.
+/// One bit per register block, in words. `std::bitset` has no portable way to visit only the set
+/// bits, and the mask is walked on every submission (`RegDelta::Capture`), where testing all
+/// 1664 blocks costs more than the copy of the blocks themselves.
+struct BlockMask {
+    static constexpr u32 Words = (Regs::NumRegs / 32 + 63) / 64;
+    std::array<u64, Words> words{};
+
+    void Set(u32 block) {
+        words[block >> 6] |= u64{1} << (block & 63);
+    }
+    /// Marks the closed range [first, last] with a handful of word writes instead of one per bit.
+    void SetRange(u32 first, u32 last) {
+        u32 word = first >> 6;
+        const u32 last_word = last >> 6;
+        const u64 head = ~u64{0} << (first & 63);
+        const u64 tail = ~u64{0} >> (63 - (last & 63));
+        if (word == last_word) {
+            words[word] |= head & tail;
+            return;
+        }
+        words[word++] |= head;
+        for (; word < last_word; ++word) {
+            words[word] = ~u64{0};
+        }
+        words[last_word] |= tail;
+    }
+    bool Test(u32 block) const {
+        return (words[block >> 6] >> (block & 63)) & 1;
+    }
+    bool Any() const {
+        for (const u64 word : words) {
+            if (word) {
+                return true;
+            }
+        }
+        return false;
+    }
+    void Reset() {
+        words.fill(0);
+    }
+    /// Calls fn(block) for every set block, skipping the empty words in between.
+    template <typename F>
+    void ForEachSet(F&& fn) const {
+        for (u32 index = 0; index < Words; ++index) {
+            u64 word = words[index];
+            while (word) {
+                fn(index * 64 + u32(std::countr_zero(word)));
+                word &= word - 1;
+            }
+        }
+    }
+};
+
 struct RegDirty {
     static constexpr u32 BlockWords = 32;
     static constexpr u32 NumBlocks = Regs::NumRegs / BlockWords;
-    std::bitset<NumBlocks> blocks;
+    BlockMask blocks;
     bool reset = false; ///< ClearState: defaults, then only the blocks marked after it
 
     void Mark(u32 word, u32 count) {
@@ -207,9 +261,7 @@ struct RegDirty {
             return;
         }
         const u32 last = std::min(word + count, Regs::NumRegs) - 1;
-        for (u32 block = word / BlockWords; block <= last / BlockWords; ++block) {
-            blocks.set(block);
-        }
+        blocks.SetRange(word / BlockWords, last / BlockWords);
     }
     template <typename T>
     void MarkField(const Regs& regs, const T& field) {
@@ -218,7 +270,7 @@ struct RegDirty {
         Mark(u32(offset / sizeof(u32)), u32((sizeof(T) + sizeof(u32) - 1) / sizeof(u32)));
     }
     void Clear() {
-        blocks.reset();
+        blocks.Reset();
         reset = false;
     }
 };
@@ -232,14 +284,18 @@ struct RegDelta {
         reset = dirty.reset;
         blocks.clear();
         words.clear();
-        for (u32 block = 0; block < RegDirty::NumBlocks; ++block) {
-            if (dirty.blocks.test(block)) {
-                blocks.push_back(u16(block));
-                const u32* src = regs.reg_array.data() + block * RegDirty::BlockWords;
-                words.insert(words.end(), src, src + RegDirty::BlockWords);
-            }
-        }
+        // Only the blocks the submission wrote are visited: the mask skips the empty words, so a
+        // capture costs its own blocks (usually a few) instead of the 1664-block register file.
+        dirty.blocks.ForEachSet([this, &regs](u32 block) { CaptureBlock(regs, block); });
     }
+private:
+    void CaptureBlock(const Regs& regs, u32 block) {
+        blocks.push_back(u16(block));
+        const u32* src = regs.reg_array.data() + block * RegDirty::BlockWords;
+        words.insert(words.end(), src, src + RegDirty::BlockWords);
+    }
+
+public:
     void Apply(Regs& regs) const {
         if (reset) {
             regs.SetDefaults();
