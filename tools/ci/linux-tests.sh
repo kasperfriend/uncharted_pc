@@ -118,6 +118,14 @@ gcc "${c11[@]}" -pthread -I. -Isrc tests/test_runtime_sync.c src/runtime_sema.c 
 "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_block_mask.cpp \
     -o "$out/block-mask-test"
 "$out/block-mask-test"
+# The page-use table the buffer cache stamps for every binding, and the residency span it keeps
+# for the next one (video_core/buffer_cache/page_stamp.h, common/interval_set.h).
+"$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_page_stamp.cpp \
+    -o "$out/page-stamp-test"
+"$out/page-stamp-test"
+"$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_resident_span.cpp \
+    -o "$out/resident-span-test"
+"$out/resident-span-test"
 gcc -std=c11 -O2 -g -Wall -Wextra -Werror -pthread tests/bench_runtime_sync.c -o "$out/runtime-sync-bench"
 "$out/runtime-sync-bench"
 # The same two files under 10 threads at once (timeouts racing signals, delete with waiters).

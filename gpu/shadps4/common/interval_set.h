@@ -29,6 +29,43 @@ concept IsInterval = std::derived_from<IV, Interval> && std::is_trivially_copyab
                          { a.SubRange(x, x) } -> std::same_as<IV>;
                      };
 
+/// bbport: the span a search over an IntervalList was found gap-free over, as a per-thread
+/// hint for the next search (BufferCache::EnsureResident: every buffer binding looks up whether
+/// its blocks are resident, and a buffer is bound by several draws in a row while the buffers of
+/// a pass sit next to each other, so the span is widened over the neighbours it touches).
+///
+/// `id` ties the span to the cache that published it; the hint is per thread, so no pair is ever
+/// exchanged between threads and nothing here needs a lock. Residency is only ever added to (a
+/// gap-free span stays gap-free), which is what makes the cached answer safe.
+struct ResidentSpan {
+    u64 id = 0;
+    u64 first = 0;
+    u64 last = 0;
+};
+
+/// True when the span was published by `id` and already covers [first, last].
+inline bool ResidentSpanCovers(const ResidentSpan& span, u64 id, u64 first, u64 last) {
+    return span.id == id && first >= span.first && last <= span.last;
+}
+
+/// Widens [first, last] to take in the span when it overlaps or touches the range (the result
+/// then has no block outside the range that the span does not already cover).
+inline void ResidentSpanWiden(const ResidentSpan& span, u64 id, u64& first, u64& last) {
+    if (span.id != id || span.first > span.last || first > span.last + 1 ||
+        span.first > last + 1) {
+        return;
+    }
+    first = std::min(first, span.first);
+    last = std::max(last, span.last);
+}
+
+/// Records [first, last] as gap-free (only after a search found no gap in it).
+inline void ResidentSpanPublish(ResidentSpan& span, u64 id, u64 first, u64 last) {
+    span.id = id;
+    span.first = first;
+    span.last = last;
+}
+
 template <class IV = Interval>
     requires IsInterval<IV>
 class IntervalList {
@@ -173,7 +210,7 @@ protected:
             intervals.insert(first, src, src + m);
             return;
         }
-        const auto slots = std::distance(first, last);
+        const auto slots = static_cast<std::size_t>(std::distance(first, last));
         if (m <= slots) {
             std::copy(src, src + m, first);
             if (m < slots) {

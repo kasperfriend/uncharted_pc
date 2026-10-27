@@ -270,6 +270,12 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    /// bbport: identifies this cache in the per-thread residency hint of EnsureResident.
+    u64 residency_hint_id{NextResidencyHintId()};
+    static u64 NextResidencyHintId() {
+        static std::atomic<u64> next{1};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
 
     /// bbport: arena memory chunks (see AllocateArenaMemory).
     struct ArenaChunk {

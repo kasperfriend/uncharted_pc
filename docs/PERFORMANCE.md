@@ -293,6 +293,60 @@ them against a scalar model (ranges, iterators, the set operators, the fused for
 `tests/bench_bit_array.cpp` prints the timings above for the build at hand, and
 `tools/ci/linux-tests.sh` builds it twice (AVX and SSE2) so the difference is visible in CI.
 
+## Per-binding costs in the buffer cache (`video_core/buffer_cache/`)
+
+Two costs sit on the path of *every* buffer binding, which the profile puts at 32 % of the GPU
+command thread's time (`BindResources`), and neither showed up in a profiler because both are a
+handful of instructions done a few thousand times a frame.
+
+- **Is the range resident?** `EnsureResident` bisects the port's list of resident block ranges
+  before a buffer is used, and that list only ever grows: after a few minutes of play it holds
+  hundreds of ranges over dozens of KiB, so the search is a handful of dependent loads into cold
+  memory. A buffer, though, is bound by several draws in a row and the buffers of a pass are
+  allocated next to each other, so the span the last search proved gap-free is kept per thread
+  (`ResidentSpan` in `common/interval_set.h`) and **widened** over each new binding that touches
+  it: one binding pays the search, the following ones are a compare.
+
+  | Resident ranges | Search, warm | Search, cold | Span hit | |
+  |---|---|---|---|---|
+  | 64 | 7–8 ns | 36–39 ns | 0.7–1.0 ns | 36–54× |
+  | 256 | 7–10 ns | 48–56 ns | 0.7–1.2 ns | 47–72× |
+  | 1024 | 9–10 ns | 62–71 ns | 0.6–0.8 ns | 92–103× |
+  | 4096 | 11–13 ns | 82 ns | 0.6–0.7 ns | 125–129× |
+  | 65536 | 17–18 ns | 129–140 ns | 0.8 ns | 161–171× |
+
+  (`tests/bench_resident_hint.cpp`; "warm" is a binding of the pass whose residents the last
+  search touched, "cold" one of another pass, and the span hit is what a repeat binding costs.)
+  The cache is sound because residency is monotone: a gap-free span stays gap-free. That is what
+  `tests/test_resident_span.cpp` checks over 20 000 queries against a list with holes in it — a
+  span that claims a block the list does not have, or a widening that reaches across a hole,
+  fails the test.
+
+- **Which frame last used each page?** `NoteGpuUse` stamps the frames of the 8 MB table the buffer
+  cache keeps for the GPU heap window, so GPU data still in use is never dropped as dead. Most
+  pages of a range already carry the frame being written (the same buffer bound again), so
+  stamping them again only dirties cache lines. Ranges of 16 pages (64 KiB) and up are compared
+  8 pages at a time with two 128-bit integer compares and stored only where they differ
+  (`PageStamp::Mark` in `video_core/buffer_cache/page_stamp.h`):
+
+  | Pages per bind | Plain stores | Compare and skip | |
+  |---|---|---|---|
+  | 1–8 | 3.5–5.1 ns | 3.5–5.1 ns | — (plain stores are used) |
+  | 16 | 7.6–7.9 ns | 7.0–7.3 ns | 1.06–1.09× |
+  | 32 | 12.7–13.5 ns | 10.4–10.8 ns | 1.22–1.25× |
+  | 64 (256 KiB) | 23.8–25.7 ns | 16.8–17.9 ns | 1.41–1.45× |
+  | 256 (1 MiB) | 93–101 ns | 72 ns | 1.31–1.41× |
+  | 1024 (4 MiB) | 357–367 ns | 200–207 ns | 1.73–1.82× |
+
+  `tests/bench_page_stamp.cpp` prints that table. `tests/test_page_stamp.cpp` checks the fast
+  path against the plain loop at every length around the threshold, from every offset that
+  straddles a step, in both toggle states and over random frames — inverting its store condition
+  fails 2 494 of its 2 801 checks.
+
+Both can be switched off at runtime (`BB_TOGGLE_FILE`): `GpuUseStamp` for the stamping; the
+residency span has no toggle because it changes nothing observable, only how the same answer is
+reached.
+
 ## Measuring
 
 - `BB_DCB_STATS=1` prints the GPU thread's per-frame counters (see `docs/parallel_gpu.md`).

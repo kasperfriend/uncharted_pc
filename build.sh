@@ -279,5 +279,9 @@ if [[ ${1:-} == --test ]]; then
         out/stream-copy-test
         "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_block_mask.cpp -o out/block-mask-test
         out/block-mask-test
+        "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_page_stamp.cpp -o out/page-stamp-test
+        out/page-stamp-test
+        "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_resident_span.cpp -o out/resident-span-test
+        out/resident-span-test
     fi
 fi

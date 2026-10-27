@@ -19,6 +19,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/page_stamp.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -682,10 +683,8 @@ void NoteGpuUse(VAddr address, u64 size) {
         return;
     }
     const u32 frame = g_guest_frames.load(std::memory_order_relaxed);
-    for (u64 page = (begin - GpuUseLow) >> 12, last = (end - 1 - GpuUseLow) >> 12; page <= last;
-         ++page) {
-        gpu_use_frame[page] = frame;
-    }
+    PageStamp::Mark(gpu_use_frame.get(), (begin - GpuUseLow) >> 12, (end - 1 - GpuUseLow) >> 12,
+                    frame, !BbToggle::Disabled(BbToggle::GpuUseStamp));
 }
 
 // bbport diagnosis: the latest resolutions of CPU writes to pages holding GPU data, printed on
@@ -1474,14 +1473,30 @@ u64 BufferCache::AllocateArenaMemory(u64 size, vk::DeviceMemory& memory) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    // bbport: a buffer is bound by several draws in a row and the buffers of a pass sit next to
+    // each other in the arena, so the span the last search proved resident is remembered and
+    // widened over the neighbours it touches (Common::ResidentSpan). The search bisects every
+    // resident range of the port -- hundreds of them after a few minutes of play, 7-18 ns a call
+    // for the pass's own residents and 36-140 ns for another pass's -- for every buffer binding;
+    // a repeat binding inside the span is one compare (tests/bench_resident_hint.cpp). The span is
+    // per thread.
+    static thread_local ResidentSpan hint;
+    if (ResidentSpanCovers(hint, residency_hint_id, first_block, last_block)) {
+        return;
+    }
+    u64 search_first = first_block;
+    u64 search_last = last_block;
+    ResidentSpanWiden(hint, residency_hint_id, search_first, search_last);
+
     u32 resident_blocks{};
     IntervalList bind_ranges;
-    resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
+    resident_ranges.ForEachGap(search_first, search_last + 1, [&](u64 start, u64 end) {
         resident_blocks += end - start;
         bind_ranges.Add({start, end});
     });
 
     if (bind_ranges.Empty()) {
+        ResidentSpanPublish(hint, residency_hint_id, search_first, search_last);
         return;
     }
     BbStats::Timer timer{BbStats::t_resident};
