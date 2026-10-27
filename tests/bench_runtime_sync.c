@@ -7,7 +7,8 @@
  *   - blocking wait: the pthread condition variable that a wait no longer creates and destroys
  *     around every wait (src/runtime_sema.c keeps one per thread instead),
  *   - region cache: 8-entry linear probe against page-indexed direct-mapped slots
- *     (src/runtime_memory.c; the cache serves every GPU-side guest range query).
+ *     (src/runtime_memory.c; the cache serves every GPU-side guest range query), and what a
+ *     frame's set of hot ranges costs at 32, 128 and 256 slots.
  *
  * Self-contained on purpose: it links nothing from the runtime, so it builds and runs anywhere.
  */
@@ -213,6 +214,63 @@ static void cache_region_direct(uintptr_t start, uintptr_t end) {
     region_direct_cache[region_slot(start)] = (CachedRegion){generation, start, end, 1};
 }
 
+/* --- region cache capacity: a frame's hot range set at 32, 128 and 256 slots -------------- */
+
+#define SWEEP_SLOTS 256
+#define SWEEP_MAX_RANGES 512
+static __thread CachedRegion sweep_cache[SWEEP_SLOTS];
+static uintptr_t sweep_starts[SWEEP_MAX_RANGES], sweep_ends[SWEEP_MAX_RANGES];
+static unsigned sweep_ranges;
+static pthread_rwlock_t sweep_lock = PTHREAD_RWLOCK_INITIALIZER;
+static uint64_t sweep_generation = 2;
+
+/* Sorted range table, binary searched the way vma_index does it in the runtime. */
+static unsigned sweep_index(uintptr_t address) {
+    unsigned lo = 0, hi = sweep_ranges;
+    while (lo < hi) {
+        const unsigned mid = (lo + hi) / 2;
+        if (sweep_starts[mid] <= address) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo ? lo - 1 : 0;
+}
+
+static double bench_region_capacity(unsigned slots, unsigned hot) {
+    memset(sweep_cache, 0, sizeof sweep_cache);
+    sweep_ranges = hot;
+    for (unsigned i = 0; i < hot; ++i) {
+        sweep_starts[i] = 0x10000000u + (uintptr_t)i * 0x20000u;
+        sweep_ends[i] = sweep_starts[i] + 0x1000u;
+    }
+    pthread_rwlock_wrlock(&sweep_lock);
+    ++sweep_generation;
+    pthread_rwlock_unlock(&sweep_lock);
+    const long queries = 2000000;
+    long hits = 0;
+    const double start = now_ns();
+    for (long i = 0; i < queries; ++i) {
+        /* 6 bindings per draw from the hot set, in the order a draw happens to need them */
+        unsigned h = (unsigned)(i * 2654435761u) >> 9;
+        const uintptr_t address = sweep_starts[h % hot];
+        uint64_t page = address >> 12;
+        page ^= page >> 5;
+        CachedRegion *c = &sweep_cache[page & (slots - 1)];
+        if (c->generation == sweep_generation && c->start <= address && address < c->end) {
+            ++hits;
+            continue;
+        }
+        /* A miss takes the runtime's read lock and searches the range table. */
+        pthread_rwlock_rdlock(&sweep_lock);
+        const unsigned index = sweep_index(address);
+        pthread_rwlock_unlock(&sweep_lock);
+        *c = (CachedRegion){sweep_generation, sweep_starts[index], sweep_ends[index], 1};
+    }
+    const double ns = (now_ns() - start) / (double)queries;
+    printf("  %3u slots, %3u hot ranges: %5.1f%% cached, %6.2f ns/query\n", slots, hot,
+           100.0 * (double)hits / (double)queries, ns);
+    return ns;
+}
+
 #define REGION_COUNT 32
 static uintptr_t region_addresses[REGION_COUNT];
 static long region_iterations = 4000000;
@@ -274,5 +332,12 @@ int main(void) {
     const double direct = best_of(3, bench_region_direct);
     printf("  8-entry linear %6.2f ns, 32-entry direct-mapped %5.2f ns (%4.1fx)\n", linear, direct,
            linear / direct);
+    printf("Region cache capacity, random bindings over a frame's hot ranges:\n");
+    const unsigned hot_counts[] = {16, 40, 100};
+    for (unsigned h = 0; h < sizeof(hot_counts) / sizeof(*hot_counts); ++h) {
+        bench_region_capacity(32, hot_counts[h]);
+        bench_region_capacity(128, hot_counts[h]);
+        bench_region_capacity(256, hot_counts[h]);
+    }
     return 0;
 }

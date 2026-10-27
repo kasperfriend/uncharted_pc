@@ -868,8 +868,11 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
 typedef struct { uint64_t generation; uintptr_t start, end; int kind; } CachedRegion;
 /* Indexed by the address instead of probed entry by entry: the GPU asks about a handful of
  * buffers and textures over and over, and every query that misses here takes the lock below.
- * The page bits are mixed so that consecutive 4 KiB pages land in different slots. */
-enum { REGION_CACHE_SLOTS = 32 };
+ * The page bits are mixed so that consecutive 4 KiB pages land in different slots. 32 slots
+ * already thrash on a frame that touches ~40 distinct ranges (a scene's vertex buffers, the
+ * textures it samples, its targets): 40% of the queries then miss. 256 slots cost 8 KiB per
+ * thread and hold ~100 ranges without conflicts. */
+enum { REGION_CACHE_SLOTS = 256 };
 static __thread CachedRegion region_cache[REGION_CACHE_SLOTS];
 static inline unsigned region_cache_slot(uintptr_t address) {
     uint64_t page=address>>12;

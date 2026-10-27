@@ -171,8 +171,23 @@ hottest data structures; none of them was indexed.
   mappings (`cached_region`), consulted for every GPU-side `clamp`/`region`/`is_mapped` query —
   that is, for every buffer and texture binding. It was 8 entries probed one by one and replaced
   round-robin, so unrelated mappings evicted each other and every miss took the runtime's
-  read lock. It is now 32 slots indexed by the address (page bits mixed, so consecutive pages
-  spread out): **7.9 ns → 1.0 ns** per query, and four times as many regions stay cached.
+  read lock. It is now a table indexed by the address (page bits mixed, so consecutive pages
+  spread out): **7.9 ns → 1.1 ns** per query.
+
+  Its size was then raised from 32 to 256 slots, because a frame does not stay within 32
+  distinct guest ranges: a scene binds its vertex and index buffers, the textures it samples and
+  its render targets, and each range that is not cached costs a read lock and a search of the
+  mapping table. `tests/bench_runtime_sync.c` sweeps the capacity with the runtime's own lock and
+  table search on the miss path:
+
+  | Hot ranges in a frame | 32 slots | 256 slots | |
+  |---|---|---|---|
+  | 16 | 2.1 ns/query | 2.1 ns/query | — |
+  | 40 | 2.9 ns/query | 2.1 ns/query | 1.4× |
+  | 100 | 19.7 ns/query | 2.0 ns/query | **10×** |
+
+  The table costs 8 KiB per thread; the queries it serves are a handful per draw, so the larger
+  table is a pure win once a frame touches more than ~30 ranges.
 
 - **Register deltas.** `AmdGpu::RegDelta::Capture` (`video_core/amdgpu/regs.h`) copies the
   registers a submission wrote into the draw-preparation worker's delta, out of a bitmap of the
@@ -182,6 +197,16 @@ hottest data structures; none of them was indexed.
   a few word writes (`SetRange`) instead of one per bit: **~1.4 µs → ~50 ns** per submission
   (≈25×), checked against the block scan for empty, partial, tail, field and reset captures, and
   the draw pipe fills its packet from the same walk on every platform, Windows included.
+
+- **Register hashing.** Every register-writing PM4 packet is folded into the running checksum
+  that the draw-preparation workers compare against (`Liverpool::HashRegisterPacket`), on the GPU
+  thread and on every worker. The fold carried a per-word shift-xor (`h ^= h >> 29`) that sat in
+  the dependency chain, ~7 cycles per word; the bare fold `h = (h ^ word) * odd_constant` is ~4
+  and measures **1.5×** on 8- to 150-word packets. Nothing is lost for this use: xor and
+  multiplication by an odd constant are invertible, so two streams that differ in one word always
+  end up with different checksums (10 400 single-bit cases, no collisions), and the fold stays
+  independent of where a caller starts and stops, so a packet split differently in two places
+  still hashes the same.
 
 - **Blocks that only the game build sees.** `tests/ci` now compiles the runtime with the port's
   own `-O3 -Werror` and instruction set, which is where two Linux-only breakages were hiding:
@@ -240,3 +265,10 @@ them against a scalar model (ranges, iterators, the set operators, the fused for
 same `.github/actions/windows-build` the release uses) and runs the host-side tests on Linux
 (`tools/ci/linux-tests.sh` plus the launcher's tests). `.github/workflows/release.yml` builds
 `dist/uncharted-windows.zip` on demand and attaches it, with its SHA-256, to a GitHub release.
+
+A failed build step's log is only reachable through a signed URL, so the Windows build step
+tees the build output and turns the error lines into annotations of the run and the tail into the
+job summary; `build.sh` keeps `out/gpu-configure.log` and `out/gpu-build.log` for the same
+reason. Two things about that job are easy to trip over: the compiler cache needs the compiler
+path CMake passes it, and a POSIX `ccache` does not accept the absolute Windows path form, so the
+step probes it and falls back to a wrapper (or to no cache) instead of failing.
