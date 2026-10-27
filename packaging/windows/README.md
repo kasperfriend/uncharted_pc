@@ -79,8 +79,9 @@ works for menus and movies.
 
 Not ported: the watchdog/`--timeout` thread dumps (Linux signals), userfaultfd tracking
 (`BB_UFFD`), MangoHud, the GTK launcher (`launcher/bbport_launcher_win.py`, Tkinter, replaces it),
-and the `tests/` programs that use Linux-only APIs (`tools/ci/linux-tests.sh` runs the rest on
-Linux; `bash build.sh --test` runs what Windows can).
+and the `tests/` programs that use Linux-only APIs. `tools/ci/linux-tests.sh` builds and runs
+the host-side ones (guest instruction rewriting, the HLE file/content/display code, the bit
+array, the streaming copy) without a GPU; CI runs it on every push.
 
 The build options (`BB_ARCH`, `BB_LTO`, `BB_PGO`, ...) and the optimizations behind them are in
 `docs/PERFORMANCE.md`. PGO works on Windows too: `bash tools/pgo.sh generate`, play,
