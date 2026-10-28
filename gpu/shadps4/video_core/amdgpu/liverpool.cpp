@@ -23,6 +23,7 @@
 #include "core/memory.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/amdgpu/reg_checksum.h"
 #include "bbport_write_log.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/landing_gate.h"
@@ -566,21 +567,16 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 // bbport: graphics-register effects of a type-3 packet. The GPU thread and the draw-preparation
 // workers both go through this function, and both fold every register-writing packet into a
 // running checksum: equal checksums at a draw mean equal register files.
+//
+// The fold itself is FoldRegisterWords (video_core/amdgpu/reg_checksum.h): four multiply-xor chains
+// that only meet at the end, which costs the multiplier's throughput per word instead of its
+// latency -- 8 to 24 word packets fold 1.7x to 2.4x faster than the single chain this replaces
+// (tests/bench_reg_packets.cpp). Both sides of the comparison walk the same packets with the same
+// boundaries, so they always fold the same words into the same lanes; were a caller to split a
+// packet differently, the two checksums would simply stop matching and the draw would recompute
+// what it has, which is what a differing checksum means anyway.
 u64 Liverpool::HashRegisterPacket(u64 checksum, const u32* words, u32 count) {
-    // bbport: the fold is a bare multiply by an odd constant, without the per-word shift-xor
-    // that a general-purpose hash needs. The shift-xor sat in the dependency chain
-    // (xor -> multiply -> shift -> xor: ~7 cycles per word); the bare fold is ~4 and measures
-    // 1.5x faster over register-sized packets. Nothing is lost for what this checksum is used
-    // for: xor and multiplication by an odd constant are both invertible, so two streams that
-    // differ in one word always end with different checksums, and the shift between them is
-    // only needed to decorrelate streams of *different* lengths, which cannot be compared here
-    // (a worker replays exactly the packets the GPU thread does, and this fold also stays
-    // independent of where a caller starts and stops, so a packet split differently in two
-    // places still hashes the same).
-    for (u32 i = 0; i < count; ++i) {
-        checksum = (checksum ^ words[i]) * 0x9E3779B97F4A7C15ull;
-    }
-    return checksum;
+    return FoldRegisterWords(checksum, words, count);
 }
 
 void Liverpool::ApplyComputeRegisterPacket(ComputeProgram& cs, const PM4Header* header) {

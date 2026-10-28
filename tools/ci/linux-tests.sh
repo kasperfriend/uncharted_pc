@@ -163,6 +163,21 @@ echo '== dynamic state per draw (recompute against the register-block memo)'
     -mno-fma -mno-bmi -mno-bmi2 -mtune=core-avx-i -mprefer-vector-width=128 \
     tests/bench_dynamic_state.cpp -o "$out/bench-dynamic-state"
 "$out/bench-dynamic-state"
+# The checksum a draw's register packets fold into (video_core/amdgpu/reg_checksum.h): the same
+# packets on the same thread must fold to the same value, and two different register files must
+# not fold alike -- a false match there reuses another draw's key and dynamic state.
+echo '== register packet checksum fold'
+"$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_reg_fold.cpp \
+    -o "$out/reg-fold-test"
+"$out/reg-fold-test"
+# ... and what that fold costs per packet: four multiply-xor chains against the single chain they
+# replace, alone and as part of a register packet (write, block marking, fold).
+echo '== register packets per draw (checksum fold, single chain against four lanes)'
+"$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Wno-unused-variable -Itests/stubs \
+    -march=x86-64-v2 -mavx -mf16c -mno-avx2 -mno-fma -mno-bmi -mno-bmi2 -mtune=core-avx-i \
+    -mprefer-vector-width=128 -Igpu/shadps4 tests/bench_reg_packets.cpp \
+    -o "$out/bench-reg-packets"
+"$out/bench-reg-packets"
 # The rest of a draw's setup (renderer_vulkan/vk_rasterizer.cpp): the diagnostics flag each draw
 # asks about, the vertex input state emitted against reused, and one sampler binding through the
 # texture cache against the memo table the texture binding helper now uses too. The last block

@@ -450,6 +450,51 @@ image search they were meant to skip.
   pays 15 % more per bind than the plain stamp it would have done — the tails of
   `tests/bench_page_stamp.cpp`.
 
+## The checksum a draw's register packets fold into (`video_core/amdgpu/`)
+
+A pass does not only send draws: it re-sends the register state each draw depends on, a packet at a
+time, and the port folds every one of those packets into a running checksum
+(`Liverpool::HashRegisterPacket`). Two draws whose checksums are equal have equal register files,
+which is what lets a draw reuse the previous draw's pipeline lookup, specialization and dynamic
+state (`PipelineCache::TryPreparedPipeline`), and the draw-preparation workers replay the same
+packets and must reach the same value.
+
+The fold was one chain, `checksum = (checksum ^ word) * K`, which costs the multiplier's latency
+(3-4 cycles) per word because every word waits for the one before it. `FoldRegisterWords`
+(`video_core/amdgpu/reg_checksum.h`) runs four such chains, seeded differently from the incoming
+checksum and combined with rotated products at the end, so the fold costs the multiplier's
+*throughput* instead:
+
+| Packet | Single chain | Four lanes | |
+|---|---|---|---|
+| 8 words | 9.4 ns | 5.3 ns | 1.8× |
+| 12 words | 14.4 ns | 6.8 ns | 2.1× |
+| 16 words | 18.9 ns | 8.0 ns | 2.4× |
+| 24 words | 28.1 ns | 10.2 ns | 2.8× |
+
+(`tests/bench_reg_packets.cpp`.) As part of a whole packet — the write into the register file, the
+block marking that carries it to the draw-preparation workers, and the fold — that is 28 % less
+per 12-word packet and 51 % less per 24-word one; packets shorter than the eight words in which the
+lanes pay stay on the single chain at the same cost. `tests/test_reg_fold.cpp` checks what the
+callers rely on: the fold is a pure function of the words (both threads reach the same value from
+the same starting checksum), and neither a changed word nor an appended one leaves the checksum
+where it was (1 056 such changes, no collision).
+
+The lanes are also why both sides have to walk the same packet boundaries. They do — the workers
+replay the packets of the same command buffer — and a caller that split a packet differently would
+only make the two checksums differ, which is the conservative answer: the draw recomputes the key
+it could have reused.
+
+**Measured and not taken: dropping the packets that change nothing.** A pass also re-sends user
+data and descriptors whose values the register file already holds, and dropping such a packet — no
+write, no block marking, and no fold, so the checksum stays where it is and the next draw can take
+the "registers unchanged" path — looked like the obvious next step. It loses: the comparison that
+decides is a branch the predictor cannot get right, and the work it skips already overlaps with the
+rest of the packet. Against the plain path on the same packet stream it costs 4 % more when one
+packet in sixteen repeats, 6 % at one in four and 9 % at one in two, and only wins when *every*
+packet repeats (27 %). The lanes give half the fold's cycles without a branch, so that is what
+stayed.
+
 ## Settings the hot paths ask about
 
 Every one of the draw path's diagnostics (`BB_FRAME_STATS`, `BB_TRACE_BUFFERS`, `BB_VERTEX_CHECK`,
@@ -489,6 +534,12 @@ same `.github/actions/windows-build` the release uses) and runs the host-side te
 A failed build step's log is only reachable through a signed URL, so the Windows build step
 tees the build output and turns the error lines into annotations of the run and the tail into the
 job summary; `build.sh` keeps `out/gpu-configure.log` and `out/gpu-build.log` for the same
-reason. Two things about that job are easy to trip over: the compiler cache needs the compiler
-path CMake passes it, and a POSIX `ccache` does not accept the absolute Windows path form, so the
-step probes it and falls back to a wrapper (or to no cache) instead of failing.
+reason. The host-test step does the same for `tools/ci/linux-tests.sh`: the log is written outside
+the tree the script clears (`$RUNNER_TEMP`), the script reports the failing line and command
+through an `ERR` trap, and the step turns those, the error lines and the last lines of the log into
+annotations. The two Zydis tarballs the instruction-rewriting stage needs are fetched from the
+release host and, failing that, from the repository archive; if neither answers, that one stage
+reports itself skipped instead of taking the run red with it. Two things about the Windows job are
+easy to trip over: the compiler cache needs the compiler path CMake passes it, and a POSIX `ccache`
+does not accept the absolute Windows path form, so the step probes it and falls back to a wrapper
+(or to no cache) instead of failing.
