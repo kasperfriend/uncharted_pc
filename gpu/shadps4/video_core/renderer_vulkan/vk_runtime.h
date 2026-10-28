@@ -68,8 +68,16 @@ public:
     };
     void UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                      std::span<const vk::BufferImageCopy> upload_copies);
+    /// `limit_base`/`limit_size`: the range of `dst` the copies may use (a staging pool
+    /// reservation inside a larger block); 0 means the whole buffer.
     void DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
-                       std::span<const vk::BufferImageCopy> download_copies);
+                       std::span<const vk::BufferImageCopy> download_copies,
+                       u64 limit_base = 0, u64 limit_size = 0);
+
+    /// bbport: the bytes `copy` writes at its buffer offset, using the transfer geometry the
+    /// driver uses (row length, image height, layers) - what a copy needs of its buffer.
+    [[nodiscard]] static u64 BufferImageCopyBytes(const vk::BufferImageCopy& copy,
+                                                  vk::Format format);
 
     void CopyImage(VideoCore::Image* src, VideoCore::Image* dst);
     void CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,

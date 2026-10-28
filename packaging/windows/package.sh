@@ -99,6 +99,20 @@ rm -f dist/uncharted-windows.zip
 import pathlib, zipfile
 with zipfile.ZipFile('../../dist/uncharted-windows.zip', 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     for p in sorted(pathlib.Path('uncharted-windows').rglob('*')): z.write(p)")
+# The pair a GitHub release is made of: the zip and the checksum players compare after
+# downloading (the release workflow writes the same two files).
+if command -v sha256sum >/dev/null; then
+    (cd dist && sha256sum uncharted-windows.zip > uncharted-windows.zip.sha256)
+else
+    out/pyenv/Scripts/python.exe -c "
+import hashlib, pathlib
+p = pathlib.Path('dist/uncharted-windows.zip')
+h = hashlib.sha256()
+with p.open('rb') as f:
+    for chunk in iter(lambda: f.read(1 << 20), b''):
+        h.update(chunk)
+pathlib.Path('dist/uncharted-windows.zip.sha256').write_text(f'{h.hexdigest()}  {p.name}\n')"
+fi
 
 # Refresh dist/uncharted-windows, keeping what players create there (saves, settings), and only
 # while nothing runs from it: deleting a running launcher's files breaks it.

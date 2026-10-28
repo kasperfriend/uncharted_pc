@@ -94,6 +94,29 @@ public:
         return registry_generation.load(std::memory_order_acquire);
     }
 
+    /// bbport: changes only when an image becomes registered. A memo that remembers "no image
+    /// here" (a texel buffer that aliases nothing, buffer_cache.cpp) stays true when images are
+    /// collected -- only a new registration can make a range covered -- so it keys on this and
+    /// survives the whole eviction side of a streaming frame.
+    [[nodiscard]] u64 RegistrationGeneration() const noexcept {
+        return registration_generation.load(std::memory_order_acquire);
+    }
+
+    /// bbport: the identity of whatever image occupies `image_id`'s slot, 0 when the slot is
+    /// free. Image uids are handed out once and never reused, so two lookups returning the same
+    /// non-zero value mean the same image is still there -- which is what the per-draw memos
+    /// (texture sets, render targets, render-state signature) have to know. They used to compare
+    /// RegistryGeneration instead, which any *unrelated* image being created or collected
+    /// invalidated: during streaming that discarded every memo entry several times a frame.
+    /// Reading a free slot is guarded by the slot vector's allocation bits, so a collected image
+    /// is never touched.
+    [[nodiscard]] u64 ImageUid(ImageId image_id) const noexcept {
+        if (!image_id || !slot_images.is_allocated(image_id)) {
+            return 0;
+        }
+        return slot_images[image_id].image_uid;
+    }
+
     /// bbport: FindImage's access tick for an image found by a memoized lookup. The LRU touch
     /// FindImage also does happens in UpdateImage (FindTexture), which every binding reaches.
     void MarkFound(ImageId image_id) {
@@ -217,6 +240,12 @@ public:
         TouchImage(image);
         return image;
     }
+    /// bbport: the image in `id`'s slot without the LRU touch GetImage does, for read-only
+    /// looks and prefetching (and for reading an image whose slot may have been reused: check
+    /// ImageUid first).
+    [[nodiscard]] const Image& PeekImage(ImageId id) const noexcept {
+        return slot_images[id];
+    }
 
     /// Retrieves the image view with the specified id.
     [[nodiscard]] ImageView& GetImageView(ImageId id) {
@@ -302,6 +331,13 @@ public:
 
     /// Runs the garbage collector.
     void RunGarbageCollector();
+
+    /// bbport: counts the times a cached sampler was destroyed. A caller that remembers a sampler
+    /// handle (the rasterizer's per-draw sampler memo) compares this with the epoch it filled the
+    /// entry at, and drops the entry when a collection may have destroyed the sampler under it.
+    [[nodiscard]] u32 SamplerEpoch() const noexcept {
+        return sampler_epoch.load(std::memory_order_relaxed);
+    }
 
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
@@ -458,8 +494,10 @@ private:
     };
     std::array<FindImageCacheEntry, 1024> find_image_cache{};
     std::atomic<u64> registry_generation{0};
+    std::atomic<u64> registration_generation{0};
     u32 button_prompt_switches = 0;
     std::mutex samplers_mutex;
+    std::atomic<u32> sampler_epoch{0};
     std::mutex download_images_mutex;
     struct MetaDataInfo {
         MetaType type;

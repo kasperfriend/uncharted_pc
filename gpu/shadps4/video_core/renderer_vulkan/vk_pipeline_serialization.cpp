@@ -4,6 +4,7 @@
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>

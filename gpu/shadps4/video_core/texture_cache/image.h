@@ -110,6 +110,13 @@ struct Image {
         return backing->image.size_bytes;
     }
 
+    /// bbport: the create info of the VkImage actually bound now. A backing can be a smaller
+    /// alias of what the guest descriptor says, so every transfer is cut to this and not to the
+    /// descriptor (a copy past it writes into memory nothing maps: a lost device).
+    const vk::ImageCreateInfo& CreateInfo() const {
+        return backing->image.image_ci;
+    }
+
     bool IsTracked() {
         return track_addr != 0 && track_addr_end != 0;
     }

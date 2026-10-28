@@ -866,22 +866,32 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
 /* Per-thread cache of recently found regions for the GPU's per-draw queries:
  * entries hold for as long as the table generation they were read at. */
 typedef struct { uint64_t generation; uintptr_t start, end; int kind; } CachedRegion;
-static __thread CachedRegion region_cache[8];
-static __thread unsigned region_cache_next;
+/* Indexed by the address instead of probed entry by entry: the GPU asks about a handful of
+ * buffers and textures over and over, and every query that misses here takes the lock below.
+ * The page bits are mixed so that consecutive 4 KiB pages land in different slots. 32 slots
+ * already thrash on a frame that touches ~40 distinct ranges (a scene's vertex buffers, the
+ * textures it samples, its targets): 40% of the queries then miss. 256 slots cost 8 KiB per
+ * thread and hold ~100 ranges without conflicts. */
+enum { REGION_CACHE_SLOTS = 256 };
+static __thread CachedRegion region_cache[REGION_CACHE_SLOTS];
+static inline unsigned region_cache_slot(uintptr_t address) {
+    uint64_t page=address>>12;
+    page^=page>>5;
+    return (unsigned)(page & (REGION_CACHE_SLOTS-1));
+}
 static const CachedRegion *cached_region(uintptr_t address) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (generation & 1) return NULL;
-    for (unsigned i=0;i<8;++i) {
-        const CachedRegion *c=&region_cache[i];
-        if (c->generation==generation && c->end && c->start<=address && address<c->end) return c;
-    }
+    const CachedRegion *c=&region_cache[region_cache_slot(address)];
+    if (c->generation==generation && c->start<=address && address<c->end) return c;
     return NULL;
 }
 /* Called under the read lock after a lookup of address. */
 static void cache_region(size_t i) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (i==vma_count || (generation & 1)) return;
-    region_cache[region_cache_next++ % 8]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind};
+    region_cache[region_cache_slot(vmas[i].start)]=
+        (CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind};
 }
 /* Mapped length from address, up to size, across adjacent mappings. */
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {

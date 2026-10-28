@@ -366,7 +366,7 @@ static ABI int32_t thread_get_prio(GuestThread *t,int *prio) {
  * Windows has fewer levels, so the guest range is cut into bands around NORMAL. Without this the
  * spinning idle workers ran at the same priority as the threads doing real work (and starved
  * the GPU command thread on CPUs with few cores). BB_THREAD_PRIO=0 keeps every thread at normal. */
-static int host_priority(int prio) {
+static int __attribute__((unused)) host_priority(int prio) {
 #ifdef _WIN32
     static int enabled=-1;
     if (enabled<0) { const char *env=getenv("BB_THREAD_PRIO"); enabled=!(env && env[0]=='0'); }

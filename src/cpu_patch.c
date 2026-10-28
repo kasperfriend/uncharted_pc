@@ -22,6 +22,7 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 enum { NEED_BMI1=1, NEED_LZCNT=2, NEED_MOVBE=4 };
@@ -405,6 +406,30 @@ static int emit_item(Code *c, const Item *it) {
     if (ok) ++rewritten[op.kind];
     return ok;
 }
+/* A site rewritten in place, in the same number of bytes: no jump to a thunk and no jump back,
+ * the guest keeps running straight-line code. A 32-bit MOVBE load is `mov r32, m` (the same
+ * ModRM bytes) followed by `bswap r32`, and the two are at most as long as the MOVBE -- equal
+ * for a 6-byte `movbe (%r12),%eax` and one byte shorter for `movbe eax,(%rcx)`. The 64-bit form
+ * needs three bytes for the BSWAP after a REX-prefixed load (one more than the single MOVBE),
+ * and the store form needs a scratch register (see gen_movbe), so those keep their thunk.
+ * Neither instruction touches the flags. Returns 1 when the site now runs natively. */
+static int inline_item(const Item *it) {
+    if (it->in.mnemonic!=ZYDIS_MNEMONIC_MOVBE) return 0;
+    CpuPatchOp op;
+    if (!describe(it,&op) || op.kind!=MOVBE_LOAD || op.width!=32) return 0;
+    /* A RIP-relative operand encodes a displacement against the address of the instruction:
+     * the thunks re-aim it, code put back in place would need the image address here. */
+    if (op.mem.rip) return 0;
+    Code c;
+    unsigned char bytes[ITEM_MAX];
+    c.p=bytes; c.n=0;
+    if (!rm(&c,32,"\x8b",op.reg[0],&op.mem,0,0)) return 0;
+    bswap(&c,32,op.reg[0]);
+    if (c.n>it->in.length) return 0;
+    memcpy((void *)(uintptr_t)it->at,bytes,c.n);
+    memset((void *)(uintptr_t)(it->at+c.n),0x90,it->in.length-c.n);  /* NOP: nothing branches in */
+    return 1;
+}
 /* The thunk for items[0..n): their code, then a jump to the end of the last. Thunk addresses of
  * the items go to starts[]. NULL when something cannot be encoded. */
 static unsigned char *emit_thunk(const Item *items, size_t n, uint64_t *starts) {
@@ -442,6 +467,81 @@ static int by_address(const void *a, const void *b) {
 static int bit(const unsigned char *bits, uint64_t offset) { return bits[offset>>3]>>(offset&7)&1; }
 
 typedef struct { uint64_t offset, previous[2]; } Site;
+/* Pass 1 is a linear sweep that spends its time in Zydis: 40 MB/s on one core, so a game
+ * executable (tens of megabytes) costs a second of every launch. Ranges are independent
+ * segments, so they are scanned on several cores at once; the per-worker site lists are
+ * concatenated in range order, which is exactly the order one thread produces. Everything
+ * else is per-worker (the two previous instructions), except the branch-target bitmap: its
+ * bits are set with an atomic OR (a range boundary is the only place two workers can touch
+ * the same byte). */
+typedef struct {
+    Site *items;
+    size_t count, capacity;
+} SiteList;
+typedef struct {
+    const uint64_t (*ranges)[2];
+    unsigned char *targets;
+    uint64_t size;
+    size_t begin, end;                                            /* ranges [begin, end) */
+    SiteList list;
+} Scan;
+static void scan_ranges(Scan *scan) {
+    for (size_t r=scan->begin; r<scan->end; ++r) {
+        const uint64_t begin=scan->ranges[r][0], end=begin+scan->ranges[r][1];
+        uint64_t previous[2]={UINT64_MAX,UINT64_MAX};
+        ZydisDecodedInstruction in;
+        ZydisDecoderContext context;
+        for (uint64_t at=begin; at<end;) {
+            if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&decoder,&context,image+at,(ZyanUSize)(end-at),&in))) {
+                previous[0]=previous[1]=UINT64_MAX; ++at; continue;
+            }
+            if (in.meta.branch_type!=ZYDIS_BRANCH_TYPE_NONE && in.raw.imm[0].is_relative) {
+                const uint64_t target=at+in.length+(uint64_t)in.raw.imm[0].value.s;
+                if (target<scan->size)
+                    __atomic_fetch_or(&scan->targets[target>>3],(unsigned char)(1u<<(target&7)),__ATOMIC_RELAXED);
+            }
+            if (wanted(in.mnemonic)) {
+                if (scan->list.count==scan->list.capacity) {
+                    Site *more=realloc(scan->list.items,
+                                       (scan->list.capacity=scan->list.capacity ? scan->list.capacity*2 : 1024)*
+                                           sizeof(*more));
+                    if (!more) return;
+                    scan->list.items=more;
+                }
+                scan->list.items[scan->list.count++]=(Site){at,{previous[0],previous[1]}};
+            }
+            previous[1]=previous[0]; previous[0]=at;
+            at+=in.length;
+        }
+    }
+}
+static void *scan_thread(void *argument) {
+    scan_ranges(argument);
+    return NULL;
+}
+/* Cores to scan on: one per processor, at most eight (the sweep is memory- and issue-bound
+ * past that) and never more than there are ranges. BB_CPU_PATCH_THREADS overrides (1: the
+ * single-threaded sweep, for a debugger). */
+static unsigned scan_threads(size_t ranges) {
+    const char *requested=getenv("BB_CPU_PATCH_THREADS");
+    unsigned cores;
+    if (requested && *requested) {
+        const int value=atoi(requested);
+        cores=value>0 ? (unsigned)value : 1u;
+    } else {
+#ifdef _WIN32
+        SYSTEM_INFO info;
+        GetSystemInfo(&info);
+        cores=info.dwNumberOfProcessors ? info.dwNumberOfProcessors : 1u;
+#else
+        const long online=sysconf(_SC_NPROCESSORS_ONLN);
+        cores=online>0 ? (unsigned)online : 1u;
+#endif
+    }
+    if (cores>8) cores=8;
+    if (cores>ranges) cores=(unsigned)ranges;
+    return cores ? cores : 1u;
+}
 void cpu_patch_image(unsigned char *base, uint64_t size, const uint64_t (*ranges)[2], size_t count) {
     const char *mode=getenv("BB_CPU_PATCH");
     if (mode && !strcmp(mode,"0")) return;
@@ -455,36 +555,43 @@ void cpu_patch_image(unsigned char *base, uint64_t size, const uint64_t (*ranges
     /* Pass 1: direct branch targets and the instructions to rewrite (with the two before them). */
     unsigned char *targets=calloc(size/8+1,1);
     Site *sites=NULL;
-    size_t site_count=0, site_capacity=0;
+    size_t site_count=0;
     if (!targets) { printf("CPU: out of memory, instructions not rewritten\n"); return; }
-    for (size_t r=0;r<count;++r) {
-        const uint64_t end=ranges[r][0]+ranges[r][1];
-        uint64_t previous[2]={UINT64_MAX,UINT64_MAX};
-        ZydisDecodedInstruction in;
-        ZydisDecoderContext context;
-        for (uint64_t at=ranges[r][0]; at<end;) {
-            if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&decoder,&context,image+at,(ZyanUSize)(end-at),&in))) {
-                previous[0]=previous[1]=UINT64_MAX; ++at; continue;
+    const unsigned workers=scan_threads(count);
+    SiteList *lists=calloc(workers,sizeof(*lists));
+    pthread_t threads[8]={0};
+    Scan scans[8];
+    if (lists) {
+        for (unsigned w=0;w<workers;++w) {
+            const size_t begin=count*w/workers, end=count*(w+1)/workers;
+            scans[w]=(Scan){ranges,targets,size,begin,end,{NULL,0,0}};
+            if (workers==1 || pthread_create(&threads[w],NULL,scan_thread,&scans[w])!=0) {
+                scan_ranges(&scans[w]);                                  /* this thread does it */
             }
-            if (in.meta.branch_type!=ZYDIS_BRANCH_TYPE_NONE && in.raw.imm[0].is_relative) {
-                const uint64_t target=at+in.length+(uint64_t)in.raw.imm[0].value.s;
-                if (target<size) targets[target>>3]|=(unsigned char)(1u<<(target&7));
-            }
-            if (wanted(in.mnemonic)) {
-                if (site_count==site_capacity) {
-                    Site *more=realloc(sites,(site_capacity=site_capacity ? site_capacity*2 : 1024)*sizeof(*more));
-                    if (!more) break;
-                    sites=more;
-                }
-                sites[site_count++]=(Site){at,{previous[0],previous[1]}};
-            }
-            previous[1]=previous[0]; previous[0]=at;
-            at+=in.length;
         }
+        for (unsigned w=workers;w-->0;) if (threads[w]) pthread_join(threads[w],NULL);
+        for (unsigned w=0;w<workers;++w) site_count+=scans[w].list.count;
+        if (site_count) {
+            sites=malloc(site_count*sizeof(*sites));
+            if (sites) {
+                size_t at=0;
+                for (unsigned w=0;w<workers;++w) {
+                    if (scans[w].list.count) {
+                        memcpy(sites+at,scans[w].list.items,scans[w].list.count*sizeof(*sites));
+                        at+=scans[w].list.count;
+                    }
+                    free(scans[w].list.items);
+                }
+            }
+        }
+        free(lists);
+        if (!sites) site_count=0;
     }
+    if (getenv("BB_CPU_PATCH_STATS"))
+        printf("CPU: scanned %#" PRIx64 " bytes on %u thread(s), %zu sites\n", size, workers, site_count);
     /* Pass 2: a jump to a thunk over 5+ bytes (the instruction, else with its neighbours), else
      * a breakpoint. Sites are in segment order; `covered` ends the last rewritten region. */
-    unsigned jumps=0, moved=0, traps=0, left=0;
+    unsigned jumps=0, moved=0, traps=0, left=0, inlined=0;
     uint64_t covered=0;
     size_t r=0;
     for (size_t i=0;i<site_count;++i) {
@@ -496,6 +603,12 @@ void cpu_patch_image(unsigned char *base, uint64_t size, const uint64_t (*ranges
         Item items[REGION_ITEMS];
         size_t n=1;
         if (!decode(o,end,&items[0])) { ++left; continue; }
+        if (inline_item(&items[0])) {
+            ++rewritten[MOVBE_LOAD];
+            ++inlined;
+            covered=o+items[0].in.length;
+            continue;
+        }
         unsigned length=items[0].in.length;
         uint64_t first=o;
         /* Short: the following instructions, else the one or two before. */
@@ -543,10 +656,10 @@ void cpu_patch_image(unsigned char *base, uint64_t size, const uint64_t (*ranges
         if (rewritten[k] && (k!=MOVBE_STORE || !rewritten[MOVBE_LOAD]))
             snprintf(kinds+strlen(kinds),sizeof(kinds)-strlen(kinds),"%s%s %u",*kinds ? ", " : "",kind_names[k],
                      k==MOVBE_LOAD ? rewritten[k]+rewritten[MOVBE_STORE] : rewritten[k]);
-    printf("CPU: %s%s%s%s: %u instructions rewritten (%s); %u jumps with %u moved neighbours, %u breakpoints, %u left as they were\n",
+    printf("CPU: %s%s%s%s: %u instructions rewritten (%s); %u jumps with %u moved neighbours, %u in place, %u breakpoints, %u left as they were\n",
            missing ? "this processor lacks the PS4's" : "rewrite forced",missing&NEED_BMI1 ? " BMI1" : "",
            missing&NEED_LZCNT ? " LZCNT" : "",missing&NEED_MOVBE ? " MOVBE" : "",
-           total,*kinds ? kinds : "none",jumps,moved,traps,left);
+           total,*kinds ? kinds : "none",jumps,moved,inlined,traps,left);
     free(targets);
     free(sites);
 }

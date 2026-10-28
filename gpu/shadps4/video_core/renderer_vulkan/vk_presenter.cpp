@@ -6,6 +6,7 @@
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
+#include "common/spin_wait.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
@@ -135,6 +136,10 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
+    // bbport: the stall report names these timelines (see Scheduler::ReportStall).
+    draw_scheduler.SetTimelineName("draw");
+    present_scheduler.SetTimelineName("present");
+    flip_scheduler.SetTimelineName("flip");
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
 
@@ -742,14 +747,19 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         generated = 0;
     }
     const auto wait_until = [](std::chrono::steady_clock::time_point at) {
-        // The system sleep is coarse: sleep most of the way, then spin.
+        // The system sleep is coarse: sleep most of the way, then spin. The spin is pauses with
+        // the clock read one time in 32 and no yield at all: a yield there gave the core away
+        // (and asked the scheduler) hundreds of times in the last microsecond of every frame,
+        // for a wait whose whole point is to present on time.
         constexpr auto spin = std::chrono::microseconds(1500);
         const auto now = std::chrono::steady_clock::now();
         if (at - now > spin) {
             std::this_thread::sleep_for(at - now - spin);
         }
         while (std::chrono::steady_clock::now() < at) {
-            std::this_thread::yield();
+            for (u32 i = 0; i < 32; ++i) {
+                Common::CpuRelax();
+            }
         }
     };
     u32 shown = 0;

@@ -17,12 +17,15 @@
 #include <vector>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <queue>
 
 #include "bbport_toggles.h"
 #include "common/assert.h"
+#include "common/binding_echo.h"
 #include "common/interval_set.h"
 #include "common/unique_function.h"
+#include "common/wait_governor.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
@@ -175,6 +178,8 @@ struct DynamicState {
     ColorWriteMasks color_write_masks{};
     float line_width{};
     bool feedback_loop_enabled{};
+    /// Incremented by Invalidate(); see InvalidationGeneration().
+    std::atomic<u32> invalidation{0};
 
     /// Commits the dynamic state to the provided command buffer (a null one only clears the
     /// flags that committing clears).
@@ -370,8 +375,17 @@ struct DynamicState {
         return std::memcmp(&pending, &clean, sizeof(pending)) != 0;
     }
 
+    /// bbport: counts the Invalidate()s. A caller that remembers which state it has already
+    /// derived from the registers (Rasterizer::UpdateDynamicState) must recompute everything
+    /// after one: the state is about to be emitted again, so re-deriving it is what sets the
+    /// flags that emit it.
+    [[nodiscard]] u32 InvalidationGeneration() const noexcept {
+        return invalidation.load(std::memory_order_acquire);
+    }
+
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
+        invalidation.fetch_add(1, std::memory_order_release);
         // bbport: named flags only; padding bits set by a memset made AnyDirty() always true.
         dirty_state.viewports = true;
         dirty_state.scissors = true;
@@ -593,6 +607,13 @@ public:
         if (offset + sizeof(Command) > Capacity) {
             return false;
         }
+        // bbport: almost every recorded closure holds only handles, spans and numbers, so its
+        // destructor is a no-op call through a vtable slot. One command in a chunk that owns
+        // something (a std::function, a string) turns the destructor calls of the whole chunk
+        // back on: one branch per chunk instead of one indirect call per command.
+        if constexpr (!std::is_trivially_destructible_v<std::decay_t<Func>>) {
+            destroys = true;
+        }
         auto* command = new (storage + offset) Command(std::forward<Func>(func));
         if (last) {
             last->next = command;
@@ -622,14 +643,23 @@ public:
     }
 
     void Execute(vk::CommandBuffer cmdbuf) {
-        for (CommandBase* command = first; command;) {
-            CommandBase* const next = command->next;
-            command->Execute(cmdbuf);
-            command->~CommandBase();
-            command = next;
+        if (destroys) {
+            for (CommandBase* command = first; command;) {
+                CommandBase* const next = command->next;
+                command->Execute(cmdbuf);
+                command->~CommandBase();
+                command = next;
+            }
+        } else {
+            for (CommandBase* command = first; command;) {
+                CommandBase* const next = command->next;
+                command->Execute(cmdbuf);
+                command = next;
+            }
         }
         first = last = nullptr;
         used = 0;
+        destroys = false;
         overflow.clear();
     }
 
@@ -669,6 +699,8 @@ private:
 
     alignas(64) std::byte storage[Capacity];
     size_t used = 0;
+    /// At least one command in this chunk owns something its destructor must release.
+    bool destroys = false;
     std::vector<std::unique_ptr<std::byte[]>> overflow;
     CommandBase* first{};
     CommandBase* last{};
@@ -726,11 +758,104 @@ public:
         return dynamic_state;
     }
 
+    /// bbport: the binding echo (common/binding_echo.h). Most of a draw's commands only restate
+    /// state the command buffer already holds -- the same pipeline for every draw of a material,
+    /// the same push constants for every draw of a pass, the same vertex or index buffer for the
+    /// next batch of a mesh -- and each of them costs a driver call and the bytes that carry it
+    /// into the recording chunk. Each of these returns whether the command still has to be
+    /// recorded, and remembers the new state. AllocateWorkerCommandBuffers() clears them.
+    bool EchoPipeline(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) {
+        if (BbToggle::Disabled(BbToggle::BindingEcho)) {
+            return true;
+        }
+        if (echo.Pipeline(bind_point == vk::PipelineBindPoint::eGraphics, EchoHandle(pipeline))) {
+            return true;
+        }
+        if (echo_stats) {
+            BbStats::Count(BbStats::echoed_pipelines);
+        }
+        return false;
+    }
+
+    /// \see EchoPipeline. `data` is the whole push constant block the command would carry.
+    bool EchoPushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, const void* data,
+                           u32 size) {
+        if (BbToggle::Disabled(BbToggle::BindingEcho)) {
+            return true;
+        }
+        if (echo.PushConstants(EchoHandle(layout), static_cast<u32>(stages), data, size)) {
+            return true;
+        }
+        if (echo_stats) {
+            BbStats::Count(BbStats::echoed_pushes);
+        }
+        return false;
+    }
+
+    /// \see EchoPipeline. `sizes` and `strides` are null when the draw leaves them dynamic.
+    bool EchoVertexBuffers(u32 count, const vk::Buffer* buffers, const vk::DeviceSize* offsets,
+                           const vk::DeviceSize* sizes, const vk::DeviceSize* strides) {
+        if (BbToggle::Disabled(BbToggle::BindingEcho)) {
+            return true;
+        }
+        if (echo.VertexBuffers(count,
+                               reinterpret_cast<const Common::BindingEcho::Handle*>(buffers),
+                               reinterpret_cast<const u64*>(offsets),
+                               reinterpret_cast<const u64*>(sizes),
+                               reinterpret_cast<const u64*>(strides))) {
+            return true;
+        }
+        if (echo_stats) {
+            BbStats::Count(BbStats::echoed_vertex_binds);
+        }
+        return false;
+    }
+
+    /// \see EchoPipeline.
+    bool EchoIndexBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType type) {
+        if (BbToggle::Disabled(BbToggle::BindingEcho)) {
+            return true;
+        }
+        if (echo.IndexBuffer(EchoHandle(buffer), offset, static_cast<u32>(type))) {
+            return true;
+        }
+        if (echo_stats) {
+            BbStats::Count(BbStats::echoed_index_binds);
+        }
+        return false;
+    }
+
+    static_assert(sizeof(vk::Buffer) == sizeof(Common::BindingEcho::Handle),
+                  "the echo compares buffers as integers");
+    static_assert(sizeof(vk::DeviceSize) == sizeof(u64), "the echo compares sizes as integers");
+
+    /// bbport: forgets every memo. A new command buffer holds no binding state, and anything
+    /// that binds a pipeline, push constants or vertex and index buffers without asking the echo
+    /// first (the host passes, the tile upload's copy shader) makes the memos describe state the
+    /// command buffer no longer has: they clear them too.
+    void ClearEcho() {
+        echo.Clear();
+    }
+
+    /// True when a command that restates state was dropped (EnableEchoStats()).
+    [[nodiscard]] bool EchoStatsEnabled() const noexcept {
+        return echo_stats;
+    }
+
+    /// bbport: keeps the echo's skip counters for BB_FRAME_STATS (they are three loads per
+    /// dropped command otherwise, and a frame's worth of them is more than the echo saves).
+    void EnableEchoStats() {
+        echo_stats = true;
+    }
+
     /// Returns the current command buffer for recording on the calling thread. With threaded
     /// recording this first waits until all commands passed to Record() are recorded, then
     /// records directly (Record() included, so callers may mix both) until the next
     /// KickRecording() or submission.
     [[gnu::noinline]] vk::CommandBuffer CommandBuffer() {
+        // Binds recorded this way bypass the echo: its memos would be about state this command
+        // buffer no longer has.
+        ClearEcho();
         if (recording_threaded && !direct_mode) {
             SyncRecording();
             direct_mode = true;
@@ -885,6 +1010,12 @@ public:
         return &work_semaphore;
     }
 
+    /// bbport: names this scheduler's timeline for the GPU stall report ("draw", "present",
+    /// "flip"), so a wait that never completes says whose timeline it waits for.
+    void SetTimelineName(const char* timeline_name) noexcept {
+        work_semaphore.SetName(timeline_name);
+    }
+
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Will be run when submitting or calling PopPendingOperations.
     void DeferOperation(Common::UniqueFunction<void>&& func) {
@@ -958,6 +1089,31 @@ private:
     // bbport: whether recorder_thread runs, read on every Record(). std::jthread::joinable()
     // compares thread ids, which on Windows (libc++ over winpthreads) costs two system calls.
     bool recording_threaded{false};
+    /// Waits of the GPU thread that the governor schedules: host copies before a submission or
+    /// a fence, the deferred signals behind them, and the recorder thread's own spin for work.
+    Common::Gov::SpinGovernor host_copy_governor{16'000};
+    Common::Gov::SpinGovernor deferred_governor{16'000};
+    Common::Gov::SpinGovernor recorder_governor{64'000};
+
+    /// bbport: the binding echo (EchoPipeline and friends), state of the command buffer being
+    /// recorded.
+    Common::BindingEcho echo;
+    bool echo_stats = false;
+
+    static std::uint64_t EchoHandle(vk::Pipeline handle) {
+        return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(
+            static_cast<VkPipeline>(handle)));
+    }
+    static std::uint64_t EchoHandle(vk::PipelineLayout handle) {
+        return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(
+            static_cast<VkPipelineLayout>(handle)));
+    }
+    static std::uint64_t EchoHandle(vk::Buffer handle) {
+        return static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(static_cast<VkBuffer>(handle)));
+    }
+
+
     std::jthread recorder_thread;
     tracy::VkCtxScope* profiler_scope{};
 };

@@ -23,6 +23,7 @@
 #include "core/memory.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/amdgpu/reg_checksum.h"
 #include "bbport_write_log.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/landing_gate.h"
@@ -135,14 +136,19 @@ void Liverpool::Process(std::stop_token stoken) {
 
     while (!stoken.stop_requested()) {
         {
-            const auto idle_start = std::chrono::steady_clock::now();
+            // bbport: the idle clock is a diagnostic; without the stats it would still cost two
+            // clock reads and a locked add on every submission.
+            const auto idle_start = BbStats::enabled ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
-            BbStats::gpu_idle_ns.fetch_add(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - idle_start).count(),
-                std::memory_order_relaxed);
+            if (BbStats::enabled) {
+                BbStats::gpu_idle_ns.fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - idle_start).count(),
+                    std::memory_order_relaxed);
+            }
         }
         if (stoken.stop_requested()) {
             break;
@@ -566,12 +572,16 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 // bbport: graphics-register effects of a type-3 packet. The GPU thread and the draw-preparation
 // workers both go through this function, and both fold every register-writing packet into a
 // running checksum: equal checksums at a draw mean equal register files.
+//
+// The fold itself is FoldRegisterWords (video_core/amdgpu/reg_checksum.h): four multiply-xor chains
+// that only meet at the end, which costs the multiplier's throughput per word instead of its
+// latency -- 8 to 24 word packets fold 1.7x to 2.4x faster than the single chain this replaces
+// (tests/bench_reg_packets.cpp). Both sides of the comparison walk the same packets with the same
+// boundaries, so they always fold the same words into the same lanes; were a caller to split a
+// packet differently, the two checksums would simply stop matching and the draw would recompute
+// what it has, which is what a differing checksum means anyway.
 u64 Liverpool::HashRegisterPacket(u64 checksum, const u32* words, u32 count) {
-    for (u32 i = 0; i < count; ++i) {
-        checksum = (checksum ^ words[i]) * 0x9E3779B97F4A7C15ull;
-        checksum ^= checksum >> 29;
-    }
-    return checksum;
+    return FoldRegisterWords(checksum, words, count);
 }
 
 void Liverpool::ApplyComputeRegisterPacket(ComputeProgram& cs, const PM4Header* header) {
@@ -1443,7 +1453,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         draw_prep->EndSubmission();
     }
     if (seq != NoSeq && BbStats::enabled) {
-        BbStats::submissions.fetch_add(1, std::memory_order_relaxed);
+        BbStats::Count(BbStats::submissions);
 #ifndef _WIN32 // bbport: per-thread rusage statistics are Linux-only
         if (rusage usage{}; getrusage(RUSAGE_THREAD, &usage) == 0) {
             BbStats::gpu_user_us.store(u64(usage.ru_utime.tv_sec) * 1000000 + usage.ru_utime.tv_usec,

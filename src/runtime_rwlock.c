@@ -21,7 +21,14 @@ typedef struct Rwlock {
 } Rwlock;
 typedef struct { int64_t seconds, nanoseconds; } GuestTime;
 static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
-static Rwlock *registry;
+/* Every guest read/write lock operation looks its handle up here, so the registry is a hash
+   table (the objects chain through their own `next`) instead of a list walked in full. */
+enum { REGISTRY_BUCKETS = 256 };
+static Rwlock *registry[REGISTRY_BUCKETS];
+static inline unsigned registry_bucket(const Rwlock *handle) {
+    uint64_t h=(uint64_t)handle>>4; h^=h>>11;
+    return (unsigned)(h & (REGISTRY_BUCKETS-1));
+}
 static size_t created, reads, writes, unlocks;
 static int32_t error(int e) {
     if (!e) return 0;
@@ -40,7 +47,7 @@ static int32_t error(int e) {
 }
 /* All helpers ending in _locked require registry_lock. */
 static Rwlock *find_locked(Rwlock *handle) {
-    for (Rwlock *r=registry; r; r=r->next) if (r==handle) return r;
+    for (Rwlock *r=registry[registry_bucket(handle)]; r; r=r->next) if (r==handle) return r;
     return NULL;
 }
 static int create_locked(Rwlock **out) {
@@ -48,7 +55,8 @@ static int create_locked(Rwlock **out) {
     if (!r) return ENOMEM;
     int e=pthread_rwlock_init(&r->native,NULL);
     if (e) { free(r); return e; }
-    r->next=registry; registry=r; *out=r; ++created; return 0;
+    const unsigned bucket=registry_bucket(r);
+    r->next=registry[bucket]; registry[bucket]=r; *out=r; ++created; return 0;
 }
 static ABI int32_t rw_init(Rwlock **out, void *const *attr, const char *name) {
     (void)name;
@@ -136,9 +144,10 @@ static ABI int32_t rw_destroy(Rwlock **handle) {
     if (r->inflight || r->holders) { pthread_mutex_unlock(&registry_lock); return error(EBUSY); }
     int e=pthread_rwlock_destroy(&r->native);
     if (!e) {
-        Rwlock **link=&registry;
-        while (*link!=r) link=&(*link)->next;
-        *link=r->next; free(r); *handle=(Rwlock *)(uintptr_t)1;
+        Rwlock **link=&registry[registry_bucket(r)];
+        while (*link && *link!=r) link=&(*link)->next;
+        if (*link) *link=r->next;
+        free(r); *handle=(Rwlock *)(uintptr_t)1;
     }
     pthread_mutex_unlock(&registry_lock); return error(e);
 }

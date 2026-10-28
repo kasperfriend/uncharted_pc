@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <mutex>
 #include <vector>
 
+#include "common/byte_key.h"
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -188,6 +190,10 @@ private:
     /// dispatches end it).
     struct BeginSignature {
         std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS + 1> ids{};
+        /// bbport: the uid of each attachment image, so the memo holds while its own images live
+        /// (the registry generation it used instead dropped every entry whenever any image was
+        /// created or collected).
+        std::array<u64, AmdGpu::NUM_COLOR_BUFFERS + 1> uids{};
         std::array<VideoCore::ImageViewInfo, AmdGpu::NUM_COLOR_BUFFERS + 1> views{};
         u32 mrt_mask = 0;
         u32 num_samples = 0;
@@ -196,7 +202,6 @@ private:
         bool scene_started = false;
         bool raster_scaling = false;
         u64 upscaler_state = 0;
-        u64 generation = 0;
         u32 depth_control = 0;
         bool depth_valid = false;
         bool stencil_valid = false;
@@ -269,7 +274,44 @@ private:
                       bool on_helper = false);
     bool BindResources(const Pipeline* pipeline);
     void BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
-                      Shader::Backend::Bindings& binding, u32& write_index);
+                      Shader::Backend::Bindings& binding, u32& write_index, bool on_helper);
+    /// The S# of the last few sampler bindings and the sampler it resolved to.
+    ///
+    /// Every stage of every draw asks the texture cache for its samplers, and that answer only
+    /// depends on the S# bytes, the depth flag, the LOD bias and the border color base -- yet
+    /// the cache hashes the S#, takes its mutex, probes a hash map and touches an LRU entry for
+    /// each one. A frame binds the same handful of S#s over and over, so a small direct-mapped
+    /// table of the answers serves all of the repeats: two multiplies, a mask and five compares.
+    struct SamplerMemoEntry {
+        u64 raw0 = 0;
+        u64 raw1 = 0;
+        u64 border = 0;
+        vk::Sampler sampler{};
+        float lod_bias = 0.0f;
+        u32 is_depth = 0;
+        /// The texture cache's SamplerEpoch() when this was filled: a collection that destroyed a
+        /// sampler bumps it, and every entry filled before is then not a hit any more.
+        u32 epoch = 0;
+        bool valid = false;
+    };
+    static constexpr u32 SamplerMemoSize = 512; ///< power of two
+    /// A table of answers and its counters. Each thread that binds samplers has one: the GPU
+    /// thread this object's, the texture binding helper its own (`helper_sampler_memo`).
+    struct SamplerMemoTable {
+        std::array<SamplerMemoEntry, SamplerMemoSize> entries{};
+        u64 hits = 0, misses = 0;
+    };
+    /// bbport: the sampler of an S#, through `memo` (the texture cache's hashed sampler map on a
+    /// miss). Every caller passes its own thread's table: both tables are written by one thread
+    /// each, so no lock is involved.
+    vk::Sampler BindSampler(const AmdGpu::Sampler& sharp, bool is_depth, float lod_bias,
+                            SamplerMemoTable& memo);
+    SamplerMemoTable sampler_memo;
+    /// The texture binding helper's own table: the helper used to skip the memo (the table above
+    /// belonged to the GPU thread), so every S# of a draw it bound took the texture cache's mutex,
+    /// its hash map probe and an LRU touch. Its counters are read only after the task's join,
+    /// which publishes the writes.
+    SamplerMemoTable helper_sampler_memo;
     /// bbport: a stage's resolved textures remembered by its prepared T# hashes
     /// (TextureSetMemo): a hit only redoes the per-draw effects (binding flags, transitions).
     struct TextureSetEntry {
@@ -282,16 +324,19 @@ private:
     struct TextureSet {
         u64 key = 0;
         const Shader::Info* stage = nullptr;
-        u64 generation = ~0ull;
         u64 scene_generation = 0; ///< SceneTargets::Generation of the proxy views
         u32 count = 0;
         static constexpr u32 MaxImages = 16; ///< larger sets are not memoized
         std::array<u64, MaxImages> hashes{};
+        /// bbport: the image uid of each entry when the set was recorded. An unrelated image
+        /// being registered or collected used to throw every set away (RegistryGeneration);
+        /// comparing uids keeps the set for exactly as long as its own images live.
+        std::array<u64, MaxImages> uids{};
         std::array<TextureSetEntry, MaxImages> entries{};
     };
     std::array<TextureSet, 32768> texture_sets{};
     u64 texture_set_hits = 0, texture_set_misses = 0;
-    std::array<u64, 4> texture_set_why{}; ///< misses: other key, generation, image check, new
+    std::array<u64, 4> texture_set_why{}; ///< misses: other key, image uid, image check, other
     /// Returns true when the stage's images were bound from the memo.
     bool BindTexturesFromSet(const Shader::Info& stage, const PreparedStage* prepared,
                              u32 first_image_idx, bool& barrier, TextureSet*& slot);
@@ -374,7 +419,35 @@ private:
     boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
 
     u32 set_write_index{};
-    Pipeline::DescriptorWrites set_writes;
+    /// bbport: the descriptor writes of the draw being prepared, as a buffer of slots that is
+    /// grown but never shrunk (DescriptorSlots): `set_writes` used to be cleared and resized on
+    /// every draw, and a vector's resize() value-initializes the new entries -- 80 bytes each,
+    /// for every descriptor of every draw, before the binding code writes them anyway.
+    std::vector<vk::WriteDescriptorSet> set_writes;
+    u32 num_set_writes{};
+    void ReserveSetWrites(u32 count) {
+        if (set_writes.size() < count) {
+            set_writes.resize(std::max<size_t>(count, 64));
+        }
+        num_set_writes = count;
+    }
+    /// bbport: the write slot of the next descriptor. The slots are reused between draws, so
+    /// every pointer a write does not use is nulled here rather than left over from the draw
+    /// that had this slot last.
+    vk::WriteDescriptorSet& DescriptorWrite(u32& write_index, u32 binding, u32 descriptor_count,
+                                            vk::DescriptorType type) {
+        auto& write = set_writes[write_index++];
+        write.pNext = nullptr;
+        write.dstSet = VK_NULL_HANDLE;
+        write.dstBinding = binding;
+        write.dstArrayElement = 0;
+        write.descriptorCount = descriptor_count;
+        write.descriptorType = type;
+        write.pImageInfo = nullptr;
+        write.pBufferInfo = nullptr;
+        write.pTexelBufferView = nullptr;
+        return write;
+    }
     Shader::PushData push_data;
 
     // bbport: bindings point at their description instead of copying it (a hot spot): into
@@ -387,8 +460,10 @@ private:
         std::array<u64, 4> sharp{};
         u32 flags = ~0u;
         VideoCore::TextureCache::ImageDesc desc;
-        // Memoized FindImage for bindings without mip overrides (TextureBindingMemo).
-        u64 found_generation = ~0ULL;
+        // Memoized FindImage for bindings without mip overrides (TextureBindingMemo): the image
+        // it resolved to, and that image's uid (0 while there is no memo). The uid, not the
+        // registry generation, says whether the same image is still in the slot.
+        u64 found_uid = 0;
         VideoCore::ImageId found_id{};
         VideoCore::TextureCache::ImageDesc found_desc;
         u64 pinned = 0; ///< bind_epoch of the BindTextures call referencing found_desc
@@ -404,22 +479,35 @@ private:
     boost::container::static_vector<VideoCore::TextureCache::ImageDesc, Shader::NUM_IMAGES * 2>
         image_desc_storage;
     u64 bind_epoch = 0;
-    // bbport: render/depth target lookups memoized by their raw register bytes while image
-    // registrations are unchanged (the descriptions depend only on those registers).
+    // bbport: render/depth target lookups memoized by the raw register bytes of the target (the
+    // description depends only on those registers, the extent hint and the depth view).
+    //
+    // The key is the concatenation of exactly the bytes the call was given, stored at the size
+    // of the call's parts: it used to be a zero-filled 256-byte array, which cost a 256-byte
+    // store per attachment per draw and kept 256 bytes in every memo entry.
+    // Entries live as long as the image they resolved to: an *unrelated* image being registered
+    // or collected used to invalidate all of them (RegistryGeneration), several times a frame
+    // while streaming.
+    // The largest key is a color target -- a u32 tag, the 60-byte color buffer register and the
+    // 4-byte extent hint, 68 bytes; a depth target is 56. The assert in FindTargetMemoized fails
+    // the build if a call ever passes more. The capacity used to be 256, which made the key, and
+    // every LastTarget and memo entry holding one, four times as wide as the bytes compared.
+    static constexpr u32 TargetKeyBytes = 72;
+    /// The key of a target lookup: exactly the bytes of the call's parts (common/byte_key.h).
+    using TargetKey = Common::ByteKey<TargetKeyBytes>;
     struct TargetMemo {
-        std::array<u8, 256> key{};
-        u32 key_size = 0;
-        u64 generation = ~0ULL;
+        TargetKey key;
+        u64 image_uid = 0;
         VideoCore::ImageId image_id{};
         VideoCore::TextureCache::ImageDesc desc;
     };
     std::array<TargetMemo, 64> target_memo{};
+    u64 target_memo_hits = 0, target_memo_misses = 0;
     // bbport: consecutive draws mostly keep their targets; the slot's description (cb_descs,
     // db_desc) is then still the right one and is neither looked up nor copied.
     struct LastTarget {
-        std::array<u8, 256> key{};
-        u32 key_size = 0;
-        u64 generation = ~0ULL;
+        TargetKey key;
+        u64 image_uid = 0;
         VideoCore::ImageId image_id{};
     };
     std::array<LastTarget, AmdGpu::NUM_COLOR_BUFFERS + 1> last_targets{}; ///< CBs, then DB
@@ -450,6 +538,19 @@ private:
         VertexInputs<vk::DeviceSize> host_strides;
         u32 num_buffers = 0;
     } vertex_binds;
+    /// bbport: the vertex input state (formats, strides, divisors, offsets) last emitted into the
+    /// current command buffer. Consecutive draws of a pipeline describe the same set, and dynamic
+    /// state stays live in the buffer until something sets it again, so an identical one costs
+    /// only the comparison. `generation` is the scheduler's invalidation count, which moves when
+    /// the draw pipe starts recording into a new command buffer.
+    struct VertexInputMemo {
+        std::array<vk::VertexInputBindingDescription2EXT, MaxVertexBufferCount> bindings;
+        std::array<vk::VertexInputAttributeDescription2EXT, MaxVertexBufferCount> attributes;
+        u32 num_bindings = 0;
+        u32 num_attributes = 0;
+        u32 generation = ~0u;
+    } vertex_input_memo;
+    u64 vertex_input_emits = 0, vertex_input_skips = 0;
     struct IndexBind {
         vk::Buffer handle;
         u64 offset;
@@ -492,6 +593,27 @@ private:
     static inline thread_local const AmdGpu::ComputeProgram* stage_cs = nullptr;
     AmdGpu::Regs pipe_regs{};
     bool pipe_synced = false;
+    /// bbport: the dynamic-state groups (a bit each) the register blocks the packet the
+    /// recording thread is running wrote belong to; 0xff when every register may have changed
+    /// (a resync), so UpdateDynamicState recomputes every group it names.
+    u8 pipe_touched_groups = 0xff;
+    /// bbport: the per-draw inputs of the dynamic state that are not registers, as the last
+    /// computation saw them.
+    struct DynamicStateMemo {
+        std::array<float, 2> target_scale{};
+        std::array<float, 2> draw_jitter{};
+        /// The pipeline's write masks by value: a pipeline the cache rebuilt can reuse the
+        /// address of one it destroyed, so the masks are compared, not the pointer.
+        ColorWriteMasks write_masks{};
+        bool feedback_loop = false;
+        /// The scheduler's Invalidate() count these values were derived at: after one the state
+        /// has to be re-derived so the new command buffer gets it.
+        u32 invalidation = ~0u;
+    };
+    mutable DynamicStateMemo dynamic_memo{};
+    /// bbport: per group (viewport, depth/stencil, primitive, rasterization, blend), how many
+    /// draws recomputed it and how many skipped it (BB_FRAME_STATS).
+    mutable std::array<u64, 5> dynamic_state_updates{}, dynamic_state_skips{};
     std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> pipe_cb_extent{};
     AmdGpu::CbDbExtent pipe_db_extent{};
     /// Stage A: small read-only guest buffers copied into the constant ring for a packet.

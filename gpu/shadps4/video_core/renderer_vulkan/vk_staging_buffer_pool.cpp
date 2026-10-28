@@ -89,7 +89,15 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
             .last_used_frame = frame,
         });
         ring.current = ring.blocks.size() - 1;
-        best_offset = *best->buffer->Reserve(size, alignment, false);
+        // bbport: a fresh block always takes the request (Request() sends sizes over the block to
+        // RequestLarge), but dereferencing the optional without checking it is how a garbage
+        // offset would reach a shader: the block is dropped and a dedicated buffer handed out.
+        const auto offset = best->buffer->Reserve(size, alignment, false);
+        if (!offset) {
+            ring.blocks.pop_back();
+            return RequestLarge(size, type, false);
+        }
+        best_offset = *offset;
     }
 
     auto& buffer = *best->buffer;

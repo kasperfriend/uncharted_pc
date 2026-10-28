@@ -3,9 +3,11 @@
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "bbport_copy.h"
+#include "bbport_memcpy.h"
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
+#include "bbport_cpu.h"
 #include "bbport_toggles.h"
 #include <algorithm>
 #include <array>
@@ -109,7 +111,8 @@ void MemoryManager::InvalidateMemory(VAddr address, u64 size) {
 u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
     return runtime_memory_clamp(virtual_addr, size);
 }
-static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
+static void CopySparseSerial(VAddr source, u8* dest, u64 size,
+                             BbCopy::CopyPolicy policy = BbCopy::CopyPolicy::Auto) {
     while (size) {
         uintptr_t start = 0, end = 0;
         int mapped = 0;
@@ -117,20 +120,29 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
             end = source + size;
         }
         const u64 n = std::min<u64>(size, end - source);
-        if (mapped) std::memcpy(dest, reinterpret_cast<const void*>(source), n);
-        else std::memset(dest, 0, n);
+        if (mapped) {
+            // Large copies stream straight to memory (bbport_memcpy.h): the GPU reads them
+            // over PCIe and the CPU will not look at them again, so keeping them out of the
+            // caches saves the read-for-ownership traffic that halves a large memcpy.
+            BbCopy::Copy(dest, reinterpret_cast<const void*>(source), n, policy);
+        } else {
+            std::memset(dest, 0, n);
+        }
         source += n; dest += n; size -= n;
     }
 }
 void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
-    // bbport: large uploads (streaming) are split across the copy threads.
+    // bbport: large uploads (streaming) are split across the copy threads. A whole upload this
+    // large goes to the GPU: every chunk of it is streamed (bbport_memcpy.h).
     constexpr u64 Chunk = 512 * 1024;
+    const auto policy = size >= BbCopy::AutoStreamBytes ? BbCopy::CopyPolicy::Stream
+                                                       : BbCopy::CopyPolicy::Auto;
     if (size < 4 * Chunk || !BbCopy::Enabled()) {
-        return CopySparseSerial(source, dest, size);
+        return CopySparseSerial(source, dest, size, policy);
     }
     BbCopy::ParallelFor((size + Chunk - 1) / Chunk, [&](std::size_t i) {
         const u64 offset = i * Chunk;
-        CopySparseSerial(source + offset, dest + offset, std::min(Chunk, size - offset));
+        CopySparseSerial(source + offset, dest + offset, std::min(Chunk, size - offset), policy);
     });
 }
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
@@ -140,11 +152,11 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {
     BbStats::Timer timer{BbStats::t_protect};
     const u64 pages = (size + 4095) / 4096;
-    BbStats::protect_calls.fetch_add(1, std::memory_order_relaxed);
-    BbStats::protect_pages.fetch_add(pages, std::memory_order_relaxed);
+    BbStats::Count(BbStats::protect_calls);
+    BbStats::Count(BbStats::protect_pages, pages);
     if (!True(perms & MemoryPermission::Write)) {
-        BbStats::protect_revoke_calls.fetch_add(1, std::memory_order_relaxed);
-        BbStats::protect_revoke_pages.fetch_add(pages, std::memory_order_relaxed);
+        BbStats::Count(BbStats::protect_revoke_calls);
+        BbStats::Count(BbStats::protect_revoke_pages, pages);
     }
     runtime_memory_gpu_protect(virtual_addr, size, True(perms & MemoryPermission::Read),
                                True(perms & MemoryPermission::Write));
@@ -194,18 +206,30 @@ u32 BbDisplayRefreshHz() {
 }
 
 #ifdef BB_PGO_GENERATE
+// Instrumented build (BB_PGO=generate, tools/pgo.sh): the game often ends through _exit (the
+// watchdog, the guest's own exit), which skips the profile write at exit. Write every 30 s.
+#if defined(__clang__)
+extern "C" int __llvm_profile_write_file(void);
+/// clang keeps the counts in memory and the profile file holds the totals so far, so writing
+/// again only ever makes the file more complete: overwrite it, do not reset.
+static void WriteProfile() {
+    __llvm_profile_write_file();
+}
+#else
 extern "C" void __gcov_dump(void);
 extern "C" void __gcov_reset(void);
-// Instrumented build (BB_PGO=generate): the game often ends through _exit (watchdog, guest
-// exit), which skips the profile write at exit. Write every 30 s and reset: the files sum the
-// intervals.
+/// GCC reads and writes a directory of counters: dump the interval and start a new one.
+static void WriteProfile() {
+    __gcov_dump();
+    __gcov_reset();
+}
+#endif
 static void StartProfileWriter() {
     std::thread([] {
         Common::SetCurrentThreadName("bb:pgo");
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(30));
-            __gcov_dump();
-            __gcov_reset();
+            WriteProfile();
             std::printf("PGO: profile written\n");
         }
     }).detach();
@@ -213,6 +237,10 @@ static void StartProfileWriter() {
 #endif
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
+    // bbport: this thread records and submits the game's draws; it and the process get the CPU
+    // share before any of the port's threads exist (see bbport_cpu.h).
+    BbCpu::InitProcess();
+    BbCpu::InitCommandThread();
     BbSettings::Load();
 #ifdef BB_PGO_GENERATE
     StartProfileWriter();

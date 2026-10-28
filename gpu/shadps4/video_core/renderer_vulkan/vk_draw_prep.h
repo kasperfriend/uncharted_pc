@@ -50,6 +50,10 @@ struct PreparedStage {
     const AmdGpu::Sampler* sampler_sharps;
     const AmdGpu::Buffer* buffer_sharps;
     u32 num_images, num_samplers, num_buffers;
+    /// Key of Rasterizer's texture-set memo for this stage (its image hashes, seeded with the
+    /// stage's address). The GPU thread would otherwise hash them again on every draw; the
+    /// worker has the same values, so it hashes them once.
+    u64 texture_set_key;
 };
 
 /// Key of Rasterizer's texture description cache for a T# bound through `res`.

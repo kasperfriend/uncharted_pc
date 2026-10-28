@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <span>
 #include <unordered_map>
 
@@ -496,6 +497,10 @@ public:
     [[nodiscard]] u64 GetDeviceMemoryBudgetNow() const;
 
     /// bbport: the driver's usage and current budget of the counted heaps in one query.
+    /// The answer is cached for a few milliseconds: the texture cache's collector asks once per
+    /// submission, and the call behind it (vkGetPhysicalDeviceMemoryProperties2) walks the
+    /// driver's allocation bookkeeping -- a budget that other processes move over hundreds of
+    /// milliseconds does not need a fresh look every 2 ms.
     void QueryMemory(u64& usage, u64& budget) const;
 
     /// bbport: false when an allocation of `bytes` of device-local memory would go over the
@@ -593,6 +598,11 @@ private:
     bool compute_shader_derivatives{};
     bool mixed_float_dot_product{}; // bbport: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
     bool supports_memory_budget{};
+    /// bbport: the last QueryMemory() answer and when it was taken (see there).
+    mutable u64 memory_query_usage{};
+    mutable u64 memory_query_budget{};
+    mutable std::chrono::steady_clock::time_point memory_query_time{};
+    mutable bool memory_query_valid{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;

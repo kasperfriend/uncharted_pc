@@ -112,13 +112,13 @@ struct PageManager::Impl {
         // bbport: the draw recording thread handles its faults inline too (vk_draw_pipe.h).
         const auto is_gpu_thread = rasterizer->IsGpuSideThread();
         if (is_gpu_thread) {
-            BbStats::gpu_signal_faults.fetch_add(1, std::memory_order_relaxed);
+            BbStats::Count(BbStats::gpu_signal_faults);
         }
         if (Common::IsWriteError(context)) {
             BbStats::Timer timer{BbStats::t_write_faults};
             return rasterizer->OnWriteFault(addr, is_gpu_thread);
         } else {
-            BbStats::read_faults.fetch_add(1, std::memory_order_relaxed);
+            BbStats::Count(BbStats::read_faults);
             BbStats::Timer timer{BbStats::t_read_faults};
             return rasterizer->ReadMemory(addr, 8, is_gpu_thread);
         }

@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/small_vector.hpp>
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include "bbport_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -81,22 +84,176 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
     return std::make_pair(src_layers, dst_layers);
 }
 
-static u32 BufferImageCopySize(const vk::BufferImageCopy& copy, const vk::Format pixel_format) {
+static u64 BufferImageCopySize(const vk::BufferImageCopy& copy, const vk::Format pixel_format) {
     const u32 row_length = copy.bufferRowLength ? copy.bufferRowLength : copy.imageExtent.width;
     const u32 height = copy.bufferImageHeight ? copy.bufferImageHeight : copy.imageExtent.height;
 
     const auto block = vk::blockExtent(pixel_format);
-    const u32 block_size = vk::blockSize(pixel_format);
-    const u32 row_pitch = (row_length / block[0]) * block_size;
-    const u32 slice_pitch = (height / block[1]) * row_pitch;
+    const u64 block_size = vk::blockSize(pixel_format);
+    if (row_length == 0 || height == 0 || copy.imageExtent.width == 0 ||
+        copy.imageExtent.height == 0 || copy.imageSubresource.layerCount == 0) {
+        return 0;
+    }
+    const u64 row_pitch = u64(row_length / block[0]) * block_size;
+    const u64 slice_pitch = u64(height / block[1]) * row_pitch;
+    if (row_pitch == 0 || slice_pitch == 0) {
+        return 0;
+    }
 
-    const u32 width_in_blocks = (copy.imageExtent.width + block[0] - 1) / block[0];
-    const u32 height_in_blocks = (copy.imageExtent.height + block[1] - 1) / block[1];
-    const u32 num_slices = copy.imageExtent.depth * copy.imageSubresource.layerCount;
+    const u64 width_in_blocks = (copy.imageExtent.width + block[0] - 1) / block[0];
+    const u64 height_in_blocks = (copy.imageExtent.height + block[1] - 1) / block[1];
+    const u64 num_slices = u64(copy.imageExtent.depth) * copy.imageSubresource.layerCount;
 
     return (num_slices - 1) * slice_pitch + (height_in_blocks - 1) * row_pitch +
            width_in_blocks * block_size;
 }
+
+namespace {
+
+/// bbport: every transfer is cut to what its resources actually have. A region that reaches past
+/// the buffer it names, or past the level or layer of the image, is undefined behaviour in
+/// Vulkan: the driver's copy writes into memory no allocation maps, and the device reports a write
+/// to an invalid address -- a lost device, in a place far away from the code that recorded the
+/// copy, which is why the crash reports never pointed at the caller. The regions are cut (or
+/// dropped when nothing is left) and the transfer is named a few times, so a log says which one
+/// was recorded past its resources.
+constexpr u32 MaxTransferReports = 12;
+std::atomic<u32> transfer_reports{0};
+
+void ReportTransferCut(const char* what, const char* resource, u64 offset, u64 size, u64 limit) {
+    if (transfer_reports.fetch_add(1, std::memory_order_relaxed) >= MaxTransferReports) {
+        return;
+    }
+    std::printf("Transfer: %s: %s 0x%llx+0x%llx reaches past its 0x%llx bytes; cut\n", what,
+                resource, static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(size), static_cast<unsigned long long>(limit));
+}
+
+void ReportTransferDrop(const char* what, const char* resource) {
+    if (transfer_reports.fetch_add(1, std::memory_order_relaxed) >= MaxTransferReports) {
+        return;
+    }
+    std::printf("Transfer: %s: a region names no part of its %s; dropped\n", what, resource);
+}
+
+/// The bytes a copy reads or writes at `bufferOffset`, or the reason it cannot fit. `base` and
+/// `span_limit`: the reservation inside the buffer the copy may use (0 = the whole buffer), so a
+/// copy cannot reach into the next reservation of a staging block or past the block itself.
+[[nodiscard]] bool CopyFitsBuffer(const char* what, const vk::BufferImageCopy& copy,
+                                  const VideoCore::Buffer* buffer, vk::Format format,
+                                  u64 base = 0, u64 span_limit = 0) {
+    if (!buffer) {
+        return true;
+    }
+    const u64 limit = span_limit != 0 ? std::min<u64>(buffer->SizeBytes(), base + span_limit)
+                                      : buffer->SizeBytes();
+    if (copy.bufferOffset >= limit) {
+        ReportTransferCut(what, "buffer", copy.bufferOffset, 0, limit);
+        return false;
+    }
+    const u64 span = BufferImageCopySize(copy, format);
+    if (span > limit - copy.bufferOffset) {
+        ReportTransferCut(what, "buffer", copy.bufferOffset, span, limit);
+        return false;
+    }
+    return true;
+}
+
+/// The bytes one level of `size` holds at `format`, rows packed to its block size: what an
+/// intermediate buffer of a color/depth copy has to hold.
+[[nodiscard]] u64 IntermediateCopyBytes(const VideoCore::Extent3D& size, u32 layers,
+                                        vk::Format format) {
+    const auto block = vk::blockExtent(format);
+    const u64 block_size = vk::blockSize(format);
+    const u64 row = ((size.width + block[0] - 1) / block[0]) * block_size;
+    return row * ((size.height + block[1] - 1) / block[1]) * size.depth * layers;
+}
+
+/// The real extent of one level of the VkImage behind an image (its backing can be a smaller
+/// alias of what the guest descriptor says).
+[[nodiscard]] vk::Extent3D LevelExtent(const vk::ImageCreateInfo& image_ci, u32 mip) {
+    return {std::max(image_ci.extent.width >> mip, 1u),
+            std::max(image_ci.extent.height >> mip, 1u),
+            std::max(image_ci.extent.depth >> mip, 1u)};
+}
+
+/// Cuts a copy to the levels and layers of the image it names. The extent is never grown, and a
+/// block-compressed extent is rounded down to whole blocks (a copy of a part of a block is
+/// invalid); a copy with nothing left is dropped.
+[[nodiscard]] bool FitCopyToImage(const char* what, vk::BufferImageCopy& copy,
+                                  const vk::ImageCreateInfo& image_ci, vk::Format format) {
+    auto& sub = copy.imageSubresource;
+    if (sub.mipLevel >= image_ci.mipLevels || sub.baseArrayLayer >= image_ci.arrayLayers) {
+        ReportTransferDrop(what, "image");
+        return false;
+    }
+    const vk::Extent3D limit = LevelExtent(image_ci, sub.mipLevel);
+    const u32 layers_left = image_ci.arrayLayers - sub.baseArrayLayer;
+    if (sub.layerCount > layers_left) {
+        if (transfer_reports.fetch_add(1, std::memory_order_relaxed) < MaxTransferReports) {
+            std::printf("Transfer: %s: the copy asks for %u layers at %u of an image with %u; "
+                        "cut\n",
+                        what, sub.layerCount, sub.baseArrayLayer, image_ci.arrayLayers);
+        }
+        sub.layerCount = layers_left;
+    }
+    const auto block = vk::blockExtent(format);
+    // A copy that fits is left exactly as it is (a compressed extent is not necessarily a whole
+    // number of blocks at the edge of a level); only a copy that has to be cut is rounded down to
+    // blocks, because a part of a block is not a valid extent.
+    const auto cut = [](u32 offset, u32 extent, u32 limit, u32 block) {
+        if (offset >= limit) {
+            return 0u;
+        }
+        const u32 room = limit - offset;
+        if (extent <= room) {
+            return extent;
+        }
+        u32 value = room;
+        if (block > 1) {
+            value = value / block * block;
+        }
+        return value;
+    };
+    const vk::Extent3D fitted{cut(copy.imageOffset.x, copy.imageExtent.width, limit.width,
+                                  block[0]),
+                              cut(copy.imageOffset.y, copy.imageExtent.height, limit.height,
+                                  block[1]),
+                              cut(copy.imageOffset.z, copy.imageExtent.depth, limit.depth, 1u)};
+    if (fitted.width == 0 || fitted.height == 0 || fitted.depth == 0) {
+        ReportTransferDrop(what, "image level");
+        return false;
+    }
+    if (fitted != copy.imageExtent) {
+        if (transfer_reports.fetch_add(1, std::memory_order_relaxed) < MaxTransferReports) {
+            std::printf("Transfer: %s: image level %u is %ux%ux%u, the copy asks for %ux%ux%u at "
+                        "%u,%u,%u; cut\n",
+                        what, sub.mipLevel, limit.width, limit.height, limit.depth,
+                        copy.imageExtent.width, copy.imageExtent.height, copy.imageExtent.depth,
+                        copy.imageOffset.x, copy.imageOffset.y, copy.imageOffset.z);
+        }
+        copy.imageExtent = fitted;
+    }
+    return true;
+}
+
+/// The copies of a buffer<->image transfer that its buffer and its image really hold.
+template <typename Container>
+[[nodiscard]] Container FitCopies(const char* what, std::span<const vk::BufferImageCopy> copies,
+                                  const VideoCore::Buffer* buffer,
+                                  const vk::ImageCreateInfo& image_ci, vk::Format format) {
+    Container fitted;
+    for (vk::BufferImageCopy copy : copies) {
+        if (!CopyFitsBuffer(what, copy, buffer, format) ||
+            !FitCopyToImage(what, copy, image_ci, format)) {
+            continue;
+        }
+        fitted.push_back(copy);
+    }
+    return fitted;
+}
+
+} // Anonymous namespace
 
 Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     : instance{instance_}, scheduler{scheduler_}, staging_pool{instance_, scheduler_} {
@@ -114,6 +271,30 @@ void Runtime::TickFrame() {
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
     scheduler.EndRendering();
+
+    // bbport: a copy that reaches past the buffer it names is undefined behaviour in Vulkan and,
+    // on a device-local buffer, a write into memory nothing maps (see FitCopies): the regions are
+    // cut to both buffers first.
+    boost::container::small_vector<vk::BufferCopy, 16> fitted_copies;
+    for (vk::BufferCopy copy : copies) {
+        const u64 src_limit = src ? src->SizeBytes() : ~u64{0};
+        const u64 dst_limit = dst ? dst->SizeBytes() : ~u64{0};
+        if (copy.srcOffset >= src_limit || copy.dstOffset >= dst_limit) {
+            ReportTransferCut("buffer copy", "region", copy.srcOffset, copy.size, src_limit);
+            continue;
+        }
+        const u64 room = std::min(src_limit - copy.srcOffset, dst_limit - copy.dstOffset);
+        if (copy.size > room) {
+            ReportTransferCut("buffer copy", "region", copy.dstOffset, copy.size, dst_limit);
+            copy.size = room;
+        }
+        if (copy.size != 0) {
+            fitted_copies.push_back(copy);
+        }
+    }
+    if (fitted_copies.size() != copies.size()) {
+        copies = std::span<const vk::BufferCopy>{fitted_copies};
+    }
 
     // bbport: many regions (HLE copy shaders) are tracked as one bounding range per buffer:
     // conservative for barriers, and two tree lookups instead of two per region.
@@ -165,6 +346,17 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
 void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32 value) {
     scheduler.EndRendering();
 
+    // bbport: a fill past its buffer is a write past it too (see FitCopies).
+    const u64 limit = dst->SizeBytes();
+    if (offset >= limit) {
+        ReportTransferCut("buffer fill", "region", offset, size, limit);
+        return;
+    }
+    if (size > limit - offset) {
+        ReportTransferCut("buffer fill", "region", offset, size, limit);
+        size = limit - offset;
+    }
+
     if (IsBufferAccessed(dst, offset, size, true)) {
         FlushBarriers();
     }
@@ -179,6 +371,12 @@ void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32
 
 void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
     scheduler.EndRendering();
+
+    // bbport: an update past its buffer is a write past it too (see FitCopies).
+    if (offset >= dst->SizeBytes() || sizeof(value) > dst->SizeBytes() - offset) {
+        ReportTransferCut("buffer update", "region", offset, sizeof(value), dst->SizeBytes());
+        return;
+    }
 
     if (IsBufferAccessed(dst, offset, sizeof(value), true)) {
         FlushBarriers();
@@ -231,6 +429,14 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
     const TransferMark mark{*this, "image upload", *dst};
+    // bbport: cut to the buffer and to the image's own levels and layers (see FitCopies).
+    const auto fitted = FitCopies<boost::container::small_vector<vk::BufferImageCopy, 16>>(
+        "image upload", upload_copies, src, dst->CreateInfo(), dst->info.pixel_format);
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    if (fitted.empty()) {
+        return;
+    }
+    upload_copies = std::span<const vk::BufferImageCopy>{fitted};
 
     bool needs_flush =
         Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eCopy,
@@ -254,15 +460,38 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
         AccessBuffer(src, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
                      vk::AccessFlagBits2::eTransferRead);
     }
+}
 
-    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+u64 Runtime::BufferImageCopyBytes(const vk::BufferImageCopy& copy, vk::Format format) {
+    return BufferImageCopySize(copy, format);
 }
 
 void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
-                            std::span<const vk::BufferImageCopy> download_copies) {
+                            std::span<const vk::BufferImageCopy> download_copies,
+                            u64 limit_base, u64 limit_size) {
     SetBackingSamples(src, src->info.num_samples);
     scheduler.EndRendering();
     const TransferMark mark{*this, "image download", *src};
+    // bbport: cut to the buffer, to the reservation inside it and to the image's own levels and
+    // layers (see FitCopies). The copy geometry of a tiled image is as wide as its pitch, which
+    // can be larger than the mip's own size: the widest copies reached past the reservation of
+    // the staging block they were given, and a reservation that ends near the end of the block
+    // put that write past the block - a lost device, reported as a write a few MiB past a 16 MiB
+    // device-local block, which no log line named.
+    boost::container::small_vector<vk::BufferImageCopy, 16> fitted;
+    const vk::ImageCreateInfo& image_ci = src->CreateInfo();
+    for (vk::BufferImageCopy copy : download_copies) {
+        if (!CopyFitsBuffer("image download", copy, dst, src->info.pixel_format, limit_base,
+                            limit_size) ||
+            !FitCopyToImage("image download", copy, image_ci, src->info.pixel_format)) {
+            continue;
+        }
+        fitted.push_back(copy);
+    }
+    if (fitted.empty()) {
+        return;
+    }
+    download_copies = std::span<const vk::BufferImageCopy>{fitted};
 
     bool needs_flush =
         Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
@@ -289,7 +518,10 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
 }
 
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
-    const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
+    const vk::ImageCreateInfo& src_ci = src->CreateInfo();
+    const vk::ImageCreateInfo& dst_ci = dst->CreateInfo();
+    const u32 num_mips = std::min({src->info.resources.levels, dst->info.resources.levels,
+                                   src_ci.mipLevels, dst_ci.mipLevels});
 
     // Format mismatch warning (safe but useful)
     if (src->info.pixel_format != dst->info.pixel_format) {
@@ -364,6 +596,46 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
             region.extent = vk::Extent3D(mip_w, mip_h, dst_layers);
         }
 
+        // bbport: cut to the levels and layers the two VkImages really have (see FitCopies).
+        const vk::Extent3D src_limit = LevelExtent(src_ci, mip);
+        const vk::Extent3D dst_limit = LevelExtent(dst_ci, mip);
+        const vk::Extent3D fitted{std::min({region.extent.width, src_limit.width,
+                                            dst_limit.width}),
+                                  std::min({region.extent.height, src_limit.height,
+                                            dst_limit.height}),
+                                  std::min({region.extent.depth, src_limit.depth,
+                                            dst_limit.depth})};
+        u32 fitted_src_layers = std::min(region.srcSubresource.layerCount, src_ci.arrayLayers);
+        u32 fitted_dst_layers = std::min(region.dstSubresource.layerCount, dst_ci.arrayLayers);
+        if (is_same_type) {
+            // 2D arrays copy layer for layer: both sides must ask for the same count.
+            fitted_src_layers = fitted_dst_layers = std::min(fitted_src_layers, fitted_dst_layers);
+        } else if (is_2d_to_3d) {
+            // The 2D side's layer count is the volume's depth: keep them equal.
+            fitted_src_layers = std::min(fitted_src_layers, fitted.depth);
+        } else {
+            fitted_dst_layers = std::min(fitted_dst_layers, fitted.depth);
+        }
+        if (fitted != region.extent || fitted_src_layers != region.srcSubresource.layerCount ||
+            fitted_dst_layers != region.dstSubresource.layerCount) {
+            if (transfer_reports.fetch_add(1, std::memory_order_relaxed) < MaxTransferReports) {
+                std::printf("Transfer: image copy: level %u of %ux%ux%u/%u layers into %ux%ux%u/%u"
+                            " layers, the copy asks for %ux%ux%u of %u into %u; cut\n",
+                            mip, src_limit.width, src_limit.height, src_limit.depth,
+                            src_ci.arrayLayers, dst_limit.width, dst_limit.height, dst_limit.depth,
+                            dst_ci.arrayLayers, region.extent.width, region.extent.height,
+                            region.extent.depth, region.srcSubresource.layerCount,
+                            region.dstSubresource.layerCount);
+            }
+        }
+        region.extent = fitted;
+        region.srcSubresource.layerCount = fitted_src_layers;
+        region.dstSubresource.layerCount = fitted_dst_layers;
+        if (fitted.width == 0 || fitted.height == 0 || fitted.depth == 0 ||
+            fitted_src_layers == 0 || fitted_dst_layers == 0) {
+            continue;
+        }
+
         regions.push_back(region);
     }
 
@@ -410,6 +682,27 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
         .imageOffset = {0, 0, 0},
         .imageExtent = {src->info.size.width, src->info.size.height, src->info.size.depth},
     };
+    // bbport: the intermediate copy is cut to both images and to the buffer it passes through
+    // (see FitCopies). It used to be the source's extent against a fixed 128 MiB buffer.
+    const vk::ImageCreateInfo& src_ci = src->CreateInfo();
+    const vk::ImageCreateInfo& dst_ci = dst->CreateInfo();
+    if (!FitCopyToImage("image color/depth copy", buffer_copy, src_ci,
+                        src->info.pixel_format) ||
+        !CopyFitsBuffer("image color/depth copy", buffer_copy, buffer,
+                        src->info.pixel_format)) {
+        return;
+    }
+    const vk::Extent3D dst_limit = LevelExtent(dst_ci, 0);
+    buffer_copy.imageExtent.width = std::min(buffer_copy.imageExtent.width, dst_limit.width);
+    buffer_copy.imageExtent.height = std::min(buffer_copy.imageExtent.height, dst_limit.height);
+    buffer_copy.imageExtent.depth = std::min(buffer_copy.imageExtent.depth, dst_limit.depth);
+    buffer_copy.imageSubresource.layerCount =
+        std::min(buffer_copy.imageSubresource.layerCount, dst_ci.arrayLayers);
+    if (buffer_copy.imageExtent.width == 0 || buffer_copy.imageExtent.height == 0 ||
+        buffer_copy.imageExtent.depth == 0 || buffer_copy.imageSubresource.layerCount == 0) {
+        ReportTransferDrop("image color/depth copy", "destination image");
+        return;
+    }
     const auto copy_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
 
     scheduler.EndRendering();
@@ -451,6 +744,11 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
 }
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
+    if (mip >= dst->info.mips_layout.size()) {
+        // bbport: the mip list is 16 entries; a guest mip index past it indexed the array.
+        ReportTransferDrop("image mip copy", "mip list");
+        return;
+    }
     const auto dst_dim = dst->info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(dst->info.size.width >> (mip + dst_dim), 1u);
     const auto mip_block_h = std::max(dst->info.size.height >> (mip + dst_dim), 1u);
@@ -464,20 +762,53 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     const auto [src_layers, dst_layers] =
         SanitizeCopyLayers(src->info, dst->info, src->info.size.depth);
 
+    // bbport: the extent is the source's, the destination is mip `mip` of the destination image:
+    // cut both to what the two VkImages really have (see FitCopies).
+    const vk::ImageCreateInfo& src_ci = src->CreateInfo();
+    const vk::ImageCreateInfo& dst_ci = dst->CreateInfo();
+    if (mip >= dst_ci.mipLevels || slice >= dst_ci.arrayLayers) {
+        ReportTransferDrop("image mip copy", "image");
+        return;
+    }
+    const vk::Extent3D src_limit = LevelExtent(src_ci, 0);
+    const vk::Extent3D dst_limit = LevelExtent(dst_ci, mip);
+    const vk::Extent3D mip_extent{
+        std::min({src->info.size.width, src_limit.width, dst_limit.width}),
+        std::min({src->info.size.height, src_limit.height, dst_limit.height}),
+        std::min({src->info.size.depth, src_limit.depth, dst_limit.depth})};
+    const u32 mip_src_layers = std::min(src_layers, src_ci.arrayLayers);
+    const u32 mip_dst_layers = std::min(dst_layers, dst_ci.arrayLayers - slice);
+    if (mip_extent.width == 0 || mip_extent.height == 0 || mip_extent.depth == 0 ||
+        mip_src_layers == 0 || mip_dst_layers == 0) {
+        ReportTransferDrop("image mip copy", "image level");
+        return;
+    }
+    if (mip_extent != vk::Extent3D{src->info.size.width, src->info.size.height,
+                                   src->info.size.depth} ||
+        mip_src_layers != src_layers || mip_dst_layers != dst_layers) {
+        if (transfer_reports.fetch_add(1, std::memory_order_relaxed) < MaxTransferReports) {
+            std::printf("Transfer: image mip copy: level %u is %ux%ux%u/%u layers, the copy asks "
+                        "for %ux%ux%u of %u into %u; cut\n",
+                        mip, dst_limit.width, dst_limit.height, dst_limit.depth,
+                        dst_ci.arrayLayers, src->info.size.width, src->info.size.height,
+                        src->info.size.depth, src_layers, dst_layers);
+        }
+    }
+
     const vk::ImageCopy image_copy{
         .srcSubresource{
             .aspectMask = src->aspect_mask,
             .mipLevel = 0,
             .baseArrayLayer = 0,
-            .layerCount = src_layers,
+            .layerCount = mip_src_layers,
         },
         .dstSubresource{
             .aspectMask = src->aspect_mask,
             .mipLevel = mip,
             .baseArrayLayer = slice,
-            .layerCount = dst_layers,
+            .layerCount = mip_dst_layers,
         },
-        .extent = {src->info.size.width, src->info.size.height, src->info.size.depth},
+        .extent = {mip_extent.width, mip_extent.height, mip_extent.depth},
     };
 
     SetBackingSamples(dst, dst->info.num_samples);
@@ -510,10 +841,16 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
             src->info.props.is_depth == dst->info.props.is_depth) {
             CopyImage(src, dst);
         } else {
-            // Perform depth from/to color copy using the intermediate copy buffer.
-            static constexpr size_t COPY_BUFFER_SIZE = 128_MB;
-            const auto copy_ref =
-                staging_pool.Request(COPY_BUFFER_SIZE, VideoCore::MemoryType::DeviceLocal);
+            // Perform depth from/to color copy using the intermediate copy buffer. bbport: the
+            // buffer holds the copy, not a fixed 128 MiB that a layered or large image could
+            // outgrow (a transfer past its buffer is a write past it: a device lost).
+            static constexpr size_t MAX_COPY_BUFFER_SIZE = 512_MB;
+            const u64 needed = std::min<u64>(
+                IntermediateCopyBytes(src->info.size, src->info.resources.layers,
+                                      src->info.pixel_format),
+                MAX_COPY_BUFFER_SIZE);
+            const auto copy_ref = staging_pool.Request(std::max<u64>(needed, 4096),
+                                                       VideoCore::MemoryType::DeviceLocal);
             CopyImageWithBuffer(src, dst, copy_ref.buffer, copy_ref.offset);
         }
     } else if (src->info.num_samples == 1 && dst->info.num_samples > 1 &&
@@ -654,6 +991,28 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
 
 void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                          const vk::ClearValue& clear_value) {
+    // bbport: a clear past the levels or layers of the image is a write past it (see FitCopies).
+    const vk::ImageCreateInfo& image_ci = dst->CreateInfo();
+    if (range.base.level >= image_ci.mipLevels || range.base.layer >= image_ci.arrayLayers) {
+        ReportTransferDrop("image clear", "image");
+        return;
+    }
+    if (range.extent.levels > image_ci.mipLevels - range.base.level ||
+        range.extent.layers > image_ci.arrayLayers - range.base.layer) {
+        if (transfer_reports.fetch_add(1, std::memory_order_relaxed) < MaxTransferReports) {
+            std::printf("Transfer: image clear: %u levels from %u of %u, %u layers from %u of "
+                        "%u; cut\n",
+                        range.extent.levels, range.base.level, image_ci.mipLevels,
+                        range.extent.layers, range.base.layer, image_ci.arrayLayers);
+        }
+    }
+    const vk::ImageSubresourceRange vk_range = {
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .baseMipLevel = range.base.level,
+        .levelCount = std::min<u32>(range.extent.levels, image_ci.mipLevels - range.base.level),
+        .baseArrayLayer = range.base.layer,
+        .layerCount = std::min<u32>(range.extent.layers, image_ci.arrayLayers - range.base.layer),
+    };
     scheduler.EndRendering();
 
     const bool needs_flush =
@@ -662,14 +1021,6 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
     if (needs_flush) {
         FlushBarriers();
     }
-
-    const vk::ImageSubresourceRange vk_range = {
-        .aspectMask = vk::ImageAspectFlagBits::eColor,
-        .baseMipLevel = range.base.level,
-        .levelCount = range.extent.levels,
-        .baseArrayLayer = range.base.layer,
-        .layerCount = range.extent.layers,
-    };
     scheduler.Record([image = dst->GetImage(), color = clear_value.color,
                       vk_range](vk::CommandBuffer cmdbuf) {
         cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);

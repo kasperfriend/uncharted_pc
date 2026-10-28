@@ -16,24 +16,161 @@ if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 # Frame pointers keep the loader's thread dumps (watchdog, SIGUSR2 sampling) walkable.
-add_compile_options(-fno-omit-frame-pointer)
+set(BB_FRAME_POINTERS ON CACHE BOOL "Frame pointers (needed for the loader's stack dumps)")
+if (BB_FRAME_POINTERS)
+    add_compile_options(-fno-omit-frame-pointer)
+else()
+    add_compile_options(-fomit-frame-pointer)
+endif()
 
-# bbport: link-time optimization (BB_LTO, default on) and profile-guided optimization
-# (BB_PGO: off, generate = instrumented build writing into BB_PGO_DIR, use = build with that
-# profile). Covers bbgpu and the static libraries linked into it. No -march: the same build
-# runs on the Steam Deck.
-option(BB_LTO "Link-time optimization of bbgpu" ON)
+# -------------------------------------------------------------------------------------------
+# Host code generation (bbport).
+#
+# The guest game code runs natively and needs AVX (the PS4's CPU has it); the loader rewrites
+# the BMI1/LZCNT/MOVBE instructions that older CPUs lack (src/cpu_patch.c). AVX is therefore the
+# instruction-set floor of every machine that runs the port, and the host side is compiled for
+# exactly that floor: SSE4.2, POPCNT, AES/PCLMUL, F16C and AVX (VEX-encoded 128-bit code), but
+# *no* AVX2, FMA or BMI -- those would be illegal instructions on the CPUs this build must run
+# on, and they only ever come from -march=native on a newer machine.
+#
+# BB_ARCH selects what is generated:
+#   avx      (default) the floor above, scheduled for a 128-bit-wide core: runs everywhere
+#   native   -march=native: everything this machine has, for local benchmark builds only
+#   avx2     x86-64-v3 (AVX2/FMA/BMI2): newer CPUs only
+#   generic  plain x86-64 (SSE2): for a debugger or an emulator, ~10% slower
+#   <value>  passed to -march= (core-avx-i, znver2, skylake, ...)
+# BB_TUNE overrides -mtune (default: the microarchitecture matching BB_ARCH).
+# -------------------------------------------------------------------------------------------
+set(BB_ARCH "avx" CACHE STRING "Host instruction set: avx, avx2, native, generic or an -march= value")
+set(BB_TUNE "" CACHE STRING "-mtune value (empty: follow BB_ARCH)")
+set(BB_ARCH_FLAGS "")
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|X86_64)$")
+    include(CheckCXXCompilerFlag)
+    if (BB_ARCH STREQUAL "native")
+        set(BB_ARCH_FLAGS -march=native)
+    elseif (BB_ARCH STREQUAL "generic")
+        set(BB_ARCH_FLAGS "")
+    elseif (BB_ARCH STREQUAL "avx2")
+        check_cxx_compiler_flag("-march=x86-64-v3" BB_HAVE_V3)
+        if (BB_HAVE_V3)
+            set(BB_ARCH_FLAGS -march=x86-64-v3)
+        else()
+            set(BB_ARCH_FLAGS -mavx2 -mfma -mbmi -mbmi2 -mf16c -msse4.2 -mpopcnt)
+        endif()
+        if (BB_TUNE STREQUAL "")
+            set(BB_TUNE core-avx-i)
+        endif()
+    elseif (BB_ARCH STREQUAL "avx")
+        # The floor. -march=x86-64-v2 (SSE4.2/POPCNT/CMPXCHG16B) plus AVX/F16C; AVX2, FMA and
+        # BMI are explicitly off so a stray -mavx2 in the environment cannot break the build.
+        check_cxx_compiler_flag("-march=x86-64-v2" BB_HAVE_V2)
+        if (BB_HAVE_V2)
+            set(BB_ARCH_FLAGS -march=x86-64-v2)
+        else()
+            set(BB_ARCH_FLAGS -msse4.2 -mpopcnt -mcx16)
+        endif()
+        list(APPEND BB_ARCH_FLAGS -mavx -mf16c -mno-avx2 -mno-fma -mno-bmi -mno-bmi2)
+        # 128-bit vectors: the cores this profile targets execute 256-bit operations as two
+        # 128-bit halves (no gain), and 256-bit code next to the guest's legacy SSE would cost
+        # a vzeroupper transition at every call boundary between them.
+        check_cxx_compiler_flag("-mprefer-vector-width=128" BB_HAVE_PVW)
+        if (BB_HAVE_PVW)
+            list(APPEND BB_ARCH_FLAGS -mprefer-vector-width=128)
+        endif()
+        if (BB_TUNE STREQUAL "")
+            set(BB_TUNE core-avx-i)
+        endif()
+    else()
+        set(BB_ARCH_FLAGS -march=${BB_ARCH})
+    endif()
+    if (NOT BB_TUNE STREQUAL "")
+        list(APPEND BB_ARCH_FLAGS -mtune=${BB_TUNE})
+    endif()
+endif()
+if (BB_ARCH_FLAGS)
+    message(STATUS "bbport: host code generation ${BB_ARCH_FLAGS}")
+    foreach (bb_flag IN LISTS BB_ARCH_FLAGS)
+        add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:${bb_flag}>")
+    endforeach()
+endif()
+
+# Release builds: -O3 by default (RelWithDebInfo would be -O2), still with debug information.
+set(BB_OPT_LEVEL "3" CACHE STRING "Optimization level of release builds (2 or 3)")
+if (BB_OPT_LEVEL AND NOT BB_OPT_LEVEL STREQUAL "0")
+    add_compile_options("$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:SHELL:-O${BB_OPT_LEVEL}>")
+endif()
+# Dead code and data in their own sections: smaller binary, better code locality (-O3 already
+# implies them for C, not for the hand-written assembly-free C++ sources).
+add_compile_options(-ffunction-sections -fdata-sections)
+# Semantically interposable symbols cannot be inlined across the library on ELF; the port
+# never interposes its own functions.
+if (NOT WIN32)
+    add_compile_options(-fno-semantic-interposition)
+endif()
+
+# bbport: link-time optimization (BB_LTO) and profile-guided optimization (BB_PGO).
+#
+# BB_LTO=THIN (default): ThinLTO -- most of full LTO's speed-up with a fraction of its build
+# time and memory (this library is ~400 TUs of C++). BB_LTO=ON: full LTO (best code, slow).
+# BB_LTO=OFF: none. ThinLTO needs the LLVM linker; without it, LTO is turned off.
+set(BB_LTO "THIN" CACHE STRING "Link-time optimization: THIN, ON (full), OFF")
+set_property(CACHE BB_LTO PROPERTY STRINGS THIN ON OFF)
 set(BB_PGO "off" CACHE STRING "Profile-guided optimization: off, generate, use")
 set(BB_PGO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pgo" CACHE PATH "Profile directory")
-if (BB_LTO)
+find_program(BB_LLD_PATH NAMES ld.lld lld)
+set(BB_USE_LLD "AUTO" CACHE STRING "Use the LLVM linker (AUTO, ON, OFF)")
+# AUTO: lld with clang (the pair MSYS2 and the CI use: several times faster than ld.bfd on this
+# library, and the only fully supported ThinLTO setup).
+if (BB_USE_LLD STREQUAL "ON" OR
+    (BB_USE_LLD STREQUAL "AUTO" AND BB_LLD_PATH AND CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
+    if (BB_LLD_PATH)
+        add_link_options(-fuse-ld=lld)
+        message(STATUS "bbport: linking with lld (${BB_LLD_PATH})")
+    elseif (BB_USE_LLD STREQUAL "ON")
+        message(WARNING "BB_USE_LLD=ON but no lld was found in PATH")
+    endif()
+endif()
+# Unused functions and data out of the executable (COFF linkers already do this by default).
+if (NOT WIN32)
+    add_link_options(-Wl,--gc-sections)
+endif()
+
+set(BB_LTO_MODE "${BB_LTO}")
+string(TOUPPER "${BB_LTO_MODE}" BB_LTO_MODE)
+if (BB_LTO_MODE STREQUAL "THIN")
+    if (BB_LLD_PATH)
+        add_compile_options(-flto=thin)
+        add_link_options(-flto=thin)
+    else()
+        # No LLVM linker: full LTO through the compiler driver's own plugin instead.
+        message(STATUS "bbport: no lld for ThinLTO, using full LTO")
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT bb_ipo_ok OUTPUT bb_ipo_error)
+        if (bb_ipo_ok)
+            set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+            set(BB_LTO_MODE ON)
+        else()
+            message(WARNING "LTO unavailable: ${bb_ipo_error}")
+            set(BB_LTO_MODE OFF)
+        endif()
+    endif()
+elseif (BB_LTO_MODE STREQUAL "ON" OR BB_LTO_MODE STREQUAL "TRUE")
     include(CheckIPOSupported)
     check_ipo_supported(RESULT bb_ipo_ok OUTPUT bb_ipo_error)
     if (bb_ipo_ok)
         set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+        set(BB_LTO_MODE ON)
     else()
         message(WARNING "LTO unavailable: ${bb_ipo_error}")
+        set(BB_LTO_MODE OFF)
     endif()
+else()
+    set(BB_LTO_MODE OFF)
 endif()
+message(STATUS "bbport: LTO ${BB_LTO_MODE}, PGO ${BB_PGO}")
+
+# Clang and GCC name their profiles differently: clang writes .profraw files that are merged
+# into one .profdata, GCC reads and writes a directory (gcc 9+ may also use -fprofile-use=dir).
 if (BB_PGO STREQUAL "generate")
     # Atomic counters: the GPU, recording, preparation and copy threads run the same code.
     add_compile_options(-fprofile-generate=${BB_PGO_DIR} -fprofile-update=atomic)
@@ -43,8 +180,15 @@ elseif (BB_PGO STREQUAL "use")
     # Partial training keeps unprofiled code optimized normally; counters from concurrent
     # threads can be slightly inconsistent (correction). Functions changed since the profile
     # (or built differently for it, bbgpu_init) are compiled without it.
-    add_compile_options(-fprofile-use=${BB_PGO_DIR} -fprofile-partial-training
-                        -fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # tools/pgo.sh merges the .profraw files into this file.
+        add_compile_options(-fprofile-use=${BB_PGO_DIR}/bbport.profdata
+                            -fprofile-partial-training -Wno-profile-instr-unprofiled
+                            -Wno-profile-instr-out-of-date -Wno-profile-correction)
+    else()
+        add_compile_options(-fprofile-use=${BB_PGO_DIR} -fprofile-partial-training
+                            -fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch)
+    endif()
 endif()
 
 find_package(Vulkan REQUIRED)
@@ -315,6 +459,19 @@ add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_sup
     shim/bbport_settings.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
+
+# bbport: the host-side work the port does itself, checked without a GPU: the bit array's range
+# scans (AVX2 and the SSE2 path this build uses) and the streaming guest-memory copy.
+add_executable(bit-array-test EXCLUDE_FROM_ALL ../tests/test_bit_array.cpp)
+target_compile_options(bit-array-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(bit-array-test PRIVATE shadps4)
+add_executable(stream-copy-test EXCLUDE_FROM_ALL ../tests/test_stream_copy.cpp shim/bbport_memcpy.cpp)
+target_compile_options(stream-copy-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(stream-copy-test PRIVATE shim)
+# Timings of the bit array loops with this build's vector path (ninja -C out/gpu bit-array-bench).
+add_executable(bit-array-bench EXCLUDE_FROM_ALL ../tests/bench_bit_array.cpp)
+target_compile_options(bit-array-bench PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(bit-array-bench PRIVATE shadps4)
 
 add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
     shadps4/video_core/renderer_vulkan/fsr411/fsr411.cpp)

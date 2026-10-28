@@ -72,6 +72,14 @@ Rejected: "hot pages" (never re-protect pages written repeatedly, upload them on
 binding) — the set grew to ~14k pages, re-uploads dropped the frame rate to 33 FPS and a GPU
 ring timeout followed. Left opt-in behind BB_HOT_PAGES=1.
 
+Rejected: a repeat memo in the barrier tracker. A draw ends with one access per bound buffer and
+the next draw binds the same ranges, so the insert looked like a search for a node the tree
+already holds. Measured on the tracker itself (`FindRange` against the memo), that search is
+**1.1 ns** — the tracker's hash of the resource picks one of 64 roots, so each bucket holds the
+few ranges of one buffer and the walk is two or three compares. The memo (index, 16 slots,
+comparison) costs **3.0 ns**, and it has to be dropped whenever the tree loses coverage. The
+insert stays as it is.
+
 Texture description cache 2-way/4096, same-target fast path, LRU touch skip, no per-texture
 meta lookup: other outdoor view, 93.9 FPS; with the texture memos off (mask 1056) 65.6 FPS.
 Close to the 100 Hz display cap (vblank-paced), so further gains need an uncapped test.
@@ -489,6 +497,9 @@ Frame rate at the level entrance, 16 threads, FSR 4 Ultra Performance: ~134 -> ~
 
 `Frame stats` now prints, next to the drain counts, the share of stage A's time each drain
 reason and each call site (`function:line`, `DrainDrawPipe` records `__builtin_LINE`) waited.
+The waits themselves (the drain spin, the ring's space wait, stage B's idle wait) are sized by
+the wait governor now, not by a fixed pause count: see `docs/PERFORMANCE.md`, "Waiting between
+the port's threads".
 Stage A waits ~25% of its time, almost all at one drain per frame: whichever drain comes first
 after a long stretch of draws waits for stage B to finish them. It was `DrawIndirect` (21%),
 then `DispatchIndirect`, then a `DumpConstRam` once those were pipelined. So stage A is faster
@@ -576,3 +587,266 @@ now reads guest memory for the constant ring, is not treated as a GPU-side threa
 (`IsGpuSideThreadId` accepts only stage B). Next: a run with `BB_WRITE_LOG=1` that crashes
 prints which logged write landed near the corrupted block; bisect the pipeline toggles
 (38 tasks, 39 pending fence waits, 41 recorder fences, 42 memory writes, 36 constant ring).
+
+## Device lost after fast movement: a guest address written as a device one (2026-10-28)
+
+Reported log (Windows, RTX 3080, driver 617.14.0.0, 3440x1440, FSR 3.1 frame generation 2x):
+`write to an invalid address at 0x10e765e000 (+- 0x1000)`, `instruction pointer (fault) at
+0xf004ff6c0`, after multi-second GPU stalls on one timeline and while the camera was moving fast.
+The buffer cache printed `BDA page table at GPU 0xfa8200000`, two arenas (guest
+`0x1100000000-0x1200000000` = GPU `0xfb9f10000-0x10b9f10000`, guest `0x1000000000-0x1100000000`
+= GPU `0x1117800000-0x1217800000`) and 462 resident ranges.
+
+What the numbers say:
+
+| address | where it is |
+| --- | --- |
+| `0x10e765e000` | in arena 2's **guest** range (offset `0xe765e000`), in no **device** range |
+| its block `0x10e765` | **not** resident (462 resident ranges, none covering it) |
+| if it were resident | GPU `0x1117800000 + 0xe765e000` = `0x11fee5e000` |
+| `0xf004ff6c0` (fault IP) | below the page table and both arenas: not a BDA data address |
+
+So the shader wrote to an address in the *guest* form of the arena while the page table can only
+hand out *device* addresses (`arena BDA + block offset`) and returns 0 for a page that is not
+resident (that path marks the page in the fault buffer and returns a null pointer instead). A write
+at a guest-form address therefore means a page-table entry held a guest address, and nothing in the
+resident set could account for it.
+
+Where a guest-form entry can come from. `EnsureResident` published `arena->BufferDeviceAddress() +
+(resident block address - arena.cpu_addr)` for every block of every gap it filled, *after* checking
+whether that block was inside the arena - it printed a complaint and then wrote the entry anyway.
+A range outside its arena (an arena page that was migrated by `GetArena`, a fault on an address
+outside it, an arena whose device address the driver did not hand out) produced
+`arena BDA + underflowed offset`: an address outside the arena's own memory, and for an arena with
+no device address at all, the guest address itself. Fast movement streams new pages, so those paths
+run hundreds of times a second exactly when the crash happened.
+
+Changes:
+
+- `EnsureResident` clamps a gap to the arena it is being bound into, counts it (`clipped_ranges`)
+  and prints at most 16 of them; a range that ends up empty publishes nothing. Every page-table
+  entry it writes is now inside `[arena BDA, arena BDA + size)`, i.e. a device address of a live
+  buffer. An arena whose `BufferDeviceAddress()` is 0 no longer publishes entries at all (the
+  shader's own fault path retries its pages instead of writing to guest memory as if it were
+  device memory).
+- The crash report answers "where is this address" for each fault address the driver names: the
+  page-table index and offset, which arena's guest or device range it falls in, whether its block
+  is resident, the device address it would have, the nearest resident range below and above, and
+  the last residency decisions (guest range, device address, memory, memory offset) that covered
+  the page. The nearest tracked buffer is printed even when it is far away, so a stale address
+  still names the buffer that used to own it.
+- The guest pages shaders faulted on (the port's own BDA page faults) are kept, newest last, and
+  printed with the same report: the streaming that came just before a device lost is the list of
+  pages that were made resident in the seconds before it.
+
+Verified without a GPU by replaying the reported address against the arena, resident-set and clamp
+arithmetic (`/tmp/crash_logic.cpp`, checks the guest-range verdict, the would-be device address and
+that a clamped gap never publishes an entry outside its arena). The full report and the clamp run
+only on faults, residency and the crash path: nothing here is on the per-draw path.
+
+## Second device lost: the tiling shader walked past its mip list (2026-10-28)
+
+The next log (same machine) came with the new report and ruled the arena theory out on its own
+terms: `0 clamped resident ranges`, `459 residency events`, and the faulting write
+`0x10e7622000` was **not** in any arena's device range, with no residency decision covering its
+page. So no page-table entry of the port produced it. The driver also named the buffers it knows:
+`nearest 0x10e6400000-0x10e7400000 aliveDeviceLocal, 0x222000 away` - a 16 MiB `DeviceLocal`
+buffer (the staging pool's ring blocks for tiled images are 16 MiB) written 2.1 MiB past its end.
+
+That the write lands *just* past a buffer the port allocates, in a frame that also streamed
+thousands of pages, points at the compute shader that converts between tiled and linear images -
+the one place where a shader indexes a buffer by an address computed from a mip table. Reading it,
+the table walk was:
+
+```glsl
+uint GetMipLevel(inout uint texel) {
+    uint mip = 0;
+    uint mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
+    while (texel >= mip_size && mip < info.num_mips) {   // checked *after* stepping
+        texel -= mip_size;
+        ++mip;
+        mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
+    }
+    return mip;
+}
+```
+
+A texel past the last filled mip leaves `mip == num_mips` and `main()` then addresses the surface
+with `mips[num_mips]` - an entry the host never fills. Its pitch, height and offset are zeros, so
+`x = texel % 0`, `y = (texel / 0) % 0` and `tiled_offset = 0` go through the tiling arithmetic as
+undefined values; whatever they multiply out to is used as a buffer index. With a real mip list
+those entries are stack garbage instead: either way the address is arbitrary, and the write lands
+wherever it lands - a few MiB past a buffer is exactly the shape of it.
+
+Two ways a dispatch asks for texels the mips do not cover:
+
+* `dim_x` was computed from the image's guest size (`guest_size / bytes_per_pixel / 64`), but the
+  shader subtracts *mip sizes* to find the mip of a texel. The two agree only when `guest_size` is
+  the sum of the filled mips. It is not when the mip list is truncated to fit the arena
+  (`SynchronizeMemoryFromImage` stops at a mip that does not fit), when an image has more than 16
+  levels (the parameters hold 16), or for a linear array whose later `mips_layout` entries were
+  never filled.
+* The parameter block held `num_mips` entries of which the shader happily read one more.
+
+Changed:
+
+* the shader's walk stops on the last filled mip (`mip + 1 < info.num_mips`), so a stray texel
+  stays on the last mip and addresses a real surface instead of an unfilled entry;
+* the parameter block carries `num_texels` (a `uint` after `num_mips`, both sides of the copy in
+  the same order) and the shader returns before computing an address when its texel is past it:
+  the dispatch can now be a whole number of workgroups without ever asking for a texel beyond the
+  data;
+* `num_mips` is clamped to the 16 entries the block holds on the CPU side too, both when it comes
+  from `resources.levels` and from the number of copies (it was an out-of-bounds write to
+  `TilingInfo::mips` - the stack of `DetileImage`/`TileImage` - for an image with more levels);
+* the dispatch is sized from the bytes the *filled mips* cover, not from `guest_size`, and a
+  mismatch between the two is printed (at most 8 times) with the image size, levels, filled mips
+  and both sizes - the case that used to over-dispatch silently;
+* image-to-buffer copies take `bufferRowLength`/`bufferImageHeight` as the larger of the mip's
+  pitch/height and the extent they copy (a row length below the extent makes the transfer
+  undefined, and the two come from different places for block-compressed and rounded mips);
+* the staging pool no longer dereferences `StreamBuffer::Reserve`'s optional without checking it
+  (a garbage offset handed to a shader would be the same kind of fault);
+* the device-lost report prints the last 32 tiling dispatches - tiled and linear buffer addresses
+  and sizes, covered bytes against guest size, workgroup count - so the next one of these names
+  the dispatch whose output range cannot hold its own texels.
+
+All of it is on the tiling and crash paths; nothing was added to a draw. Checked without a GPU by
+replaying the walk and the bound (`/tmp/chk_tile.cpp`): no texel, dispatched or not, leaves the
+filled mip list, the last texel stays on the last mip, and a truncated list covers only its own
+mips.
+
+## Round 13: the third device lost - every transfer cut to its allocation
+
+The tiling bound of round 12 was not the cause: the third crash log's own dispatch record shows the
+detile landing in its 16 MiB staging block with `covers 0x540000 of guest 0x540000` (inside its
+block, nothing flagged), while the fault is a *write* at `0x10e7618000` - 18.09 MiB into that block
+and 2.09 MiB past its end. The nearest live buffer is an unnamed 16 MiB `MemoryType::DeviceLocal`
+buffer, i.e. one of the staging blocks (`StagingBufferPool`'s ring); the address is in no recorded
+allocation at all, so the write went past one. The faulting instruction pointer repeats across all
+three crashes in one 4 KiB page, and the driver's own copy/blit shaders live in that heap: the
+shape of the fault is a transfer, not a game shader (a shader's BDA store can only ever land in an
+arena - the page table holds arena addresses only).
+
+Vulkan makes a transfer that reaches past its buffer or past a level/layer of its image *undefined*:
+the driver writes where nothing is mapped, the device is lost, and the report points at the copy,
+never at the code that recorded it. Every one of the port's transfers is now cut to what the
+resource really has before it is recorded, and the cut is printed (12 times each) with the
+transfer's name:
+
+* `Runtime::UploadImage` / `Runtime::DownloadImage` - each region is checked against the buffer's
+  size and against the *VkImage's own* `mipLevels`/`arrayLayers`/level extent (an image's backing
+  can be a smaller alias of what the guest descriptor describes). Regions that do not fit are cut
+  or dropped; the image-side extent is only ever shrunk, and a block-compressed extent that has to
+  be cut is rounded down to whole blocks.
+* `Runtime::CopyBuffer` - both buffers' sizes bound every region.
+* `Runtime::FillBuffer` / `Runtime::InlineData` - a fill or update past its buffer is cut (it is a
+  transfer write too).
+* `Runtime::CopyImage` - each level's region is cut to both images' real level extent and array
+  layers, keeping the layer counts equal in the ways Vulkan requires (2D arrays copy layer for
+  layer, a 2D-to-3D copy's layer count is the volume's depth).
+* `Runtime::CopyMip` - the source's extent pasted into a destination *mip* used to be the source's
+  base extent unchecked; both are cut to the destination level and its remaining layers.
+* `Runtime::ClearImage` - a clear's subresource range is cut to the image's levels and layers (the
+  range comes from the guest).
+* `Runtime::CopyImageWithBuffer` (color/depth) - the intermediate copy is cut to both images and to
+  the buffer it passes through, and `CopyColorAndDepth` now sizes that buffer from the image
+  (level bytes x layers, at most 512 MiB) instead of always requesting a fixed 128 MiB that a
+  layered or larger image could outgrow.
+* `BufferImageCopySize` returns 64 bits and answers 0 for a region with no width, height or layer
+  (its `num_slices - 1` underflowed to ~4 GiB for an empty copy, which the barrier tracker then
+  used as a real size).
+
+The tiling shader is the one place where an index comes from the guest's own surface maths, so its
+*tiled* side is bounded as well: `TilingInfo` carries `tiled_bytes` (the bytes the bound buffer
+really has after the bind offset, `uint` after `num_texels` - the shader's scalar block has it at
+byte 16, checked), both descriptors' ranges are cut to the buffer, and `tiling.comp` drops a texel
+whose computed offset does not hold a whole element inside `tiled_bytes`. For a well formed surface
+the last texel still fits (checked over six surface shapes plus the block layout in
+`/tmp/r13/tile13.cpp`), so nothing is lost where nothing was wrong.
+
+Net effect: no dispatch or transfer the port records can write outside an allocation any more, and
+if a caller ever hands one a region that would, the log says which transfer and by how much.
+
+## Round 14: the write past the staging block, and whose timeline the GPU waits for
+
+Crash 4 (a write, `0x10e7626000`, IP `0xf004ffbc0`) landed 2.1 MiB past the end of a *16 MiB
+device-local staging block* - the detiling scratch pool's own memory - and was preceded by
+`GPU stall: waiting 5 s for tick 2122 of timeline ...`: two ticks allocated and never executed on
+the draw timeline, four on the present one, a chain of submissions behind them. Two separate
+things were left to find: what can index past that scratch, and what the stall is waiting for.
+
+**The tiling download wrote past its reservation.** `TileManager::TileImage` fills the detiling
+scratch with `Runtime::DownloadImage` and then runs the tiling dispatch over it. The scratch was
+reserved for the image's *guest size*, but the copies handed to the download are as wide as the
+image's *pitch* - `buffer_cache` bounds each copy's row by `max(mip_pitch, width)`, because a row
+length below the extent the copy writes is undefined - so a copy can be wider than the mip's own
+size (the pitch is rounded up per level). Round 13 cut a copy to the *whole buffer* it names; the
+16 MiB staging *block* is bigger than the reservation inside it, so a copy that reached past the
+reservation but not past the block passed the check and wrote into the block's next allocation, or
+past the end of the block when the reservation ended near it. That is a write a few MiB past a
+16 MiB device-local block: the driver does not map it, the device is lost, and the crash report
+could not name the copy because it never left the host as an out-of-range region.
+
+Two things fix it. The scratch is now reserved for `max(guest_size, widest copy end)`, so a copy
+never needs to be dropped, and `Runtime::DownloadImage` takes the reservation (`offset`, `size`)
+and cuts any copy that would still reach past it (naming it, "image download"). The same function
+also answers `BufferImageCopyBytes` - the copy geometry the driver uses - which is what the reserve
+is computed with, so the two cannot drift apart.
+
+**The tiling scratch had a bound on one side only.** Round 13 bounded the *tiled* side
+(`tiled_bytes`, computed by the host from the buffer the guest data sits in) but the *linear* side
+was bounded by nothing at all in the shader: `linear_data[gl_GlobalInvocationID.x]` with the index
+running to `num_texels`, a number the host computes from the image's mip list and writes into the
+parameter block. Two consequences:
+
+* the shader's bound was a *host* number, not a property of the memory it was given: any dispatch
+  whose parameters say more texels than the scratch holds writes past it, and the write is into
+  memory the driver does not map - a lost device, exactly the reported signature (a few MiB past a
+  16 MiB block, at the size of the image being streamed);
+* the parameter block itself lives in the shared 128 MiB stream buffer, allocated per tick with a
+  tick watch (`StreamBuffer::Copy`), so a *stale* block (a range reused earlier than the GPU reads
+  it, in the one case the watch cannot cover: a dispatch recorded into a later submission) would
+  hand the shader another image's texel count.
+
+Both are gone now, and neither fix depends on the host being right:
+
+* `tiling.comp` indexes neither side without asking the descriptor what it holds:
+  `linear_index >= linear_data.length() || tiled_index >= tiled_data.length()` drops the texel.
+  `length()` of a runtime array is the *descriptor's* range, so the bound comes from the memory
+  the dispatch was bound, not from the parameter block. The `tiled_bytes` check stays as the cheap
+  early-out and as the byte-exact test (a partial last element is dropped).
+* `TileManager` sizes the dispatch from what the staging pool *granted* (`linear_bytes =
+  min(covered, staging.size)`, and `staging.size` is the reservation, not the request), sets both
+  descriptor ranges to the same span (`staging.size`, `tiled_bytes`), and prints a line if the
+  covered texels ever do not fit the scratch (8 times) instead of silently overrunning it;
+* `params.num_mips` is bounded by the image's own level count as well as by the 16-entry array, so
+  a caller that hands more copies than levels cannot have the entries past the image's own read
+  from `mips_layout` uninitialized (and their sizes reach the dispatch as its texel count).
+* the dispatch record of a crash report now holds the *bound* addresses (`buffer device address +
+  bind offset`) and each buffer's remaining size, so the dump's `tiled .../linear ...` ranges can be
+  compared with the fault address directly, and a covered span that does not fit either side is
+  marked `OUT OF THE TILED BUFFER` / `OUT OF THE LINEAR BUFFER`.
+
+**A stall report that names the timeline.** The 5 s stall printed the timeline *addresses* and the
+last 32 submissions, which cannot answer "whose value did that submission never get". Every
+timeline the port creates is registered now (`draw`, `present`, `flip`, `arena binds`), each records
+the value its last submission signals and whether it is inside `vkQueueSubmit`, and the report
+prints all of it next to every wait:
+
+```
+GPU stall: scheduler 0x... ('draw') timeline 0x...: GPU reached 2120, submitted 2121, next 2123
+GPU stall: submit #6227 scheduler 0x... signals 0x...=2123, waits 0x...=2121
+  ['draw': GPU 2120, submitted 2121, next 2123]
+```
+
+`submitted < next tick` means a tick was allocated and the queue never took it; `submitted == next
+tick - 1` with `GPU < submitted` means the GPU is behind (or waiting on another timeline, whose own
+line says how far it got). The wait is no longer unbounded-silent either: the 5 s timeout is
+re-asked and the report repeated (12 times), a wait that fails for any other reason ends the game
+with the full crash report instead of looping, and the crash report itself prints the same lines -
+so a device lost by a hang says what hung.
+
+What this keeps: a well formed dispatch still walks exactly the texels it did before (both bounds
+are the ones round 13 used, one of them now taken from the descriptor), so no data is lost where
+nothing was wrong.

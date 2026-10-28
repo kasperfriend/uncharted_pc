@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -178,6 +179,8 @@ void FaultManager::ProcessFaultBuffer() {
             std::printf("GPU page faults: %u page(s), first %#llx\n", fault_count,
                         static_cast<unsigned long long>(fault_buf[1]));
         }
+        buffer_cache.NoteFaultedPages(
+            fault_buf + 1, std::min<u32>(fault_count, static_cast<u32>(MaxPageFaults)));
         for (u32 i = 1; i <= fault_count; ++i) {
             fault_ranges.Add(fault_buf[i], sparse_pagesize);
             LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);

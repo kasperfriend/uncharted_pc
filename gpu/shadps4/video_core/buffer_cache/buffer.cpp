@@ -126,6 +126,28 @@ void DumpBuffersNear(u64 address) {
                         r.alive ? "alive" : "DESTROYED", r.name[0] ? r.name : "");
         }
     }
+    // bbport: the closest one whatever its distance -- an address that hits nothing near it is
+    // usually a stale one, and the buffer that used to be nearest still names the culprit.
+    const BdaRecord* best = nullptr;
+    u64 best_distance = ~u64{0};
+    for (const auto& r : bda_records) {
+        if (address >= r.address && address < r.address + r.size) {
+            continue;
+        }
+        const u64 distance = address >= r.address + r.size ? address - (r.address + r.size)
+                                                           : r.address - address;
+        if (distance < best_distance) {
+            best_distance = distance;
+            best = &r;
+        }
+    }
+    if (best) {
+        std::printf("GPU crash:   nearest 0x%llx-0x%llx %s%s, 0x%llx away\n",
+                    static_cast<unsigned long long>(best->address),
+                    static_cast<unsigned long long>(best->address + best->size),
+                    best->alive ? "alive" : "DESTROYED", best->name[0] ? best->name : "",
+                    static_cast<unsigned long long>(best_distance));
+    }
 }
 
 UniqueBuffer::UniqueBuffer(vk::Device device_, VmaAllocator allocator_)

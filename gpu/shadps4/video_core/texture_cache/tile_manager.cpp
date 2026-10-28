@@ -23,8 +23,16 @@
 #include "video_core/host_shaders/tiling_micro_8_comp.h"
 #include "video_core/host_shaders/tiling_micro_96_comp.h"
 
+#include <atomic>
+#include <cstdio>
+#include <limits>
 #include <magic_enum/magic_enum.hpp>
 #include <vk_mem_alloc.h>
+
+namespace Vulkan {
+/// bbport: printed by the device-lost report (vk_semaphore.cpp).
+extern void (*g_gpu_crash_detail)();
+} // namespace Vulkan
 
 namespace VideoCore {
 
@@ -32,12 +40,49 @@ struct TilingInfo {
     u32 bank_swizzle;
     u32 num_slices;
     u32 num_mips;
+    u32 num_texels;  ///< the texels the filled mips hold (the shader's hard bound)
+    u32 tiled_bytes; ///< the bytes the tiled side has (the shader's bound on that side)
     std::array<ImageInfo::MipInfo, 16> mips;
 };
+
+namespace {
+/// bbport: the bytes the filled mips of a tiling dispatch cover. The dispatch is sized from this
+/// and not from the image's guest size: the shader walks the mip list by subtracting mip sizes,
+/// so a texel past the last filled mip used to step onto the entry after it - which the host does
+/// not fill - and address the surface with that entry's pitch, height and offset (a write to a
+/// garbage offset, i.e. a device lost). Clamping the shader's walk fixes the addressing; sizing
+/// the dispatch from the covered mips makes the mismatch impossible in the first place.
+u64 CoveredBytes(const TilingInfo& params) {
+    u64 covered = 0;
+    for (u32 mip = 0; mip < params.num_mips && mip < params.mips.size(); ++mip) {
+        covered += params.mips[mip].size;
+    }
+    return covered;
+}
+
+/// bbport: the parameters of a tiling dispatch that does not fit its buffer, printed a few times
+/// (the crash report of a device lost then names the dispatch that could write outside it).
+void ReportTilingMismatch(const char* what, const ImageInfo& info, const TilingInfo& params,
+                          u64 covered) {
+    static std::atomic<u32> printed{0};
+    if (printed.fetch_add(1, std::memory_order_relaxed) >= 8) {
+        return;
+    }
+    std::printf("Tiling: %s of a %ux%u image (%u levels, %u filled, %u bits): the filled mips "
+                "cover 0x%llx bytes of the 0x%llx-byte guest size; dispatching the covered bytes\n",
+                what, info.size.width, info.size.height, info.resources.levels, params.num_mips,
+                info.num_bits, static_cast<unsigned long long>(covered),
+                static_cast<unsigned long long>(info.guest_size));
+}
+} // namespace
 
 TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, StreamBuffer& stream_buffer_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, stream_buffer{stream_buffer_} {
+    // bbport: a device lost prints the tiling dispatches recorded so far (see DispatchRecord).
+    static TileManager* crash_report;
+    crash_report = this;
+    Vulkan::g_gpu_crash_detail = [] { crash_report->DumpDispatches(); };
     const auto device = instance.GetDevice();
     const std::array<vk::DescriptorSetLayoutBinding, 3> bindings = {{
         {
@@ -193,9 +238,44 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
     return handle;
 }
 
+void TileManager::NoteDispatch(const DispatchRecord& record) {
+    dispatches[dispatch_seq.fetch_add(1, std::memory_order_relaxed) % DispatchRecords] = record;
+}
+
+void TileManager::DumpDispatches() const {
+    const u64 total = dispatch_seq.load(std::memory_order_relaxed);
+    if (total == 0) {
+        return;
+    }
+    std::printf("GPU crash: last tiling dispatches (%llu recorded):\n",
+                static_cast<unsigned long long>(total));
+    const u64 oldest = total > DispatchRecords ? total - DispatchRecords : 0;
+    u32 printed = 0;
+    for (u64 n = total; n > oldest && printed < 8; --n) {
+        const auto& r = dispatches[(n - 1) % DispatchRecords];
+        // bbport: which side the covered texels do not fit, if either (see DetileImage).
+        const char* verdict = r.covered > r.tiled_size    ? " OUT OF THE TILED BUFFER"
+                              : r.covered > r.linear_size ? " OUT OF THE LINEAR BUFFER"
+                                                          : "";
+        std::printf("GPU crash:   %s #%llu %u mips %u bits %u texels (%u groups): tiled "
+                    "0x%llx+0x%llx, linear 0x%llx+0x%llx, covers 0x%llx of guest 0x%llx%s\n",
+                    r.tiler ? "tile" : "detile", static_cast<unsigned long long>(n - 1),
+                    r.num_mips, r.num_bits, r.texels, r.dim_x,
+                    static_cast<unsigned long long>(r.tiled_address),
+                    static_cast<unsigned long long>(r.tiled_size),
+                    static_cast<unsigned long long>(r.linear_address),
+                    static_cast<unsigned long long>(r.linear_size),
+                    static_cast<unsigned long long>(r.covered),
+                    static_cast<unsigned long long>(r.guest_size), verdict);
+        ++printed;
+    }
+}
+
 void TileManager::RecordTilingDispatch(vk::Pipeline pipeline, const vk::DescriptorBufferInfo& tiled,
                                        const vk::DescriptorBufferInfo& linear,
                                        const vk::DescriptorBufferInfo& params, u32 dim_x) {
+    // The tiling shader binds its own pipeline: the echo must forget what it knew.
+    scheduler.ClearEcho();
     scheduler.Record([pipeline, layout = *pl_layout, tiled, linear, params,
                       dim_x](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
@@ -233,7 +313,9 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     TilingInfo params{};
     params.bank_swizzle = info.bank_swizzle;
     params.num_slices = info.props.is_volume ? info.size.depth : info.resources.layers;
-    params.num_mips = info.resources.levels;
+    // bbport: the mip array of the shader's parameter block is 16 entries; an image with more
+    // levels wrote past it (the stack of this function) and the shader read whatever followed.
+    params.num_mips = std::min<u32>(info.resources.levels, static_cast<u32>(params.mips.size()));
     for (u32 mip = 0; mip < params.num_mips; ++mip) {
         auto& mip_info = params.mips[mip];
         mip_info = info.mips_layout[mip];
@@ -243,13 +325,56 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         }
     }
 
+    // bbport: the texels the filled mips hold, not the image's guest size (see CoveredBytes).
+    const u64 covered = CoveredBytes(params);
+    if (covered != info.guest_size) {
+        ReportTilingMismatch("detile", info, params, covered);
+    }
+    if (covered == 0 || info.num_bits == 0) {
+        return {in_buffer, in_offset};
+    }
+    // bbport: the tiled side is bound for the image's guest size, but the buffer behind it can
+    // hold less than that after the offset (an image at the end of an arena chunk, a staging
+    // block): the descriptor range is cut to what is there and the shader drops the texels the
+    // surface maths puts past it (tiling.comp). A read or a write past the buffer is a lost
+    // device, and neither descriptor used to be checked.
+    if (in_offset >= in_buffer->SizeBytes()) {
+        return {in_buffer, in_offset};
+    }
+    const u64 tiled_bytes = std::min<u64>(info.guest_size, in_buffer->SizeBytes() - in_offset);
+    params.tiled_bytes = static_cast<u32>(std::min<u64>(tiled_bytes, ~u32{0}));
+
+    // bbport: the linear side is this dispatch's own scratch and the shader writes all the
+    // covered texels into it, so the dispatch is sized from what the pool granted and not from
+    // what was asked for. A texel the linear side has no room for is not dispatched (the shader
+    // drops it as well: the descriptor is the bound now, see tiling.comp).
+    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
+    if (staging.size < info.guest_size) {
+        return {in_buffer, in_offset};
+    }
+    if (covered > staging.size) {
+        static std::atomic<u32> printed{0};
+        if (printed.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::printf("Tiling: detile of a %ux%u image: the covered 0x%llx bytes do not fit the "
+                        "0x%llx-byte scratch it was given; dispatching what fits\n",
+                        info.size.width, info.size.height,
+                        static_cast<unsigned long long>(covered),
+                        static_cast<unsigned long long>(staging.size));
+        }
+    }
+    const u64 linear_bytes = std::min<u64>(covered, staging.size);
+    // bbport: every texel of the filled mips, and no texel past the last one (the shader stops
+    // at num_texels), so the dispatch cannot address outside the buffers it was given.
+    const u32 texels = static_cast<u32>(std::min<u64>(
+        linear_bytes / (info.num_bits / 8), std::numeric_limits<u32>::max()));
+    const u32 dim_x = (texels + 63) / 64;
+    params.num_texels = texels;
+
     const vk::DescriptorBufferInfo params_buffer_info{
         .buffer = stream_buffer.Handle(),
         .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
         .range = sizeof(params),
     };
-
-    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
 
     scheduler.EndRendering();
     runtime.FlushBarriers();
@@ -257,14 +382,24 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = in_buffer->Handle(),
         .offset = in_offset,
-        .range = info.guest_size,
+        .range = tiled_bytes,
     };
     const vk::DescriptorBufferInfo linear_buffer_info{
         .buffer = staging.buffer->Handle(),
         .offset = staging.offset,
-        .range = info.guest_size,
+        .range = staging.size,
     };
-    const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
+    NoteDispatch({.tiled_address = in_buffer->BufferDeviceAddress() + in_offset,
+                  .tiled_size = in_buffer->SizeBytes() - in_offset,
+                  .linear_address = staging.buffer->BufferDeviceAddress() + staging.offset,
+                  .linear_size = staging.size,
+                  .covered = covered,
+                  .guest_size = info.guest_size,
+                  .dim_x = dim_x,
+                  .texels = texels,
+                  .num_mips = params.num_mips,
+                  .num_bits = info.num_bits,
+                  .tiler = false});
     // bbport: recorded with copies of the descriptor infos (threaded recording).
     RecordTilingDispatch(GetTilingPipeline(info, false), tiled_buffer_info, linear_buffer_info,
                          params_buffer_info, dim_x);
@@ -290,7 +425,13 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     TilingInfo params{};
     params.bank_swizzle = info.bank_swizzle;
     params.num_slices = info.props.is_volume ? info.size.depth : info.resources.layers;
-    params.num_mips = static_cast<u32>(buffer_copies.size());
+    // bbport: 16 mips is what the shader's parameter block holds, and the image describes
+    // `resources.levels` of them: a caller that hands more copies than levels used to have the
+    // entries past the image's own read from mips_layout uninitialized, and their garbage pitch,
+    // height and offset (and their sizes, which the dispatch is sized from) reached the shader.
+    params.num_mips = std::min<u32>(
+        std::min<u32>(static_cast<u32>(buffer_copies.size()), info.resources.levels),
+        static_cast<u32>(params.mips.size()));
     for (u32 mip = 0; mip < params.num_mips; ++mip) {
         auto& mip_info = params.mips[mip];
         mip_info = info.mips_layout[mip];
@@ -300,36 +441,93 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         }
     }
 
+    // bbport: the texels the filled mips hold, not the image's guest size (see CoveredBytes).
+    const u64 covered = CoveredBytes(params);
+    if (covered != info.guest_size) {
+        ReportTilingMismatch("tile", info, params, covered);
+    }
+    if (covered == 0 || info.num_bits == 0) {
+        return;
+    }
+    // bbport: see DetileImage: the tiler writes the tiled side, so that range is cut to the
+    // buffer and the shader drops the texels it would put past it.
+    if (out_offset >= out_buffer->SizeBytes()) {
+        return;
+    }
+    const u64 tiled_bytes = std::min<u64>(info.guest_size, out_buffer->SizeBytes() - out_offset);
+    params.tiled_bytes = static_cast<u32>(std::min<u64>(tiled_bytes, ~u32{0}));
+
+    // bbport: the download below fills this dispatch's linear side and the shader reads all the
+    // covered texels from it, so the scratch is sized from the copies as well as from the covered
+    // texels. A copy's geometry is as wide as the image's *pitch* (the caller bounds the row by
+    // max(pitch, width)), which is more than the mip's own size for the levels it rounds up; the
+    // reservation used to be the guest size alone, so the widest copies wrote past it - into the
+    // next reservation of the block, or past the block when it ended near it (a write a few MiB
+    // past a 16 MiB device-local block, which is what the crash reports showed).
+    u64 needed = info.guest_size;
+    for (const auto& copy : buffer_copies) {
+        needed = std::max<u64>(needed, copy.bufferOffset + Vulkan::Runtime::BufferImageCopyBytes(
+                                                                 copy, info.pixel_format));
+    }
+    const auto staging = runtime.GetStagingPool().Request(needed, MemoryType::DeviceLocal);
+    if (staging.size < needed) {
+        return;
+    }
+    if (covered > staging.size) {
+        static std::atomic<u32> printed{0};
+        if (printed.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::printf("Tiling: tile of a %ux%u image: the covered 0x%llx bytes do not fit the "
+                        "0x%llx-byte scratch it was given; tiling what fits\n",
+                        info.size.width, info.size.height,
+                        static_cast<unsigned long long>(covered),
+                        static_cast<unsigned long long>(staging.size));
+        }
+    }
+    const u64 linear_bytes = std::min<u64>(covered, staging.size);
+    // bbport: every texel of the filled mips, and no texel past the last one (see DetileImage).
+    const u32 texels = static_cast<u32>(
+        std::min<u64>(linear_bytes / (info.num_bits / 8), std::numeric_limits<u32>::max()));
+    const u32 dim_x = (texels + 63) / 64;
+    params.num_texels = texels;
+
     const vk::DescriptorBufferInfo params_buffer_info{
         .buffer = stream_buffer.Handle(),
         .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
         .range = sizeof(params),
     };
-
-    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
     for (auto& copy : buffer_copies) {
         copy.bufferOffset += staging.offset;
     }
 
-    runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);
+    runtime.DownloadImage(&in_image, staging.buffer, buffer_copies, staging.offset, staging.size);
     runtime.FlushBarriers();
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = out_buffer->Handle(),
         .offset = out_offset,
-        .range = info.guest_size,
+        .range = tiled_bytes,
     };
     const vk::DescriptorBufferInfo linear_buffer_info{
         .buffer = staging.buffer->Handle(),
         .offset = staging.offset,
-        .range = info.guest_size,
+        .range = staging.size,
     };
-    const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
+    NoteDispatch({.tiled_address = out_buffer->BufferDeviceAddress() + out_offset,
+                  .tiled_size = out_buffer->SizeBytes() - out_offset,
+                  .linear_address = staging.buffer->BufferDeviceAddress() + staging.offset,
+                  .linear_size = staging.size,
+                  .covered = covered,
+                  .guest_size = info.guest_size,
+                  .dim_x = dim_x,
+                  .texels = texels,
+                  .num_mips = params.num_mips,
+                  .num_bits = info.num_bits,
+                  .tiler = true});
     // bbport: recorded with copies of the descriptor infos (threaded recording).
     RecordTilingDispatch(GetTilingPipeline(info, true), tiled_buffer_info, linear_buffer_info,
                          params_buffer_info, dim_x);
 
-    runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
+    runtime.AccessBuffer(out_buffer, out_offset, tiled_bytes,
                          vk::PipelineStageFlagBits2::eComputeShader,
                          vk::AccessFlagBits2::eShaderWrite);
 }

@@ -26,7 +26,7 @@ git submodule update --init --recursive
 bash build.sh                      # out/bb-probe.exe, out/bb-gpu-capabilities.exe
 BB_GAME_DIR=F:/path/to/CUSA03173 python run.py
 python launcher/bbport_launcher_win.py
-bash packaging/windows/package.sh  # dist/bbport-windows/ and .zip: Bloodborne.exe + DLLs
+bash packaging/windows/package.sh  # dist/uncharted-windows/ and .zip: Uncharted.exe + DLLs
 ```
 
 `run.py` is the Windows `run.sh` (same variables; works from a plain Windows Python too).
@@ -40,6 +40,42 @@ game directly with the saved settings.
 `run.py` then runs other versions at 30 FPS with live resolution changes.
 From a source tree it adds `C:\msys64\clang64\bin` (or `$MSYS2_ROOT`) to `PATH` for the DLLs.
 `bash tools/fetch_fsr4_assets.sh` works in the CLANG64 shell as on Linux.
+
+## Release
+
+Two files leave the build: `dist/uncharted-windows.zip` (the package players unpack anywhere and
+start with `Uncharted.exe`) and `dist/uncharted-windows.zip.sha256`. The bare executables
+(`bb-probe.exe`, `bb-gpu-capabilities.exe`, `bb-play.exe`) are *not* a package: they are what
+`bash build.sh` leaves in `out/`, and `run.py` runs them from there when you play from a source
+tree (`bin/bb-probe.exe` inside an unpacked zip). A copy of them from a CI run belongs in `out/`
+of the checkout they were built from, and still needs the MSYS2 CLANG64 DLLs on `PATH`
+(`run.py` adds `C:\msys64\clang64\bin` itself); the zip carries its DLLs in `bin/`.
+
+Full release from GitHub Actions (recommended: the artifact is the package, not a build output):
+
+1. Make sure `VERSION` in `launcher/uncharted_launcher.py` is the version to release.
+2. Actions → **Release** → *Run workflow*: `tag` = `v<VERSION>` (an existing tag is rebuilt
+   exactly; a new one is created at the commit you dispatch from), optionally `draft`,
+   `prerelease`, `xess`, `fsr4` and `notes`.
+3. The job builds with the same action CI uses, packages, uploads
+   `uncharted-windows.zip` + `.sha256` to the release and keeps them as a workflow artifact for
+   30 days.
+
+Pushing a `v*` tag (`git tag v0.3.9 && git push origin v0.3.9`) runs the same workflow with its
+defaults (XeSS shipped, FSR 4 assets not, published, not a draft).
+
+Full release from a local tree (MSYS2 CLANG64, same result by hand):
+
+```bash
+bash build.sh                       # out/bb-probe.exe, out/bb-gpu-capabilities.exe, out/bb-play.exe
+bash packaging/windows/package.sh   # dist/uncharted-windows.zip + dist/uncharted-windows.zip.sha256
+gh release create v0.3.9 dist/uncharted-windows.zip dist/uncharted-windows.zip.sha256 \
+    --title v0.3.9 --notes-file notes.md    # --draft to check it first
+```
+
+The zip holds `Uncharted.exe` (the frozen launcher), `Play Uncharted.exe`, `bb-probe.exe` with the
+CLANG64 DLLs it loads, `run.py`, the preparation scripts, the licenses, and — when they were
+fetched into `out/` — Intel's XeSS DLL and NVIDIA's DLSS bridge.
 
 DLSS (optional): `DLSS_SDK_ROOT=<checkout of github.com/NVIDIA/DLSS> bash
 packaging/windows/build_dlss.sh` builds `bbport_dlss.dll` (`gpu/dlss_bridge`, the only code that
@@ -78,5 +114,12 @@ and the presented image of the next frame to `BB_DUMP_DIR` (raw 32-bit pixels), 
 works for menus and movies.
 
 Not ported: the watchdog/`--timeout` thread dumps (Linux signals), userfaultfd tracking
-(`BB_UFFD`), MangoHud, PGO (GCC flags), the GTK launcher (`launcher/bbport_launcher_win.py`, Tkinter, replaces it), and
-the `tests/` programs (several use Linux-only APIs).
+(`BB_UFFD`), MangoHud, the GTK launcher (`launcher/bbport_launcher_win.py`, Tkinter, replaces it),
+and the `tests/` programs that use Linux-only APIs. `tools/ci/linux-tests.sh` builds and runs
+the host-side ones (guest instruction rewriting, the HLE file/content/display code, the bit
+array, the streaming copy) without a GPU; CI runs it on every push.
+
+The build options (`BB_ARCH`, `BB_LTO`, `BB_PGO`, ...) and the optimizations behind them are in
+`docs/PERFORMANCE.md`. PGO works on Windows too: `bash tools/pgo.sh generate`, play,
+`bash tools/pgo.sh merge`, then `bash build.sh` (clang writes `pgo/bbport.profdata`). CI builds
+every push and the release workflow makes the zip: `.github/workflows/`.

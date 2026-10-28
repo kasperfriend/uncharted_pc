@@ -23,6 +23,7 @@
 #include <x86intrin.h>
 
 #include "common/assert.h"
+#include "common/spin_wait.h"
 #include "common/thread.h"
 #include "common/types.h"
 
@@ -110,13 +111,11 @@ public:
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
         const u64 start = __rdtsc();
-        for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
-            if (spins < 4096) {
-                __builtin_ia32_pause();
-            } else {
-                std::this_thread::yield();
-            }
-        }
+        // The wait governor: this site's own drains decide how long to spin (a packet is a few
+        // microseconds), and a drain that outlives them yields once per budget instead of once
+        // per 4096 pauses -- on the GPU thread every yield is a reschedule.
+        drain_governor.Wait([this] { return consumed.load(std::memory_order_acquire) == head; },
+                            [] { std::this_thread::yield(); });
         const u64 waited = __rdtsc() - start;
         drain_cycles += waited;
         cycles_by_reason[slot] += waited;
@@ -150,10 +149,24 @@ private:
         return (size + 63) & ~63u;
     }
 
-    void WaitForSpace(u64 at, u64 size) {
-        while (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
-            __builtin_ia32_pause();
+    /// Stage B: off the core until the next packet (or the stop request) arrives.
+    void ParkOnWake(std::stop_token stop, u64 at) {
+        const u32 seen = wake.load(std::memory_order_seq_cst);
+        sleeping.store(true, std::memory_order_seq_cst);
+        if (published.load(std::memory_order_seq_cst) == at && !stop.stop_requested()) {
+            wake.wait(seen, std::memory_order_seq_cst);
         }
+        sleeping.store(false, std::memory_order_relaxed);
+    }
+
+    void WaitForSpace(u64 at, u64 size) {
+        // Stage B is running packets while this waits; it is a spin until the ring has space
+        // again, and a yield per learned budget if it has not.
+        space_governor.Wait(
+            [this, at, size] {
+                return at + size - consumed.load(std::memory_order_acquire) <= Capacity;
+            },
+            [] { std::this_thread::yield(); });
     }
 
     void Run(std::stop_token stop) {
@@ -166,29 +179,31 @@ private:
             // and sleep only after a longer pause (between frames).
             u64 available = published.load(std::memory_order_acquire);
             if (available == at) {
-                // With few hardware threads (Steam Deck: 8) a long spin takes time from the
-                // game's own threads. BB_PIPE_SPIN_US overrides.
-                static const auto spin_time = std::chrono::microseconds([] {
-                    if (const char* env = std::getenv("BB_PIPE_SPIN_US")) {
-                        return std::max(0, std::atoi(env));
-                    }
-                    return BbThreads::Available() >= 12 ? 200 : 50;
-                }());
-                const auto spin_until = std::chrono::steady_clock::now() + spin_time;
-                for (u32 spins = 1; available == at; ++spins) {
-                    if (stop.stop_requested()) {
-                        return;
-                    }
-                    __builtin_ia32_pause();
-                    if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
-                        const u32 seen = wake.load(std::memory_order_seq_cst);
-                        sleeping.store(true, std::memory_order_seq_cst);
-                        if (published.load(std::memory_order_seq_cst) == at &&
-                            !stop.stop_requested()) {
-                            wake.wait(seen, std::memory_order_seq_cst);
+                // The idle wait: this site learns how far apart its packets are (microseconds
+                // while a frame is recorded, milliseconds between frames) and parks on `wake`
+                // once spinning has stopped paying -- the idle spin used to run to a fixed
+                // deadline between every frame, taking that much of a core from the game's own
+                // threads. With few hardware threads (Steam Deck: 8) a long spin also takes
+                // time from them. BB_PIPE_SPIN_US pins a fixed deadline instead (A/B).
+                if (spin_time.count() > 0) {
+                    const auto spin_until = std::chrono::steady_clock::now() + spin_time;
+                    for (u32 spins = 1; available == at; ++spins) {
+                        if (stop.stop_requested()) {
+                            return;
                         }
-                        sleeping.store(false, std::memory_order_relaxed);
+                        Common::CpuRelax();
+                        if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
+                            ParkOnWake(stop, at);
+                        }
+                        available = published.load(std::memory_order_acquire);
                     }
+                } else {
+                    idle_governor.Wait(
+                        [&] {
+                            return published.load(std::memory_order_acquire) != at ||
+                                   stop.stop_requested();
+                        },
+                        [&] { ParkOnWake(stop, at); });
                     available = published.load(std::memory_order_acquire);
                 }
             }
@@ -212,6 +227,17 @@ private:
     std::unique_ptr<u8[]> ring;
     u64 head = 0; ///< stage A's write position
     u32 pending_size = 0;
+    /// BB_PIPE_SPIN_US: a fixed idle spin instead of the governed one (0: governed).
+    static inline const std::chrono::microseconds spin_time = [] {
+        if (const char* env = std::getenv("BB_PIPE_SPIN_US")) {
+            return std::chrono::microseconds(std::max(0, std::atoi(env)));
+        }
+        return std::chrono::microseconds(0);
+    }();
+    // Waits of stage A (drains, ring space) and of stage B (its own idle wait).
+    Common::Gov::SpinGovernor drain_governor{16'000};
+    Common::Gov::SpinGovernor space_governor{16'000};
+    Common::Gov::SpinGovernor idle_governor{64'000};
     alignas(64) std::atomic<u64> published{0};
     alignas(64) std::atomic<u64> consumed{0};
     alignas(64) std::atomic<u32> wake{0};

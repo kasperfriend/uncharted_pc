@@ -160,7 +160,7 @@ public:
         if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
             return;
         }
-        RegionBits add(~(gpu | writeable), start_page, end_page);
+        RegionBits add(WriteFaultWindowMask(gpu, writeable), start_page, end_page);
         if (add.None()) {
             return;
         }
@@ -247,7 +247,9 @@ private:
     template <bool track, bool is_read>
     void UpdateProtection() {
         RENDERER_TRACE;
-        RegionBits mask = is_read ? (~gpu ^ readable) : (cpu ^ writeable);
+        // bbport: the read mask in one pass over the words instead of a temporary ~gpu copy and
+        // an XOR; the write mask is a plain XOR (see ProtectionChangeMask for why the two differ).
+        RegionBits mask = ProtectionChangeMask(is_read, gpu, readable, cpu, writeable);
         if (mask.None()) {
             return;
         }
@@ -284,7 +286,7 @@ private:
             if (writeable.Get(page)) {
                 continue; // not protected: no fault
             }
-            BbStats::tracker_faults.fetch_add(1, std::memory_order_relaxed);
+            BbStats::Count(BbStats::tracker_faults);
             if (!hot_enabled) {
                 continue;
             }
@@ -298,7 +300,7 @@ private:
                 }
                 hot.Set(page);
                 ++num_hot;
-                BbStats::hot_pages.fetch_add(1, std::memory_order_relaxed);
+                BbStats::Count(BbStats::hot_pages);
             }
         }
     }
@@ -310,7 +312,7 @@ private:
         if (!HotPagesEnabled() ||
             std::chrono::steady_clock::now() - hot_since > HotPeriod) {
             // Re-protect them (on this upload) and start counting again.
-            BbStats::hot_pages.fetch_sub(num_hot, std::memory_order_relaxed);
+            BbStats::Uncount(BbStats::hot_pages, num_hot);
             hot.Clear();
             write_faults.fill(0);
             num_hot = 0;

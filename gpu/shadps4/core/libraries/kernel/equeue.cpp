@@ -302,38 +302,52 @@ bool EqueueInternal::AddSmallTimer(EqueueEvent& ev) {
         std::scoped_lock lock{m_mutex};
         m_small_timers[st.event.ident] = std::move(st);
     }
+    // A thread waiting for the timers may be asleep until the earliest of them: it has to
+    // learn about the new one.
+    m_timer_cond.notify_all();
     return true;
 }
 
 int EqueueInternal::WaitForSmallTimer(OrbisKernelEvent* ev, int num, u32 micros) {
     ASSERT(num >= 1);
 
-    auto curr_clock = std::chrono::steady_clock::now();
-    const auto wait_end_us = (micros == 0) ? std::chrono::steady_clock::time_point::max()
-                                           : curr_clock + std::chrono::microseconds{micros};
-    int count = 0;
-    do {
-        curr_clock = std::chrono::steady_clock::now();
-        {
-            std::scoped_lock lock{m_mutex};
-            for (auto it = m_small_timers.begin(); it != m_small_timers.end() && count < num;) {
-                const SmallTimer& st = it->second;
-
-                if (curr_clock - st.added >= st.interval) {
-                    ev[count++] = st.event;
-                    it = m_small_timers.erase(it);
-                } else {
-                    ++it;
-                }
+    const auto deadline = micros == 0 ? std::chrono::steady_clock::time_point::max()
+                                      : std::chrono::steady_clock::now() +
+                                            std::chrono::microseconds{micros};
+    std::unique_lock lock{m_mutex};
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        int count = 0;
+        auto next = deadline;
+        for (auto it = m_small_timers.begin(); it != m_small_timers.end();) {
+            const SmallTimer& st = it->second;
+            if (count < num && now - st.added >= st.interval) {
+                ev[count++] = st.event;
+                it = m_small_timers.erase(it);
+                continue;
             }
-
-            if (count > 0)
-                return count;
+            // The earliest timer still to expire: the thread sleeps until exactly that one,
+            // and the wait_until below returns as soon as it is due.
+            next = std::min(next, st.added + st.interval);
+            ++it;
         }
-        std::this_thread::yield();
-    } while (curr_clock < wait_end_us);
-
-    return 0;
+        if (count > 0) {
+            return count;
+        }
+        if (now >= deadline) {
+            return 0;
+        }
+        if (next == std::chrono::steady_clock::time_point::max()) {
+            // Nothing left to wait for (another thread took the last timer): the caller gets
+            // its empty answer instead of a sleep no notify will ever end.
+            return 0;
+        }
+        // Off the core until a timer is due, one is added or removed (both notify) or the
+        // caller's timeout runs out. The loop this replaces read the clock, took the mutex and
+        // asked the scheduler for another thread on every iteration of the whole timeout: a
+        // guest thread waiting on a timer held a core for as long as it waited.
+        m_timer_cond.wait_until(lock, next);
+    }
 }
 
 bool EqueueInternal::EventExists(u64 id, s16 filter) {

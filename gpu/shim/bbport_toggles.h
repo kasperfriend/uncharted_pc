@@ -70,8 +70,18 @@ enum : std::uint64_t {
     // when nothing moves. Static-camera flicker of railings/window bars p99.9 -45% (2026-10-03).
     TaaKeepNearerHistory = 1ull << 55,
     SceneMipBias = 1ull << 57, ///< negative LOD bias of G-buffer samplers at reduced scene sizes
+    /// Emit setVertexInputEXT only when a draw's vertex formats differ from the live state.
+    VertexInputMemo = 1ull << 58,
     /// One upscaler frame start per frame (Uncharted draws twice into its display buffer).
     OneFrameStart = 1ull << 59,
+    /// Compare-and-skip stamping of the page-use table for long buffer binds (NoteGpuUse).
+    GpuUseStamp = 1ull << 60,
+    /// Drop a recorded command that only restates state the command buffer already has live
+    /// (pipeline, push constants, vertex and index buffers). Scheduler::Echo*.
+    BindingEcho = 1ull << 61,
+    /// Keep the descriptor writes of a draw in a buffer of slots that is never resized, instead
+    /// of one that is cleared and resized (value-initialized) every draw.
+    DescriptorSlots = 1ull << 62,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {
@@ -129,13 +139,24 @@ inline std::atomic<std::uint64_t> reduced_draws{0}, scene_draws{0};
 /// for host copies before a submission or fence, and for GPU ticks.
 inline std::atomic<std::uint64_t> sync_recording_ns{0}, host_copies_wait_ns{0}, tick_wait_ns{0},
     copy_threads_wait_ns{0}, host_copy_waits{0};
+/// Times a wait: the sites that use it are per-packet (a fence, a release, a draw's host copies),
+/// so with BB_FRAME_STATS off it must cost nothing at all -- no clock read, no locked add.
 struct WaitTimer {
-    std::atomic<std::uint64_t>& total;
-    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::atomic<std::uint64_t>* total = nullptr;
+    std::chrono::steady_clock::time_point start{};
+    explicit WaitTimer(std::atomic<std::uint64_t>& total_) {
+        if (enabled) {
+            total = &total_;
+            start = std::chrono::steady_clock::now();
+        }
+    }
     ~WaitTimer() {
-        total.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - start).count(),
-                        std::memory_order_relaxed);
+        if (total) {
+            total->fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count(),
+                             std::memory_order_relaxed);
+        }
     }
 };
 /// GPU thread rusage, refreshed after each graphics submission.
@@ -146,4 +167,26 @@ inline std::atomic<std::uint64_t> gpu_signal_faults{0};
 /// Protection changes: calls and pages, those removing write access (TLB shootdowns) apart.
 inline std::atomic<std::uint64_t> protect_calls{0}, protect_pages{0}, protect_revoke_calls{0},
     protect_revoke_pages{0};
+/// Commands the recording stream dropped because the command buffer already had that state live
+/// (bbport: the binding echo, see Scheduler::EchoPipeline and friends).
+inline std::atomic<std::uint64_t> echoed_pipelines{0}, echoed_pushes{0}, echoed_vertex_binds{0},
+    echoed_index_binds{0};
+
+/// Counts a diagnostic event. With BB_FRAME_STATS off this is a branch on a constant false: no
+/// counter, no cache line, and none of the locked read-modify-writes the counters are.
+template <typename T, typename U = T>
+inline void Count(std::atomic<T>& counter, U by = U{1}) {
+    if (enabled) {
+        counter.fetch_add(static_cast<T>(by), std::memory_order_relaxed);
+    }
+}
+
+/// The reverse of Count(): a counter that is counted up in one place and down in another (the
+/// hot pages one is) must be gated on both sides, or it drifts below zero with the stats off.
+template <typename T, typename U = T>
+inline void Uncount(std::atomic<T>& counter, U by = U{1}) {
+    if (enabled) {
+        counter.fetch_sub(static_cast<T>(by), std::memory_order_relaxed);
+    }
+}
 } // namespace BbStats

@@ -91,14 +91,17 @@ void TextureCache::ProcessDownloadImages() {
 // fence), so the CPU read a stale value: the focus sat at ~2 m and everything behind Drake was
 // blurred while aiming. Images of at most 4x4 pixels (1x1 of any tiling, else linear) the GPU
 // writes are now copied back after each use without waiting. BB_TINY_READBACK=0: off.
+// bbport: read once, not through a function-local static: this is asked for every image a draw
+// binds (the guard variable was a load and a branch per ask).
+const bool TinyReadbackEnabled = [] {
+    // On for Uncharted 2 (run.py): its aim blur; elsewhere it costs ~13% (U3 square).
+    const char* env = std::getenv("BB_TINY_READBACK");
+    return env && env[0] == '1';
+}();
+
 bool TextureCache::TinyReadback(const Image& image) {
-    static const bool enabled = [] {
-        // On for Uncharted 2 (run.py): its aim blur; elsewhere it costs ~13% (U3 square).
-        const char* env = std::getenv("BB_TINY_READBACK");
-        return env && env[0] == '1';
-    }();
     const auto& size = image.info.size;
-    return enabled && image.info.guest_address != 0 && size.depth == 1 &&
+    return TinyReadbackEnabled && image.info.guest_address != 0 && size.depth == 1 &&
            size.width * size.height <= 16 &&
            (!image.info.props.is_tiled || (size.width == 1 && size.height == 1));
 }
@@ -545,7 +548,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // An exact match stays valid while that image is registered with the same description;
     // resolved overlaps (views into other images) only until any image registration changes.
     const auto still_exact = [&] {
-        if (cached.view_mip >= 0 || cached.view_slice >= 0 || !cached.image_id) {
+        if (cached.view_mip >= 0 || cached.view_slice >= 0 || !cached.image_id ||
+            !slot_images.is_allocated(cached.image_id)) {
             return false;
         }
         const Image& image = slot_images[cached.image_id];
@@ -926,7 +930,7 @@ void TextureCache::RefreshImage(Image& image) {
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
-    BbStats::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    BbStats::Count(BbStats::image_upload_bytes, image.info.guest_size);
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
     for (u32 m = 0; m < num_mips; m++) {
         const u32 width = std::max(image.info.size.width >> m, 1u);
@@ -1000,12 +1004,13 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
 }
 
 void TextureCache::RegisterImage(ImageId image_id) {
-    BbStats::images_registered.fetch_add(1, std::memory_order_relaxed);
+    BbStats::Count(BbStats::images_registered);
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     ++registry_generation;
+    ++registration_generation;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     registered_image_bytes += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
@@ -1305,6 +1310,7 @@ void TextureCache::GarbageCollectSamplers() {
         return;
     }
     std::scoped_lock lock{samplers_mutex};
+    const size_t samplers_before = samplers.size();
     bool pressured = false;
     bool aggresive = false;
     u64 ticks_to_destroy = 0;
@@ -1336,6 +1342,10 @@ void TextureCache::GarbageCollectSamplers() {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
         sampler_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    }
+    if (samplers.size() != samplers_before) {
+        // Destroyed handles: a memo that holds one must not hand it out again.
+        sampler_epoch.fetch_add(1, std::memory_order_relaxed);
     }
 }
 

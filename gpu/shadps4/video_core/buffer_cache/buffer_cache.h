@@ -158,6 +158,9 @@ public:
     /// crash report).
     void DumpArenas() const;
 
+    /// bbport: the guest pages of a pass over the fault buffer (FaultManager).
+    void NoteFaultedPages(const u64* pages, u32 count);
+
 private:
     struct ArenaBinds {
         const Buffer* arena;
@@ -270,6 +273,36 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    /// bbport: identifies this cache in the per-thread residency hint of EnsureResident.
+    u64 residency_hint_id{NextResidencyHintId()};
+
+    /// bbport: the last residency decisions (guest range -> device address, memory and its
+    /// offset), so a device-lost report can say what the page table was given for a page.
+    struct ResidencyEvent {
+        u64 guest_start;
+        u64 guest_end;
+        u64 device_address;
+        u64 memory;
+        u64 memory_offset;
+    };
+    static constexpr u32 ResidencyEventCount = 256;
+    std::array<ResidencyEvent, ResidencyEventCount> residency_events{};
+    std::atomic<u64> residency_event_seq{0};
+    /// bbport: ranges that were clamped to their arena (see EnsureResident; non-zero is a bug in
+    /// the caller's request and is printed with the crash report).
+    std::atomic<u64> clipped_ranges{0};
+    /// bbport: the guest pages shaders reached through BDA before they were resident (the port's
+    /// own page faults, newest last), so a crash report shows what streamed in before it.
+    static constexpr u32 FaultPageCount = 64;
+    std::array<u64, FaultPageCount> faulted_pages{};
+    std::atomic<u64> faulted_page_seq{0};
+    /// bbport: places a faulting address in the address space of the arenas, the residency
+    /// events and the resident ranges (device lost).
+    void DumpAddressVerdict(u64 address) const;
+    static u64 NextResidencyHintId() {
+        static std::atomic<u64> next{1};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
 
     /// bbport: arena memory chunks (see AllocateArenaMemory).
     struct ArenaChunk {

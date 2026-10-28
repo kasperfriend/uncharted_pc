@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -17,6 +18,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
+#include "video_core/amdgpu/dynamic_state_blocks.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -177,6 +179,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+    // bbport: the binding echo counts what it drops only for BB_FRAME_STATS.
+    if (BbStats::enabled) {
+        scheduler.EnableEchoStats();
+    }
     // Before the rasterizer is bound: Liverpool enqueues buffers only once it sees it.
     draw_prep = std::make_unique<DrawPreparation>(pipeline_cache);
     scene_targets = std::make_unique<SceneTargets>(instance, scheduler, runtime, texture_cache);
@@ -306,53 +312,48 @@ template <typename... Parts>
 VideoCore::ImageId Rasterizer::FindTargetMemoized(VideoCore::TextureCache::ImageDesc& desc,
                                                   LastTarget& last, auto&& make_desc,
                                                   const Parts&... parts) {
-    static_assert((sizeof(Parts) + ...) <= 256, "target memo key too large");
-    std::array<u8, 256> key{};
-    u32 key_size = 0;
-    const auto append = [&](const auto& part) {
-        std::memcpy(key.data() + key_size, &part, sizeof(part));
-        key_size += sizeof(part);
-    };
-    (append(parts), ...);
-    const u64 generation = texture_cache.RegistryGeneration();
+    // The key is exactly the bytes of the call's parts: neither a zero fill of a maximum-size
+    // buffer nor a hash over bytes that were never written.
+    static_assert((sizeof(Parts) + ...) <= TargetKeyBytes, "target memo key too large");
+    TargetKey key;
+    key.Set(parts...);
+
     const bool memo_enabled = !BbToggle::Disabled(BbToggle::TextureBindingMemo);
-    if (memo_enabled && last.generation == generation && last.key_size == key_size &&
-        std::memcmp(last.key.data(), key.data(), key_size) == 0) {
+    // The same image still in its slot (its uid), and the same target registers: this is the
+    // draw after the previous one, which mostly draws into the same place.
+    if (memo_enabled && last.image_uid != 0 &&
+        texture_cache.ImageUid(last.image_id) == last.image_uid && last.key.Equals(key)) {
         texture_cache.MarkFound(last.image_id);
+        ++target_memo_hits;
         return last.image_id;
     }
     const auto remember = [&](VideoCore::ImageId image_id) {
         last.key = key;
-        last.key_size = key_size;
-        last.generation = generation;
         last.image_id = image_id;
+        last.image_uid = texture_cache.ImageUid(image_id);
     };
-    u64 hash = 0xCBF29CE484222325ull;
-    for (u32 i = 0; i < key_size; i += 8) {
-        u64 word;
-        std::memcpy(&word, key.data() + i, 8);
-        hash = (hash ^ word) * 0x100000001B3ull;
-        hash ^= hash >> 29;
-    }
+    const u64 hash = XXH3_64bits(key.bytes, key.size);
     auto& memo = target_memo[hash % target_memo.size()];
-    if (memo.generation == generation && memo.key_size == key_size &&
-        std::memcmp(memo.key.data(), key.data(), key_size) == 0 && memo_enabled) {
+    if (memo_enabled && memo.image_uid != 0 &&
+        texture_cache.ImageUid(memo.image_id) == memo.image_uid && memo.key.Equals(key)) {
         desc = memo.desc;
         texture_cache.MarkFound(memo.image_id);
         remember(memo.image_id);
+        ++target_memo_hits;
         return memo.image_id;
     }
+    ++target_memo_misses;
     make_desc();
     const VideoCore::ImageId image_id = texture_cache.FindImage(desc);
-    if (generation == texture_cache.RegistryGeneration()) {
+    const u64 image_uid = texture_cache.ImageUid(image_id);
+    if (image_uid != 0) {
         memo.key = key;
-        memo.key_size = key_size;
-        memo.generation = generation;
         memo.image_id = image_id;
+        memo.image_uid = image_uid;
         memo.desc = desc;
         remember(image_id);
     } else {
-        last.generation = ~0ULL;
+        last.image_uid = 0;
     }
     return image_id;
 }
@@ -497,10 +498,16 @@ void Rasterizer::EliminateFastClear() {
     auto& image = texture_cache.GetImage(image_id);
     const auto clear_value = LiverpoolToVK::ColorBufferClearValue(col_buf);
 
-    ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
-                                 col_buf.CmaskAddress()));
+    // bbport: the drain the marker used to do, now explicit (and done once instead of twice).
+    DrainDrawPipe();
+    if (host_markers_enabled) {
+        ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
+                                     col_buf.CmaskAddress()));
+    }
     runtime.ClearImage(&image, desc.view_info.range, clear_value);
-    ScopeMarkerEnd();
+    if (host_markers_enabled) {
+        ScopeMarkerEnd();
+    }
 }
 
 // bbport: two-stage draw pipeline (vk_draw_pipe.h). Packet layout, 8-byte aligned parts:
@@ -520,6 +527,9 @@ struct DrawPacket {
     u32 index_offset;
     u8 is_indexed;
     u8 regs_reset;
+    /// The register copy was replaced wholesale (the pipe resynced): every register may differ,
+    /// even though no block is listed.
+    u8 regs_wholesale;
     u16 num_blocks;
     u32 num_stages;
     u32 verify;
@@ -538,13 +548,12 @@ struct PacketStage {
 constexpr u32 AlignPacket(u32 size) {
     return (size + 7) & ~7u;
 }
-u32 VerifyInterval() {
-    static const u32 interval = [] {
-        const char* env = std::getenv("BB_PIPE_VERIFY");
-        return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
-    }();
-    return interval;
-}
+/// bbport: read once, at startup. A function-local static costs its guard variable (an acquire
+/// load and a branch) on every call, and this is asked once per draw.
+const u32 VerifyInterval = [] {
+    const char* env = std::getenv("BB_PIPE_VERIFY");
+    return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+}();
 } // namespace
 
 bool Rasterizer::DrawPipeWanted() {
@@ -577,12 +586,70 @@ namespace {
 std::unordered_map<const char*, std::unordered_map<u32, u64>> drain_sites;
 } // namespace
 
+namespace {
+/// bbport: the diagnostics settings the draw path asks about, read once at load. Each of these was
+/// a function-local static on a per-draw or per-packet path, so every draw paid its guard variable
+/// -- an acquire load and a branch -- to ask a question whose answer cannot change while the game
+/// runs. One `const` in static storage is a load with no branch.
+const bool FrameStats = std::getenv("BB_FRAME_STATS") != nullptr;
+/// BB_VERTEX_CHECK=N: every Nth frame, check the vertex streams of every draw.
+const u64 VertexCheckEvery = [] {
+    const char* env = std::getenv("BB_VERTEX_CHECK");
+    return env ? std::max<u64>(1, std::strtoull(env, nullptr, 10)) : 0ull;
+}();
+const bool BoneCheck = std::getenv("BB_BONE_CHECK") != nullptr;
+const bool ObjectMotionAll = [] {
+    const char* value = std::getenv("BB_OBJECT_MOTION_ALL");
+    return value && value[0] == '1';
+}();
+/// BB_READBACK_SMALL_BUFFERS=1 (off by default: in one area it halved the frame rate).
+const bool ReadbackSmallBuffers = [] {
+    const char* env = std::getenv("BB_READBACK_SMALL_BUFFERS");
+    return env && env[0] == '1';
+}();
+/// BB_FULL_BARRIER=1|2: a full barrier after (2: also before) every dispatch.
+const int FullBarrier = [] {
+    const char* env = std::getenv("BB_FULL_BARRIER");
+    return env ? std::atoi(env) : 0;
+}();
+const u64 TraceBuffers = [] {
+    const char* env = std::getenv("BB_TRACE_BUFFERS");
+    return env ? std::strtoull(env, nullptr, 16) : 0ull;
+}();
+const u64 TraceTextures = [] {
+    const char* env = std::getenv("BB_TRACE_SHADER");
+    return env ? std::strtoull(env, nullptr, 16) : 0ull;
+}();
+const u64 TraceCompute = [] {
+    const char* env = std::getenv("BB_TRACE_CS");
+    return env ? std::strtoull(env, nullptr, 16) : 0ull;
+}();
+const u64 TraceComputeBones = [] {
+    const char* env = std::getenv("BB_CS_BONE_CHECK");
+    return env ? std::strtoull(env, nullptr, 16) : 0ull;
+}();
+/// BB_FORCE_VB_UPLOAD=1: upload every draw's vertex, index and read-only buffers again.
+const bool ForceUploadAll = std::getenv("BB_FORCE_VB_UPLOAD") != nullptr;
+const bool RingCheck = std::getenv("BB_RING_CHECK") != nullptr;
+const bool WarnMetaTexture = std::getenv("BB_WARN_META_TEXTURE") != nullptr;
+/// BB_FORCE_UPLOAD_VS=<hash>[:index|:buffers]: the shader whose draws upload their data again.
+const std::pair<u32, int> ForceUploadShader = [] {
+    const char* env = std::getenv("BB_FORCE_UPLOAD_VS");
+    if (!env) {
+        return std::pair<u32, int>{0, 0};
+    }
+    char* end;
+    const u32 hash = static_cast<u32>(std::strtoull(env, &end, 16));
+    const int kind = !std::strcmp(end, ":index") ? 1 : !std::strcmp(end, ":buffers") ? 2 : 3;
+    return std::pair<u32, int>{hash, kind};
+}();
+} // namespace
+
 void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
     if (!draw_pipe || !OnStageA()) {
         return;
     }
-    static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
-    if (!stats) {
+    if (!FrameStats) {
         draw_pipe->Drain(reason);
         return;
     }
@@ -718,28 +785,20 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
                           bool is_indexed, u32 index_offset, const AmdGpu::ComputeProgram* cs,
                           const IndirectDraw* indirect) {
     auto& dirty = liverpool->pipe_dirty;
+    bool wholesale = false;
     if (!pipe_synced) {
-        // Stage B has not run yet: its register copy starts as this one.
+        // Stage B has not run yet: its register copy starts as this one. Every register may
+        // differ from what the recording thread last saw, and no block says so.
         pipe_regs = liverpool->regs;
         dirty.Clear();
         pipe_synced = true;
+        wholesale = true;
     }
     std::array<u16, AmdGpu::RegDirty::NumBlocks> blocks;
     u32 num_blocks = 0;
-#ifdef __GLIBCXX__
-    for (size_t block = dirty.blocks._Find_first(); block < dirty.blocks.size();
-         block = dirty.blocks._Find_next(block)) {
-        blocks[num_blocks++] = static_cast<u16>(block);
-    }
-#else
-    if (dirty.blocks.any()) {
-        for (size_t block = 0; block < dirty.blocks.size(); ++block) {
-            if (dirty.blocks.test(block)) {
-                blocks[num_blocks++] = static_cast<u16>(block);
-            }
-        }
-    }
-#endif
+    // The mask walks its own set bits, on every standard library: the blocks a draw packet has to
+    // carry are usually a handful of the 1664 the register file has.
+    dirty.blocks.ForEachSet([&](u32 block) { blocks[num_blocks++] = static_cast<u16>(block); });
     const auto stages =
         pipeline ? pipeline->GetStages() : std::span<const Shader::Info* const>{};
     // Constants: copied here into the ring, the recording thread only binds them.
@@ -769,7 +828,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     if (indirect) {
         size += AlignPacket(sizeof(IndirectDraw));
     }
-    const u32 interval = VerifyInterval();
+    const u32 interval = VerifyInterval;
     const bool verify = interval && (draw_pipe->packets % interval) == 0;
     if (verify) {
         size += sizeof(AmdGpu::Regs);
@@ -787,6 +846,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     packet.index_offset = index_offset;
     packet.is_indexed = is_indexed;
     packet.regs_reset = dirty.reset;
+    packet.regs_wholesale = wholesale;
     packet.num_blocks = static_cast<u16>(num_blocks);
     packet.num_stages = num_stages;
     packet.verify = verify;
@@ -896,10 +956,16 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     const auto* blocks = reinterpret_cast<const u16*>(in);
     in += AlignPacket(packet.num_blocks * sizeof(u16));
     auto& regs = self.pipe_regs;
+    // bbport: which dynamic-state groups this packet's registers can have changed
+    // (UpdateDynamicState). A reset or a resync replaces the whole register set: every group.
+    const auto& groups = AmdGpu::DynamicStateRegGroups::Get();
+    self.pipe_touched_groups =
+        (packet.regs_reset || packet.regs_wholesale) ? AmdGpu::DynamicStateRegGroups::AllGroups : 0;
     if (packet.regs_reset) {
         regs.SetDefaults();
     }
     for (u32 i = 0; i < packet.num_blocks; ++i) {
+        self.pipe_touched_groups |= groups.group_of_block[blocks[i]];
         std::memcpy(regs.reg_array.data() + blocks[i] * AmdGpu::RegDirty::BlockWords, in,
                     AmdGpu::RegDirty::BlockWords * sizeof(u32));
         in += AmdGpu::RegDirty::BlockWords * sizeof(u32);
@@ -1018,8 +1084,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
 }
 
 void Rasterizer::PrintPipeStats() {
-    static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
-    if (!stats || (draw_pipe->packets & 1023) != 0) {
+    if (!FrameStats || (draw_pipe->packets & 1023) != 0) {
         return;
     }
     static auto window = std::chrono::steady_clock::now();
@@ -1098,17 +1163,20 @@ bool Rasterizer::FilterDrawPasses() const {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* prepared) {
     RENDERER_TRACE;
-    BbStats::draws.fetch_add(1, std::memory_order_relaxed);
+    BbStats::Count(BbStats::draws);
 
     // bbport: with the draw pipeline this thread only selects the pipeline and hands the draw
     // to the recording thread (DrawRecord there); draws FilterDraw handles itself run here.
     const bool pipelined = UseDrawPipe();
-    if (pipelined && !FilterDrawPasses() &&
-        !BbToggle::Disabled(BbToggle::PipelinedMemoryWrites)) {
+    // bbport: the two questions below ask FilterDraw's checks; asking them once also keeps the
+    // third ask further down honest -- nothing between here and there changes a register when
+    // the draw takes the pipelined path (FilterDraw only runs when it does not).
+    const bool filter_passes = FilterDrawPasses();
+    if (pipelined && !filter_passes && !BbToggle::Disabled(BbToggle::PipelinedMemoryWrites)) {
         PostDraw(nullptr, nullptr, false, 0);
         return;
     }
-    if (!pipelined || !FilterDrawPasses()) {
+    if (!pipelined || !filter_passes) {
         DrainDrawPipe(DrawPipe::ReasonDraw);
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
@@ -1126,7 +1194,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
     if (!pipeline) {
         return;
     }
-    if (pipelined && FilterDrawPasses()) {
+    if (pipelined && filter_passes) {
         PostDraw(pipeline, used_prepared, is_indexed, index_offset);
         return;
     }
@@ -1263,17 +1331,7 @@ void Rasterizer::CheckConstants() {
 // draws upload their index data and/or read-only buffers from guest memory again (as
 // BB_FORCE_VB_UPLOAD does for every draw).
 static u32 ForceUploadVs(bool index) {
-    static const std::pair<u32, int> setting = [] {
-        const char* env = std::getenv("BB_FORCE_UPLOAD_VS");
-        if (!env) {
-            return std::pair<u32, int>{0, 0};
-        }
-        char* end;
-        const u32 hash = static_cast<u32>(std::strtoull(env, &end, 16));
-        const int kind = !std::strcmp(end, ":index") ? 1 : !std::strcmp(end, ":buffers") ? 2 : 3;
-        return std::pair<u32, int>{hash, kind};
-    }();
-    return (setting.second & (index ? 1 : 2)) ? setting.first : 0;
+    return (ForceUploadShader.second & (index ? 1 : 2)) ? ForceUploadShader.first : 0;
 }
 
 // bbport diagnosis: BB_SHADER_DEBUG_FILE=<file>, re-read every 250 ms while the game runs, so a
@@ -1298,6 +1356,11 @@ const char* LiveShaderDebugFile() {
     static const char* path = std::getenv("BB_SHADER_DEBUG_FILE");
     return path;
 }
+
+/// bbport: whether the live debug file is configured, read once at startup. The draw path asks
+/// this a few times per draw and per buffer binding, and a function-local static answers it with
+/// its guard variable (an acquire load and a branch) every time.
+const bool LiveShaderDebugOn = std::getenv("BB_SHADER_DEBUG_FILE") != nullptr;
 
 LiveShaderDebug& LiveDebug() {
     static LiveShaderDebug state;
@@ -1360,6 +1423,32 @@ LiveShaderDebug& LiveDebug() {
 }
 } // namespace
 
+namespace {
+/// bbport: a shader hash list from an environment variable, read once at startup.
+std::vector<u64> HashListFromEnv(const char* name, bool truncate) {
+    std::vector<u64> list;
+    const char* env = std::getenv(name);
+    if (!env) {
+        return list;
+    }
+    for (const char* p = env; *p;) {
+        char* end;
+        const u64 value = std::strtoull(p, &end, 16);
+        if (end == p) {
+            break;
+        }
+        list.push_back(truncate ? u64(u32(value)) : value);
+        p = *end == ',' ? end + 1 : end;
+    }
+    return list;
+}
+const std::vector<u64> JitteredShaders = HashListFromEnv("BB_JITTER_PS", true);
+const std::vector<u64> SkippedShaders = HashListFromEnv("BB_SKIP_SHADERS", false);
+/// True when no draw can be skipped: neither list is set nor is the live debug file. Asked twice
+/// per draw, so it is one bool rather than two guarded static vectors.
+const bool SkippingConfigured = !SkippedShaders.empty() || LiveShaderDebugOn;
+} // namespace
+
 // bbport: BB_JITTER_PS=<pixel shader hash>,... (run.py, Uncharted): full-screen passes that
 // rebuild positions from the scene depth through an interpolated texture coordinate, jittered
 // like the scene geometry. Unjittered, they reconstructed each pixel from depth that was
@@ -1367,25 +1456,11 @@ LiveShaderDebug& LiveDebug() {
 // every jitter step and flickered under FSR and TAA, worst on the largest steps (every 4th
 // frame). The live "jitter" line of BB_SHADER_DEBUG_FILE adds shaders for tests.
 static bool JitterFullScreenPass(u64 hash) {
-    static const std::vector<u64> listed = [] {
-        std::vector<u64> list;
-        if (const char* env = std::getenv("BB_JITTER_PS")) {
-            for (const char* p = env; *p;) {
-                char* end;
-                const u64 value = std::strtoull(p, &end, 16);
-                if (end == p) {
-                    break;
-                }
-                list.push_back(u64(u32(value)));
-                p = *end == ',' ? end + 1 : end;
-            }
-        }
-        return list;
-    }();
-    if (std::find(listed.begin(), listed.end(), u64(u32(hash))) != listed.end()) {
+    if (std::find(JitteredShaders.begin(), JitteredShaders.end(), u64(u32(hash))) !=
+        JitteredShaders.end()) {
         return true;
     }
-    if (!LiveShaderDebugFile()) {
+    if (!LiveShaderDebugOn) {
         return false;
     }
     auto& live = LiveDebug();
@@ -1401,7 +1476,10 @@ static bool JitterFullScreenPass(u64 hash) {
 // bbport: BB_SKIP_SHADERS=<hash>,...: draws and dispatches of these pixel/compute shaders
 // are not recorded (diagnostic: which pass of a frame causes a visual problem).
 static bool SkipShader(u64 hash) {
-    if (hash && LiveShaderDebugFile()) {
+    if (!SkippingConfigured) {
+        return false;
+    }
+    if (hash && LiveShaderDebugOn) {
         auto& live = LiveDebug();
         const u32 count = live.num_skipped.load(std::memory_order_acquire);
         for (u32 i = 0; i < count; ++i) {
@@ -1410,22 +1488,8 @@ static bool SkipShader(u64 hash) {
             }
         }
     }
-    static const std::vector<u64> skipped = [] {
-        std::vector<u64> list;
-        if (const char* env = std::getenv("BB_SKIP_SHADERS")) {
-            for (const char* p = env; *p;) {
-                char* end;
-                const u64 value = std::strtoull(p, &end, 16);
-                if (end == p) {
-                    break;
-                }
-                list.push_back(value);
-                p = *end == ',' ? end + 1 : end;
-            }
-        }
-        return list;
-    }();
-    return hash && std::find(skipped.begin(), skipped.end(), hash) != skipped.end();
+    return hash &&
+           std::find(SkippedShaders.begin(), SkippedShaders.end(), hash) != SkippedShaders.end();
 }
 
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
@@ -1513,10 +1577,6 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // bbport diagnosis: BB_VERTEX_CHECK=N, every Nth frame: vertex shader buffers (elements of
     // 12 to 64 bytes) whose elements start with impossible positions (NaN, infinity, beyond 1e5)
     // or with many exact zero triples, in guest memory as the draw is recorded.
-    static const u64 vertex_check = [] {
-        const char* env = std::getenv("BB_VERTEX_CHECK");
-        return env ? std::max<u64>(1, std::strtoull(env, nullptr, 10)) : 0ull;
-    }();
     if (StaleCheckEnabled()) {
         const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
         auto& t = Stale();
@@ -1557,7 +1617,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             }
         }
     }
-    if (vertex_check && BbStats::gpu_frames.load(std::memory_order_relaxed) % vertex_check == 0) {
+    if (VertexCheckEvery &&
+        BbStats::gpu_frames.load(std::memory_order_relaxed) % VertexCheckEvery == 0) {
         const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
         for (u32 b = 0; b < vs.buffers.size(); ++b) {
             const auto& resource = vs.buffers[b];
@@ -1596,8 +1657,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     // bbport diagnosis: BB_BONE_CHECK=1 reports vertex shader bone palettes (stride-16 buffers)
     // holding values no bone matrix has (NaN, infinity, beyond 1e5) as the draw is recorded.
-    static const bool bone_check = std::getenv("BB_BONE_CHECK") != nullptr;
-    if (bone_check) {
+    if (BoneCheck) {
         const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
         for (u32 b = 0; b < vs.buffers.size(); ++b) {
             const auto& resource = vs.buffers[b];
@@ -1647,11 +1707,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         // Without a character-size skeleton the draw is gated on its bone palette changing
         // since last frame (model constants follow the camera, the palette does not). The
         // check comes first: most gated draws are static world pieces with long index lists.
-        static const bool all_motion = [] {
-            const char* value = std::getenv("BB_OBJECT_MOTION_ALL");
-            return value && value[0] == '1';
-        }();
-        bool gated = !all_motion;
+        bool gated = !ObjectMotionAll;
         u64 palette = 0;
         for (const auto& resource : vs.buffers) {
             if (resource.IsSpecial()) continue;
@@ -1718,7 +1774,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             });
         }
     }
-    pipeline->BindResources(set_writes, push_data);
+    pipeline->BindResources({set_writes.data(), num_set_writes}, push_data);
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
     draw_jitter = {};
@@ -1748,11 +1804,14 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         checkpoint = NoteCheckpoint("draw", vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices,
                                     num_instances, 0, 0);
     }
+    const bool rebind = scheduler.EchoPipeline(vk::PipelineBindPoint::eGraphics, handle);
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         if (checkpoint) {
             cmdbuf.setCheckpointNV(checkpoint);
         }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        if (rebind) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        }
         if (is_indexed) {
             cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex), first_instance);
         } else {
@@ -1887,7 +1946,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     push_data.xoffset *= target_scale[0];
     push_data.yscale *= target_scale[1];
     push_data.yoffset *= target_scale[1];
-    pipeline->BindResources(set_writes, push_data);
+    pipeline->BindResources({set_writes.data(), num_set_writes}, push_data);
     draw_jitter = {};
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth()) {
         draw_jitter = upscaler->Jitter();
@@ -1911,11 +1970,14 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
                                     ps ? ps->pgm_hash : 0, max_count, stride,
                                     count_address != 0, indirect.args);
     }
+    const bool rebind = scheduler.EchoPipeline(vk::PipelineBindPoint::eGraphics, handle);
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         if (checkpoint) {
             cmdbuf.setCheckpointNV(checkpoint);
         }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        if (rebind) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        }
         if (is_indexed) {
             if (counts) {
                 cmdbuf.drawIndexedIndirectCount(args, args_offset, counts, counts_offset, max_count,
@@ -1936,12 +1998,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
 }
 
 void Rasterizer::NoteSmallWrittenBuffers(const Shader::Info& stage) {
-    static const bool enabled = [] {
-        // Off by default: in U3's Cartagena square it halved the frame rate (94 -> 46 FPS).
-        const char* env = std::getenv("BB_READBACK_SMALL_BUFFERS");
-        return env && env[0] == '1';
-    }();
-    if (!enabled) {
+    if (!ReadbackSmallBuffers) {
         return;
     }
     for (const auto& desc : stage.buffers) {
@@ -1975,7 +2032,7 @@ void Rasterizer::ReadBackSmallWrittenBuffers() {
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
-    BbStats::dispatches.fetch_add(1, std::memory_order_relaxed);
+    BbStats::Count(BbStats::dispatches);
     // bbport: like draws, handed to the draw recording thread after the pipeline selection.
     const bool pipelined = UseDrawPipe() && !BbToggle::Disabled(BbToggle::PipelinedDispatch);
     if (!pipelined) {
@@ -2023,11 +2080,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     }
     // bbport diagnosis: BB_TRACE_CS=<hash>: that compute shader's buffers (first 200 dispatches),
     // with the buffer cache's view of them before binding.
-    static const u64 trace_cs = [] {
-        const char* env = std::getenv("BB_TRACE_CS");
-        return env ? std::strtoull(env, nullptr, 16) : 0ull;
-    }();
-    if (trace_cs && u32(cs.pgm_hash) == u32(trace_cs)) {
+    if (TraceCompute && u32(cs.pgm_hash) == u32(TraceCompute)) {
         static std::atomic<u32> traced{0};
         if (traced.load() == 0) {
             std::printf("Trace cs %08x: workgroup %ux%ux%u, LDS %u bytes, subgroup %u; lane id %d, "
@@ -2088,11 +2141,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     // bbport diagnosis: BB_CS_BONE_CHECK=<cs hash>: that compute shader's small read-only
     // buffers of 3x4 matrices (multiples of 48 bytes up to 64 KiB) with values no transform has
     // (NaN, infinity, beyond 1e5) or all-zero matrices, in guest memory at the dispatch.
-    static const u64 cs_bone_check = [] {
-        const char* env = std::getenv("BB_CS_BONE_CHECK");
-        return env ? std::strtoull(env, nullptr, 16) : 0ull;
-    }();
-    if (cs_bone_check && u32(cs.pgm_hash) == u32(cs_bone_check)) {
+    if (TraceComputeBones && u32(cs.pgm_hash) == u32(TraceComputeBones)) {
         static u64 checked = 0, reports = 0;
         for (u32 b = 0; b < cs.buffers.size(); ++b) {
             const auto& desc = cs.buffers[b];
@@ -2184,7 +2233,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     scheduler.EndRendering();
     mark();
-    pipeline->BindResources(set_writes, push_data);
+    pipeline->BindResources({set_writes.data(), num_set_writes}, push_data);
 
     const vk::Pipeline handle = pipeline->Handle();
     const u32 dim_x = cs_program.dim_x, dim_y = cs_program.dim_y, dim_z = cs_program.dim_z;
@@ -2194,11 +2243,8 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     // bbport diagnosis: BB_FULL_BARRIER=1 — every dispatch is followed by a barrier from all
     // commands to all commands (a missing compute -> later read dependency shows as gone);
     // BB_FULL_BARRIER=2 also precedes it with one (earlier reads -> its writes).
-    static const int full_barrier = [] {
-        const char* env = std::getenv("BB_FULL_BARRIER");
-        return env ? std::atoi(env) : 0;
-    }();
     const void* checkpoint = NoteCheckpoint("dispatch", cs.pgm_hash, 0, dim_x, dim_y, dim_z, 0);
+    const bool rebind = scheduler.EchoPipeline(vk::PipelineBindPoint::eCompute, handle);
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         const vk::MemoryBarrier2 barrier = {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -2210,15 +2256,17 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
             .memoryBarrierCount = 1,
             .pMemoryBarriers = &barrier,
         };
-        if (full_barrier >= 2) {
+        if (FullBarrier >= 2) {
             cmdbuf.pipelineBarrier2(dependency);
         }
         if (checkpoint) {
             cmdbuf.setCheckpointNV(checkpoint);
         }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        if (rebind) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        }
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
-        if (full_barrier >= 1) {
+        if (FullBarrier >= 1) {
             cmdbuf.pipelineBarrier2(dependency);
         }
     });
@@ -2264,7 +2312,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, push_data);
+    pipeline->BindResources({set_writes.data(), num_set_writes}, push_data);
 
     const vk::Pipeline handle = pipeline->Handle();
     const vk::Buffer args = buffer->Handle();
@@ -2272,11 +2320,14 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     const void* checkpoint =
         NoteCheckpoint("indirect dispatch", pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,
                        0, size, 0, 0, address + offset);
+    const bool rebind = scheduler.EchoPipeline(vk::PipelineBindPoint::eCompute, handle);
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         if (checkpoint) {
             cmdbuf.setCheckpointNV(checkpoint);
         }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        if (rebind) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        }
         cmdbuf.dispatchIndirect(args, args_offset);
     });
     DebugState.IncDispatch();
@@ -2375,7 +2426,6 @@ bool Rasterizer::HelperEligible(const Pipeline* pipeline) const {
 
 bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
                                           const PreparedStage* prepared) {
-    const u64 generation = texture_cache.RegistryGeneration();
     for (u32 image_index = 0; image_index < stage.images.size(); ++image_index) {
         const auto& image_desc = stage.images[image_index];
         if (image_desc.is_written) {
@@ -2393,7 +2443,10 @@ bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
         const auto& entry =
             prepared ? CachedImageDescEntry(tsharp, image_desc, prepared->image_hashes[image_index])
                      : CachedImageDescEntry(tsharp, image_desc);
-        if (entry.found_generation != generation) {
+        // The helper may only bind images whose description the GPU thread already resolved to
+        // an image that is still there (uid): anything else needs a lookup, an upload or a
+        // barrier, which belong to the GPU thread.
+        if (entry.found_uid == 0 || texture_cache.ImageUid(entry.found_id) != entry.found_uid) {
             return false;
         }
         VideoCore::ImageId image_id = entry.found_id;
@@ -2440,7 +2493,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     set_write_index = 0;
-    set_writes.clear();
+    num_set_writes = 0;
     buffer_infos.clear();
     image_infos.clear();
     // bbport: G-buffer passes sample material textures for a scene rendered below the output
@@ -2460,8 +2513,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     bool uses_dma = false;
 
-    static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
-    if (stats && ((helper_full + helper_partial + helper_serial) & 1023) == 0) {
+    if (FrameStats && ((helper_full + helper_partial + helper_serial) & 1023) == 0) {
         static auto window = std::chrono::steady_clock::now();
         const auto now = std::chrono::steady_clock::now();
         if (now - window >= std::chrono::seconds(5)) {
@@ -2488,8 +2540,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             if (!stage) {
                 continue;
             }
-            set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
-                              stage->samplers.size());
+            ReserveSetWrites(num_set_writes + static_cast<u32>(stage->buffers.size() +
+                                                                 stage->images.size() +
+                                                                 stage->samplers.size()));
             stage->PushUd(binding, push_data);
             const PreparedStage* prepared = FindPreparedStage(*stage);
             BindBuffers(*stage, prepared, binding, push_data, set_write_index);
@@ -2518,7 +2571,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             const u32 num_buffers = static_cast<u32>(stage->buffers.size());
             const u32 num_descriptors =
                 num_buffers + static_cast<u32>(stage->images.size() + stage->samplers.size());
-            set_writes.resize(set_writes.size() + num_descriptors);
+            ReserveSetWrites(num_set_writes + num_descriptors);
             stage->PushUd(binding, push_data);
             const PreparedStage* prepared = FindPreparedStage(*stage);
             buffer_stages[task.count] = {stage, prepared, binding, set_write_index};
@@ -2562,6 +2615,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         fault_process_pending = true;
     }
 
+    num_set_writes = set_write_index;
     return true;
 }
 
@@ -2576,18 +2630,63 @@ void Rasterizer::EmitVertexBuffers() {
     auto& v = vertex_binds;
     const bool dynamic_input = instance.IsVertexInputDynamicState();
     const u32 num_buffers = v.num_buffers;
-    scheduler.ReserveRecordData(
-        v.bindings.size() * sizeof(v.bindings[0]) + v.attributes.size() * sizeof(v.attributes[0]) +
-        num_buffers * (sizeof(vk::Buffer) + 3 * sizeof(vk::DeviceSize)) + 128);
-    if (dynamic_input) {
+    // bbport: a batch of draws repeats the same vertex formats. The dynamic state stays live in
+    // the command buffer until something sets it again, so emitting an identical description only
+    // costs the copy into the chunk and the command that carries it. The comparison is the bytes
+    // of the two lists (a few 16-byte entries); a new command buffer clears the memo through the
+    // scheduler's invalidation count, the same edge the dynamic state itself is re-emitted on.
+    const u32 generation = dynamic_input ? scheduler.GetDynamicState().InvalidationGeneration()
+                                         : 0u;
+    const u32 num_bindings = static_cast<u32>(v.bindings.size());
+    const u32 num_attributes = static_cast<u32>(v.attributes.size());
+    bool emit_input = dynamic_input;
+    if (dynamic_input && !BbToggle::Disabled(BbToggle::VertexInputMemo)) {
+        emit_input = vertex_input_memo.generation != generation ||
+                     vertex_input_memo.num_bindings != num_bindings ||
+                     vertex_input_memo.num_attributes != num_attributes ||
+                     std::memcmp(vertex_input_memo.bindings.data(), v.bindings.data(),
+                                 num_bindings * sizeof(v.bindings[0])) != 0 ||
+                     std::memcmp(vertex_input_memo.attributes.data(), v.attributes.data(),
+                                 num_attributes * sizeof(v.attributes[0])) != 0;
+    }
+    // bbport: the binding echo. A batch of draws that repeats a binding (a mesh drawn again by
+    // the next packet, a full-screen pass after another) does not need it recorded again: the
+    // state stays live in the command buffer, and the copies into the chunk and the command
+    // that carries them are what this draw would otherwise pay for.
+    const vk::DeviceSize* sizes =
+        dynamic_input || num_buffers == 0 ? nullptr : v.host_sizes.data();
+    const vk::DeviceSize* strides =
+        dynamic_input || num_buffers == 0 ? nullptr : v.host_strides.data();
+    const bool bind_buffers =
+        num_buffers != 0 && scheduler.EchoVertexBuffers(num_buffers, v.host_buffers.data(),
+                                                       v.host_offsets.data(), sizes, strides);
+    if (emit_input || bind_buffers) {
+        scheduler.ReserveRecordData(
+            (emit_input ? v.bindings.size() * sizeof(v.bindings[0]) +
+                              v.attributes.size() * sizeof(v.attributes[0])
+                        : 0) +
+            (bind_buffers ? num_buffers * (sizeof(vk::Buffer) + 3 * sizeof(vk::DeviceSize)) : 0) +
+            128);
+    }
+    if (emit_input) {
+        ++vertex_input_emits;
+        vertex_input_memo.generation = generation;
+        vertex_input_memo.num_bindings = num_bindings;
+        vertex_input_memo.num_attributes = num_attributes;
+        std::memcpy(vertex_input_memo.bindings.data(), v.bindings.data(),
+                    num_bindings * sizeof(v.bindings[0]));
+        std::memcpy(vertex_input_memo.attributes.data(), v.attributes.data(),
+                    num_attributes * sizeof(v.attributes[0]));
         scheduler.Record([bindings = scheduler.RecordData(std::span<const vk::VertexInputBindingDescription2EXT>{v.bindings.data(), v.bindings.size()}),
                           attributes = scheduler.RecordData(std::span<const vk::VertexInputAttributeDescription2EXT>{
                               v.attributes.data(), v.attributes.size()})](
                              vk::CommandBuffer cmdbuf) {
             cmdbuf.setVertexInputEXT(bindings, attributes);
         });
+    } else if (dynamic_input) {
+        ++vertex_input_skips;
     }
-    if (num_buffers == 0) {
+    if (!bind_buffers) {
         return;
     }
     const auto buffers = scheduler.RecordData(std::span<const vk::Buffer>{v.host_buffers.data(), num_buffers});
@@ -2598,11 +2697,14 @@ void Rasterizer::EmitVertexBuffers() {
         });
         return;
     }
-    const auto sizes = scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_sizes.data(), num_buffers});
-    const auto strides = scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_strides.data(), num_buffers});
-    scheduler.Record([num_buffers, buffers, offsets, sizes, strides](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindVertexBuffers2(0, num_buffers, buffers.data(), offsets.data(), sizes.data(),
-                                  strides.data());
+    const auto host_sizes =
+        scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_sizes.data(), num_buffers});
+    const auto host_strides =
+        scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_strides.data(), num_buffers});
+    scheduler.Record([num_buffers, buffers, offsets, host_sizes, host_strides](
+                         vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindVertexBuffers2(0, num_buffers, buffers.data(), offsets.data(),
+                                  host_sizes.data(), host_strides.data());
     });
 }
 
@@ -2709,9 +2811,9 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     }
 
     // Map buffers for merged ranges
-    static const bool force_vb_upload = std::getenv("BB_FORCE_VB_UPLOAD") != nullptr;
+    const u32 force_upload_vs = ForceUploadVs(false);
     const bool force_this_draw =
-        force_vb_upload || (ForceUploadVs(false) && ForceUploadVs(false) == current_vs_hash);
+        ForceUploadAll || (force_upload_vs && force_upload_vs == current_vs_hash);
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
         if (force_this_draw) {
@@ -2757,6 +2859,9 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 }
 
 void Rasterizer::EmitIndexBuffer() {
+    if (!scheduler.EchoIndexBuffer(index_bind.handle, index_bind.offset, index_bind.type)) {
+        return;
+    }
     scheduler.Record([handle = index_bind.handle, offset = index_bind.offset,
                       type = index_bind.type](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindIndexBuffer(handle, offset, type);
@@ -2775,8 +2880,8 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
-    static const bool force_ib_upload = std::getenv("BB_FORCE_VB_UPLOAD") != nullptr;
-    if (force_ib_upload || (ForceUploadVs(true) && ForceUploadVs(true) == current_vs_hash)) {
+    const u32 force_upload_vs = ForceUploadVs(true);
+    if (ForceUploadAll || (force_upload_vs && force_upload_vs == current_vs_hash)) {
         buffer_cache.ForceUpload(index_address, index_buffer_size);
     }
     const auto [buffer, offset] =
@@ -2953,13 +3058,10 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
 namespace {
 /// bbport diagnosis: BB_WATCH_GPU_WRITE=<address>: GPU writes into the 4 KiB from there are printed.
-VAddr WatchedGpuWrite() {
-    static const VAddr value = [] {
-        const char* env = std::getenv("BB_WATCH_GPU_WRITE");
-        return env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
-    }();
-    return value;
-}
+const VAddr WatchedGpuWrite = [] {
+    const char* env = std::getenv("BB_WATCH_GPU_WRITE");
+    return env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
+}();
 } // namespace
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
@@ -2968,11 +3070,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
     const u64 alignment = instance.StorageMinAlignment();
     // bbport diagnosis: BB_TRACE_BUFFERS=<hash> prints the V# of every buffer binding of that
     // shader and the first bytes of guest memory behind it (first 6 draws).
-    static const u64 trace_hash = [] {
-        const char* env = std::getenv("BB_TRACE_BUFFERS");
-        return env ? std::strtoull(env, nullptr, 16) : 0ull;
-    }();
-    if (trace_hash && u32(stage.pgm_hash) == u32(trace_hash)) {
+    if (TraceBuffers && u32(stage.pgm_hash) == u32(TraceBuffers)) {
         static std::atomic<u32> traced{0};
         if (traced.fetch_add(1, std::memory_order_relaxed) < 6) {
             for (u32 i = 0; i < stage.buffers.size(); ++i) {
@@ -3007,8 +3105,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         const RingBinding* ring = num_ring_stages ? FindRingBinding(stage, buffer_index) : nullptr;
         if (ring) {
             // Copied by the GPU command thread into the constant ring (read-only).
-            static const bool ring_check = std::getenv("BB_RING_CHECK") != nullptr;
-            if (ring_check && !desc.IsSpecial() && memory->IsValidGpuMapping(ring->address, 0)) {
+            if (RingCheck && !desc.IsSpecial() && memory->IsValidGpuMapping(ring->address, 0)) {
                 const u8* copied = constant_ring->Data(ring->offset);
                 const u8* now = reinterpret_cast<const u8*>(ring->address);
                 if (std::memcmp(copied, now, ring->size) != 0) {
@@ -3125,10 +3222,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
-                static const bool force_upload = std::getenv("BB_FORCE_VB_UPLOAD") != nullptr;
-                if ((force_upload || (ForceUploadVs(false) &&
-                                      ForceUploadVs(false) == u32(stage.pgm_hash))) &&
-                    !desc.is_written) {
+                // One setting read, not two: the value is the shader hash this pull applies to.
+                const u32 force_upload_vs = desc.is_written ? 0 : ForceUploadVs(false);
+                if (!desc.is_written &&
+                    (ForceUploadAll ||
+                     (force_upload_vs != 0 && force_upload_vs == u32(stage.pgm_hash)))) {
                     buffer_cache.ForceUpload(vsharp.base_address, size);
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
@@ -3151,7 +3249,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
-                if (const VAddr watch = WatchedGpuWrite();
+                if (const VAddr watch = WatchedGpuWrite;
                     watch && desc.is_written && vsharp.base_address < watch + 0x1000 &&
                     watch < vsharp.base_address + size) {
                     static std::atomic<u32> reported{0};
@@ -3165,12 +3263,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
             }
         }
 
-        auto& set_write = set_writes[write_index++];
-        set_write.dstSet = VK_NULL_HANDLE;
-        set_write.dstBinding = binding.unified++;
-        set_write.dstArrayElement = 0;
-        set_write.descriptorCount = 1;
-        set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
+        auto& set_write = DescriptorWrite(write_index, binding.unified++, 1,
+                                          vk::DescriptorType::eStorageBuffer);
         set_write.pBufferInfo = &buffer_infos.back();
         ++binding.buffer;
     }
@@ -3210,7 +3304,7 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
         entry.desc = VideoCore::TextureCache::ImageDesc{sharp, res};
         entry.sharp = key;
         entry.flags = flags;
-        entry.found_generation = ~0ULL;
+        entry.found_uid = 0;
         entry.view_memo = {};
     }
     return entry;
@@ -3222,13 +3316,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
     const u32 first_image_idx = image_infos.size();
     // bbport diagnosis: BB_TRACE_SHADER=<hash> prints the T# of every texture binding of that
     // shader (first 8 draws).
-    static const u64 env_trace_hash = [] {
-        const char* env = std::getenv("BB_TRACE_SHADER");
-        return env ? std::strtoull(env, nullptr, 16) : 0ull;
-    }();
-    u64 trace_hash = env_trace_hash;
+    u64 trace_hash = TraceTextures;
     u32 trace_generation = 0;
-    if (LiveShaderDebugFile()) {
+    if (LiveShaderDebugOn) {
         auto& live = LiveDebug();
         if (const u64 live_hash = live.trace.load(std::memory_order_relaxed)) {
             trace_hash = live_hash;
@@ -3314,15 +3404,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         BindTexturesFromSet(stage, prepared, first_image_idx, barrier, set_slot)) {
         // Descriptor writes: one per image (no mip arrays in a memoized set).
         for (u32 i = 0; i < stage.images.size(); ++i) {
-            auto& set_write = set_writes[write_index++];
-            set_write.dstSet = VK_NULL_HANDLE;
-            set_write.dstBinding = binding.unified++;
-            set_write.dstArrayElement = 0;
-            set_write.descriptorCount = 1;
-            set_write.descriptorType = vk::DescriptorType::eSampledImage;
+            auto& set_write = DescriptorWrite(write_index, binding.unified++, 1,
+                                              vk::DescriptorType::eSampledImage);
             set_write.pImageInfo = &image_infos[first_image_idx + i];
         }
-        BindSamplers(stage, prepared, binding, write_index);
+        BindSamplers(stage, prepared, binding, write_index, false);
         return;
     }
     image_bindings.clear();
@@ -3346,8 +3432,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         const auto tsharp =
             prepared ? prepared->image_sharps[image_index] : image_desc.GetSharp(stage);
         // bbport: a hash lookup per texture per draw for a diagnostic only.
-        static const bool warn_meta = std::getenv("BB_WARN_META_TEXTURE") != nullptr;
-        if (warn_meta && texture_cache.IsMeta(tsharp.Address())) {
+        if (WarnMetaTexture && texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
 
@@ -3401,9 +3486,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         };
         for (auto i = 0; i < num_bindings; i++) {
             // bbport: a plain binding (no mip override) of the same T# resolves to the same image
-            // while no image was registered or unregistered.
+            // for as long as that image is still in its slot (its uid says so; the registry
+            // generation this used to test dropped the memo whenever any other image changed).
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::None &&
-                desc_entry.found_generation == texture_cache.RegistryGeneration() &&
+                desc_entry.found_uid != 0 &&
+                texture_cache.ImageUid(desc_entry.found_id) == desc_entry.found_uid &&
                 !BbToggle::Disabled(BbToggle::TextureBindingMemo)) {
                 desc_entry.pinned = bind_epoch;
                 auto& [image_id, _] =
@@ -3438,12 +3525,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 desc.view_info.range.extent.levels = 1;
             }
 
-            const u64 generation = texture_cache.RegistryGeneration();
             image_id = texture_cache.FindImage(desc);
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::None &&
-                generation == texture_cache.RegistryGeneration() &&
                 desc_entry.pinned != bind_epoch) {
-                desc_entry.found_generation = generation;
+                desc_entry.found_uid = texture_cache.ImageUid(image_id);
                 desc_entry.found_id = image_id;
                 desc_entry.found_desc = desc;
                 desc_entry.view_memo = {};
@@ -3565,11 +3650,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         }
     }
     if (set_ok && image_bindings.size() == stage.images.size()) {
-        // Remember the set: the same T#s resolve the same way while no image is (un)registered.
-        set_slot->generation = texture_cache.RegistryGeneration();
+        // Remember the set: the same T#s resolve the same way while the images it resolved to
+        // are still the ones in their slots (their uids, not the whole registry, say that).
         set_slot->scene_generation = scene_targets->Generation();
         set_slot->count = static_cast<u32>(stage.images.size());
         std::copy_n(resolved.begin(), set_slot->count, set_slot->entries.begin());
+        for (u32 i = 0; i < set_slot->count; ++i) {
+            set_slot->uids[i] = set_slot->entries[i].id ? texture_cache.ImageUid(set_slot->entries[i].id) : 0;
+        }
     } else if (set_slot) {
         set_slot->key = 0;
     }
@@ -3579,13 +3667,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
     for (u32 array_size : image_descriptor_array_sizes) {
         const auto& desc = *image_bindings[image_binding_idx].second;
         const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
-        auto& set_write = set_writes[write_index++];
-        set_write.dstSet = VK_NULL_HANDLE;
-        set_write.dstBinding = binding.unified;
-        set_write.dstArrayElement = 0;
-        set_write.descriptorCount = array_size;
-        set_write.descriptorType =
-            is_storage ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage;
+        auto& set_write = DescriptorWrite(
+            write_index, binding.unified, array_size,
+            is_storage ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage);
         set_write.pImageInfo = &image_infos[image_info_idx];
 
         image_info_idx += array_size;
@@ -3593,24 +3677,50 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         binding.unified += array_size;
     }
 
-    BindSamplers(stage, prepared, binding, write_index);
+    BindSamplers(stage, prepared, binding, write_index, on_helper);
+}
+
+vk::Sampler Rasterizer::BindSampler(const AmdGpu::Sampler& sharp, bool is_depth, float lod_bias,
+                                    SamplerMemoTable& memo) {
+    const u64 border = Regs().ta_bc_base.base_addr;
+    const u32 epoch = texture_cache.SamplerEpoch();
+    const u64 hash =
+        sharp.raw0 * 0x9E3779B97F4A7C15ull ^ sharp.raw1 * 0xFF51AFD7ED558CCDull ^
+        border * 0xC4CEB9FE1A85EC53ull ^ u64(std::bit_cast<u32>(lod_bias)) << 5 ^ u64(is_depth);
+    SamplerMemoEntry& entry = memo.entries[(hash ^ hash >> 29) & (SamplerMemoSize - 1)];
+    if (entry.valid && entry.epoch == epoch && entry.raw0 == sharp.raw0 &&
+        entry.raw1 == sharp.raw1 && entry.border == border &&
+        entry.is_depth == u32(is_depth) && entry.lod_bias == lod_bias) {
+        ++memo.hits;
+        return entry.sampler;
+    }
+    ++memo.misses;
+    const vk::Sampler sampler =
+        texture_cache.GetSampler(sharp, Regs().ta_bc_base, is_depth, lod_bias);
+    entry.raw0 = sharp.raw0;
+    entry.raw1 = sharp.raw1;
+    entry.border = border;
+    entry.lod_bias = lod_bias;
+    entry.is_depth = u32(is_depth);
+    entry.epoch = epoch;
+    entry.valid = true;
+    entry.sampler = sampler;
+    return sampler;
 }
 
 void Rasterizer::BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
-                              Shader::Backend::Bindings& binding, u32& write_index) {
+                              Shader::Backend::Bindings& binding, u32& write_index,
+                              bool on_helper) {
     for (u32 sampler_index = 0; sampler_index < stage.samplers.size(); ++sampler_index) {
         const auto& sampler = stage.samplers[sampler_index];
         auto ssharp =
             prepared ? prepared->sampler_sharps[sampler_index] : sampler.GetSharp(stage);
-        const auto vk_sampler = texture_cache.GetSampler(
-            ssharp, Regs().ta_bc_base, sampler.is_depth, sampler.is_depth ? 0.0f : sampler_lod_bias);
+        const vk::Sampler vk_sampler =
+            BindSampler(ssharp, sampler.is_depth, sampler.is_depth ? 0.0f : sampler_lod_bias,
+                        on_helper ? helper_sampler_memo : sampler_memo);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
-        auto& set_write = set_writes[write_index++];
-        set_write.dstSet = VK_NULL_HANDLE;
-        set_write.dstBinding = binding.unified++;
-        set_write.dstArrayElement = 0;
-        set_write.descriptorCount = 1;
-        set_write.descriptorType = vk::DescriptorType::eSampler;
+        auto& set_write =
+            DescriptorWrite(write_index, binding.unified++, 1, vk::DescriptorType::eSampler);
         set_write.pImageInfo = &image_infos.back();
     }
 }
@@ -3622,12 +3732,17 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
     const u32 num_color = std::bit_width(key.mrt_mask);
     for (u32 cb = 0; cb < num_color && cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
         sig.ids[cb] = cb_descs[cb].first;
+        // The uid in the same pass: a signature is built per draw, and eight more slot lookups
+        // for the targets this draw does not use are eight lookups nobody reads.
+        sig.uids[cb] = cb_descs[cb].first ? texture_cache.ImageUid(cb_descs[cb].first) : 0;
         if (cb_descs[cb].first) {
             sig.views[cb] = cb_descs[cb].second.view_info;
         }
         sig.color_samples[cb] = key.color_samples[cb];
     }
     sig.ids[AmdGpu::NUM_COLOR_BUFFERS] = db_desc.first;
+    sig.uids[AmdGpu::NUM_COLOR_BUFFERS] =
+        db_desc.first ? texture_cache.ImageUid(db_desc.first) : 0;
     if (db_desc.first) {
         sig.views[AmdGpu::NUM_COLOR_BUFFERS] = db_desc.second.view_info;
     }
@@ -3637,7 +3752,6 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
     sig.scene_started = scene_started;
     sig.raster_scaling = upscaler->RasterScaling();
     sig.upscaler_state = upscaler->RedirectState();
-    sig.generation = texture_cache.RegistryGeneration();
     std::memcpy(&sig.depth_control, &regs.depth_control, sizeof(u32));
     sig.depth_valid = regs.depth_buffer.DepthValid();
     sig.stencil_valid = regs.depth_buffer.StencilValid();
@@ -3656,37 +3770,54 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
             return false;
         }
     }
-    u64 key = XXH3_64bits_withSeed(prepared->image_hashes, count * sizeof(u64),
-                                   reinterpret_cast<u64>(&stage));
-    key |= 1; // 0 marks an empty slot
+    // The key is hashed by the draw-preparation worker (PreparedStage::texture_set_key); only a
+    // draw whose preparation did not survive has to hash its own hashes here.
+    const u64 key = prepared->texture_set_key ? prepared->texture_set_key
+                                              : XXH3_64bits_withSeed(prepared->image_hashes,
+                                                                     count * sizeof(u64),
+                                                                     reinterpret_cast<u64>(&stage)) | 1;
     auto& set = texture_sets[key % texture_sets.size()];
     slot = &set;
-    const u64 generation = texture_cache.RegistryGeneration();
     const bool match = set.key == key && set.stage == &stage && set.count == count &&
-                       set.generation == generation &&
                        set.scene_generation == scene_targets->Generation() &&
                        std::equal(set.hashes.begin(), set.hashes.begin() + count,
                                   prepared->image_hashes);
     if (!match) {
-        ++texture_set_why[set.key != key ? 0 : set.generation != generation ? 1 : 3];
+        ++texture_set_why[set.key != key ? 0 : 3];
         ++texture_set_misses;
         set.key = key;
         set.stage = &stage;
         set.count = 0;
-        set.generation = ~0ull;
+        set.scene_generation = 0;
         std::copy_n(prepared->image_hashes, count, set.hashes.begin());
         return false;
     }
-    // Every image still has the backing its view belongs to and needs no refresh.
+    // Every image is the one this set was recorded with, still has the backing its view belongs
+    // to, and needs no refresh.
+    const bool proxies_on = !BbToggle::Disabled(BbToggle::SampleSceneProxies);
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
         if (!entry.id) {
             continue;
         }
+        // Each step reads an Image out of the slot array (a large array: a scene's textures are
+        // scattered over it), and the checks of one step depend on the loads of the previous
+        // one. Asking for the next two images while this one is checked overlaps those misses.
+        if (i + 1 < count && set.entries[i + 1].id) {
+            __builtin_prefetch(&texture_cache.PeekImage(set.entries[i + 1].id), 0, 1);
+        }
+        if (i + 2 < count && set.entries[i + 2].id) {
+            __builtin_prefetch(&texture_cache.PeekImage(set.entries[i + 2].id), 0, 1);
+        }
+        if (texture_cache.ImageUid(entry.id) != set.uids[i]) {
+            ++texture_set_why[1];
+            ++texture_set_misses;
+            set.key = 0;
+            return false;
+        }
         const auto& image = texture_cache.GetImage(entry.id);
         // Proxy entries need a current proxy; native entries of a proxied image go through
         // BindTextures, which may sample the proxy instead.
-        const bool proxies_on = !BbToggle::Disabled(BbToggle::SampleSceneProxies);
         if (image.backing != entry.backing || image.binding.needs_rebind ||
             image.binding.is_target || !texture_cache.IsUpToDate(entry.id) ||
             (entry.proxy ? !proxies_on ||
@@ -3696,7 +3827,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
             (upscaler->Enabled() && upscaler->RedirectsSampled(entry.id))) {
             ++texture_set_why[2];
             ++texture_set_misses;
-            set.generation = ~0ull;
+            set.key = 0;
             return false;
         }
     }
@@ -3740,15 +3871,44 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                     static_cast<unsigned long long>(begin_memo_misses),
                     static_cast<unsigned long long>(texture_set_hits),
                     static_cast<unsigned long long>(texture_set_misses));
-        std::printf("  texture set misses: other key %llu, generation %llu, image check %llu, "
+        std::printf("  texture set misses: other key %llu, image uid %llu, image check %llu, "
                     "other %llu\n",
                     (unsigned long long)texture_set_why[0], (unsigned long long)texture_set_why[1],
                     (unsigned long long)texture_set_why[2], (unsigned long long)texture_set_why[3]);
         std::printf("  scene proxies sampled directly: %llu bindings\n",
                     static_cast<unsigned long long>(proxy_samples));
+        std::printf("  render targets: %llu memo hits, %llu misses; samplers: %llu hits, "
+                    "%llu misses (helper %llu/%llu)\n",
+                    static_cast<unsigned long long>(target_memo_hits),
+                    static_cast<unsigned long long>(target_memo_misses),
+                    static_cast<unsigned long long>(sampler_memo.hits),
+                    static_cast<unsigned long long>(sampler_memo.misses),
+                    static_cast<unsigned long long>(helper_sampler_memo.hits),
+                    static_cast<unsigned long long>(helper_sampler_memo.misses));
+        // bbport: vertex input descriptions emitted against reused for the draw after it (a batch
+        // of one pipeline's draws describes the same formats).
+        std::printf("  vertex input: %llu emitted, %llu reused\n",
+                    static_cast<unsigned long long>(vertex_input_emits),
+                    static_cast<unsigned long long>(vertex_input_skips));
+        vertex_input_emits = vertex_input_skips = 0;
+        // bbport: the five dynamic-state groups (viewport, depth/stencil, primitive,
+        // rasterization, blend): how often a draw's packet left each one untouched.
+        std::printf("  dynamic state recomputed/skipped:");
+        static const char* const names[5] = {"viewport", "depth", "primitive", "raster", "blend"};
+        for (u32 i = 0; i < 5; ++i) {
+            std::printf(" %s %llu/%llu", names[i],
+                        static_cast<unsigned long long>(dynamic_state_updates[i]),
+                        static_cast<unsigned long long>(dynamic_state_skips[i]));
+        }
+        std::printf("\n");
         proxy_samples = 0;
         texture_set_why = {};
         begin_memo_hits = begin_memo_misses = texture_set_hits = texture_set_misses = 0;
+        target_memo_hits = target_memo_misses = 0;
+        sampler_memo.hits = sampler_memo.misses = 0;
+        helper_sampler_memo.hits = helper_sampler_memo.misses = 0;
+        dynamic_state_updates = {};
+        dynamic_state_skips = {};
     }
     BeginSignature signature;
     if (memo_on) {
@@ -3861,8 +4021,8 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     }
     push_data.scene_size = reduced ? SceneResolution::Pack(scene_targets->Size()) : 0;
     if (BbStats::enabled) {
-        BbStats::reduced_draws.fetch_add(reduced, std::memory_order_relaxed);
-        BbStats::scene_draws.fetch_add(scene_started, std::memory_order_relaxed);
+        BbStats::Count(BbStats::reduced_draws, reduced);
+        BbStats::Count(BbStats::scene_draws, scene_started);
     }
     RenderState state;
     state.width = instance.GetMaxFramebufferWidth();
@@ -3877,7 +4037,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         }
         auto* image = &texture_cache.GetImage(image_id);
         if (image->binding.needs_rebind) {
-            last_targets[cb].generation = ~0ULL; // FindImage may rewrite the description
+            last_targets[cb].image_uid = 0; // FindImage may rewrite the description
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             image = &texture_cache.GetImage(image_id);
         }
@@ -4113,12 +4273,17 @@ void Rasterizer::Resolve() {
     auto& mrt0_image = texture_cache.GetImage(texture_cache.FindImage(mrt0_desc, true));
     auto& mrt1_image = texture_cache.GetImage(texture_cache.FindImage(mrt1_desc, true));
 
-    ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
-                                 Regs().color_buffers[0].Address(),
-                                 Regs().color_buffers[1].Address()));
+    DrainDrawPipe();
+    if (host_markers_enabled) {
+        ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
+                                     Regs().color_buffers[0].Address(),
+                                     Regs().color_buffers[1].Address()));
+    }
     runtime.ResolveImage(&mrt0_image, &mrt1_image, mrt0_desc.view_info.range,
                          mrt1_desc.view_info.range);
-    ScopeMarkerEnd();
+    if (host_markers_enabled) {
+        ScopeMarkerEnd();
+    }
 }
 
 void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
@@ -4138,14 +4303,17 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
     sub_range.base.layer = Regs().depth_view.slice_start;
     sub_range.extent.layers = Regs().depth_view.NumSlices() - sub_range.base.layer;
 
-    ScopeMarkerBegin(fmt::format(
-        "DepthStencilCopy:DR={:#x}:SR={:#x}:DW={:#x}:SW={:#x}", regs.depth_buffer.DepthAddress(),
-        regs.depth_buffer.StencilAddress(), regs.depth_buffer.DepthWriteAddress(),
-        regs.depth_buffer.StencilWriteAddress()));
-
+    DrainDrawPipe();
+    if (host_markers_enabled) {
+        ScopeMarkerBegin(fmt::format(
+            "DepthStencilCopy:DR={:#x}:SR={:#x}:DW={:#x}:SW={:#x}", regs.depth_buffer.DepthAddress(),
+            regs.depth_buffer.StencilAddress(), regs.depth_buffer.DepthWriteAddress(),
+            regs.depth_buffer.StencilWriteAddress()));
+    }
     runtime.CopyDepthStencil(&read_image, &write_image, sub_range);
-
-    ScopeMarkerEnd();
+    if (host_markers_enabled) {
+        ScopeMarkerEnd();
+    }
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
@@ -4171,7 +4339,8 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
     DrainDrawPipe();
-    if (const VAddr watch = WatchedGpuWrite(); watch && !dst_gds && dst < watch + 0x1000 && watch < dst + num_bytes) {
+    if (const VAddr watch = WatchedGpuWrite;
+        watch && !dst_gds && dst < watch + 0x1000 && watch < dst + num_bytes) {
         static std::atomic<u32> reported{0};
         if (reported.fetch_add(1, std::memory_order_relaxed) < 20) {
             std::printf("Watch: DMA copy 0x%llx <- 0x%llx (%u bytes), dst gpu modified %d, src gpu "
@@ -4370,13 +4539,68 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
-    UpdateViewportScissorState();
-    UpdateDepthStencilState();
-    UpdatePrimitiveState(is_indexed);
-    UpdateRasterizationState();
-    UpdateColorBlendingState(pipeline);
-
+    // bbport: only the groups whose inputs changed are recomputed. On the draw pipe the packet's
+    // register blocks say what changed; without the pipe (or after a resync, which marks every
+    // block) everything is recomputed as before. CommitWith still runs every draw: it flushes
+    // whatever a previous draw left dirty.
     auto& dynamic_state = scheduler.GetDynamicState();
+    const bool tracking = DrawPipe::OnStageB();
+    const bool stats = BbStats::enabled && tracking;
+    // Without the pipe nothing says what changed: every group is recomputed, as before. A new
+    // command buffer (DynamicState::Invalidate) needs every group re-derived too, so the values
+    // are set again in it.
+    const u32 invalidation = dynamic_state.InvalidationGeneration();
+    const bool fresh = invalidation != dynamic_memo.invalidation;
+    dynamic_memo.invalidation = invalidation;
+    const u8 touched = (tracking && !fresh) ? pipe_touched_groups
+                                            : AmdGpu::DynamicStateRegGroups::AllGroups;
+    const auto changed = [touched](u8 group) { return (touched & group) != 0; };
+    const auto count = [stats](u64& updated, u64& skipped, const bool recomputed) {
+        if (!stats) {
+            return;
+        }
+        if (recomputed) {
+            ++updated;
+        } else {
+            ++skipped;
+        }
+    };
+
+    if (changed(AmdGpu::DynamicStateRegGroups::Viewport) ||
+        target_scale != dynamic_memo.target_scale || draw_jitter != dynamic_memo.draw_jitter) {
+        UpdateViewportScissorState();
+        dynamic_memo.target_scale = target_scale;
+        dynamic_memo.draw_jitter = draw_jitter;
+        count(dynamic_state_updates[0], dynamic_state_skips[0], true);
+    } else {
+        count(dynamic_state_updates[0], dynamic_state_skips[0], false);
+    }
+    const bool depth_changed = changed(AmdGpu::DynamicStateRegGroups::DepthStencil);
+    if (depth_changed) {
+        UpdateDepthStencilState();
+    }
+    count(dynamic_state_updates[1], dynamic_state_skips[1], depth_changed);
+    const bool primitive_changed = changed(AmdGpu::DynamicStateRegGroups::Primitive);
+    if (primitive_changed) {
+        UpdatePrimitiveState(is_indexed);
+    }
+    count(dynamic_state_updates[2], dynamic_state_skips[2], primitive_changed);
+    const bool raster_changed = changed(AmdGpu::DynamicStateRegGroups::Rasterization);
+    if (raster_changed) {
+        UpdateRasterizationState();
+    }
+    count(dynamic_state_updates[3], dynamic_state_skips[3], raster_changed);
+    const auto& write_masks = pipeline->GetGraphicsKey().write_masks;
+    const bool blend_changed = changed(AmdGpu::DynamicStateRegGroups::ColorBlend) ||
+                               write_masks != dynamic_memo.write_masks ||
+                               attachment_feedback_loop != dynamic_memo.feedback_loop;
+    if (blend_changed) {
+        UpdateColorBlendingState(pipeline);
+        dynamic_memo.write_masks = write_masks;
+        dynamic_memo.feedback_loop = attachment_feedback_loop;
+    }
+    count(dynamic_state_updates[4], dynamic_state_skips[4], blend_changed);
+
     dynamic_state.CommitWith(instance.IsDepthBoundsSupported(),
                              instance.IsDynamicColorWriteMaskSupported(),
                              instance.IsAttachmentFeedbackLoopLayoutSupported(),
@@ -4664,11 +4888,13 @@ void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) cons
 }
 
 void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) {
-    DrainDrawPipe();
-    if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||
-        (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
+    // bbport: markers are off unless BB_VK_MARKERS is set, and the check comes first: a marker
+    // that will not be written must not drain the parallel draw pipe (with host markers on there
+    // is no draw pipe at all, so the drain only ever matters on the path that emits).
+    if (from_guest ? !guest_markers_enabled : !host_markers_enabled) {
         return;
     }
+    DrainDrawPipe();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
@@ -4676,21 +4902,19 @@ void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) 
 }
 
 void Rasterizer::ScopeMarkerEnd(bool from_guest) {
-    DrainDrawPipe();
-    if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||
-        (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
+    if (from_guest ? !guest_markers_enabled : !host_markers_enabled) {
         return;
     }
+    DrainDrawPipe();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.endDebugUtilsLabelEXT();
 }
 
 void Rasterizer::ScopedMarkerInsert(const std::string_view& str, bool from_guest) {
-    DrainDrawPipe();
-    if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||
-        (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
+    if (from_guest ? !guest_markers_enabled : !host_markers_enabled) {
         return;
     }
+    DrainDrawPipe();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
@@ -4699,11 +4923,10 @@ void Rasterizer::ScopedMarkerInsert(const std::string_view& str, bool from_guest
 
 void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 color,
                                          bool from_guest) {
-    DrainDrawPipe();
-    if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||
-        (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
+    if (from_guest ? !guest_markers_enabled : !host_markers_enabled) {
         return;
     }
+    DrainDrawPipe();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),

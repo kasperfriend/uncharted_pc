@@ -12,7 +12,10 @@
 typedef struct Waiter {
     int32_t need, result;
     int done;
-    pthread_cond_t event;
+    /* This thread's own condition variable (see wait_event): a thread blocks on one semaphore
+       at a time, so one per thread serves every wait and none is created or destroyed per wait.
+       Signalling by pointer keeps the FIFO order: only the waiter that owns the slot wakes. */
+    pthread_cond_t *event;
     struct Waiter *next;
 } Waiter;
 typedef struct Sema {
@@ -20,15 +23,21 @@ typedef struct Sema {
     int32_t count, initial, maximum;
     unsigned active;
     int deleted;
-    Waiter *first;
+    Waiter *first, *last; /* last: O(1) append, guest job queues keep many waiters */
     struct Sema *next;
 } Sema;
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
-static Sema *registry;
+/* Looked up on every wait, signal and poll: hashed buckets (objects chain through their own
+   `next`) instead of a list walked in full. */
+enum { REGISTRY_BUCKETS = 64 };
+static Sema *registry[REGISTRY_BUCKETS];
 static uint32_t next_id=1;
 static size_t created, deleted, acquired, signaled, timed_out;
+static inline unsigned registry_bucket(uint32_t id) {
+    return (unsigned)((id*2654435761u)>>26) & (REGISTRY_BUCKETS-1);
+}
 static Sema *find(uint32_t id) {
-    for (Sema *s=registry;s;s=s->next) if (s->id==id) return s;
+    for (Sema *s=registry[registry_bucket(id)];s;s=s->next) if (s->id==id) return s;
     return NULL;
 }
 static void host_check(int e) {
@@ -46,6 +55,22 @@ static uint64_t now_ns(void) {
     if (clock_gettime(WAIT_CLOCK,&t)) { perror("clock_gettime"); exit(1); }
     return (uint64_t)t.tv_sec*1000000000+(uint64_t)t.tv_nsec;
 }
+static void host_check(int e);
+/* One condition variable per thread, created on the thread's first blocking wait and reused by
+   all of its later ones. Creating and destroying one around every wait cost four attribute calls
+   and two condition-variable calls per wait (winpthreads makes those expensive). */
+static __thread struct { pthread_cond_t cond; int ready; } wait_state;
+static pthread_cond_t *wait_event(void) {
+    if (!wait_state.ready) {
+        pthread_condattr_t attr;
+        host_check(pthread_condattr_init(&attr));
+        host_check(pthread_condattr_setclock(&attr,WAIT_CLOCK));
+        host_check(pthread_cond_init(&wait_state.cond,&attr));
+        host_check(pthread_condattr_destroy(&attr));
+        wait_state.ready=1;
+    }
+    return &wait_state.cond;
+}
 static ABI int32_t sem_create(uint32_t *out,const char *name,uint32_t attr,
                               int32_t initial,int32_t maximum,const void *options) {
     if (!out || !name || attr>2 || initial<0 || maximum<=0 || initial>maximum) return ERR(22);
@@ -55,7 +80,8 @@ static ABI int32_t sem_create(uint32_t *out,const char *name,uint32_t attr,
     pthread_mutex_lock(&lock);
     if (next_id==UINT32_MAX) { pthread_mutex_unlock(&lock); free(s); return ERR(28); }
     s->id=next_id++; s->attr=attr; s->count=s->initial=initial; s->maximum=maximum;
-    s->next=registry; registry=s; *out=s->id; ++created;
+    const unsigned bucket=registry_bucket(s->id);
+    s->next=registry[bucket]; registry[bucket]=s; *out=s->id; ++created;
     printf("Runtime: semaphore id=%u, attr=%u, initial=%d, max=%d\n",s->id,attr,initial,maximum);
     pthread_mutex_unlock(&lock);
     return 0;
@@ -73,23 +99,18 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
         /* Priority-ordered semaphores (attr 2) are served FIFO: there is no
            PS4 priority scheduler, host threads run at equal priority. */
         if (getenv("BB_TRACE_SEMA")) fprintf(stderr,"Runtime: blocking wait on semaphore %u (need %d, count %d)\n",id,need,s->count); /* deadlock diagnosis */
-        Waiter w={.need=need};
-        pthread_condattr_t attr;
-        host_check(pthread_condattr_init(&attr));
-        host_check(pthread_condattr_setclock(&attr,WAIT_CLOCK));
-        host_check(pthread_cond_init(&w.event,&attr));
-        host_check(pthread_condattr_destroy(&attr));
-        Waiter **tail=&s->first;
-        while (*tail) tail=&(*tail)->next;
-        *tail=&w; ++s->active;
+        Waiter w={.need=need,.event=wait_event()};
+        if (s->last) s->last->next=&w; else s->first=&w;
+        s->last=&w; ++s->active;
         uint64_t deadline=timeout ? now_ns()+(uint64_t)*timeout*1000 : 0;
         struct timespec end={.tv_sec=(time_t)(deadline/1000000000),.tv_nsec=(long)(deadline%1000000000)};
         while (!w.done) {
-            int e=timeout ? pthread_cond_timedwait(&w.event,&lock,&end) : pthread_cond_wait(&w.event,&lock);
+            int e=timeout ? pthread_cond_timedwait(w.event,&lock,&end) : pthread_cond_wait(w.event,&lock);
             if (e==ETIMEDOUT && !w.done) {
-                Waiter **p=&s->first;
-                while (*p!=&w) p=&(*p)->next;
-                *p=w.next; w.result=ERR(60); w.done=1; ++timed_out;
+                Waiter **p=&s->first, *prev=NULL;
+                while (*p!=&w) { prev=*p; p=&(*p)->next; }
+                *p=w.next; if (s->last==&w) s->last=prev;
+                w.result=ERR(60); w.done=1; ++timed_out;
             } else if (e!=ETIMEDOUT) host_check(e);
         }
         result=w.result;
@@ -98,7 +119,6 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
             uint64_t now=now_ns();
             *timeout=result ? 0 : (uint32_t)(now>=deadline ? 0 : (deadline-now)/1000);
         }
-        host_check(pthread_cond_destroy(&w.event));
         if (!--s->active && s->deleted) free(s);
     }
     pthread_mutex_unlock(&lock);
@@ -114,12 +134,13 @@ static ABI int32_t sem_signal(uint32_t id,int32_t count) {
     else if (count<=0 || count>s->maximum-s->count) result=ERR(22);
     else {
         s->count+=count; ++signaled;
-        Waiter **p=&s->first;
+        Waiter **p=&s->first, *prev=NULL;
         while (*p) {
             Waiter *w=*p;
-            if (w->need>s->count) { p=&w->next; continue; }
+            if (w->need>s->count) { prev=w; p=&w->next; continue; }
             s->count-=w->need; *p=w->next; w->done=1;
-            host_check(pthread_cond_signal(&w->event));
+            if (s->last==w) s->last=prev;
+            host_check(pthread_cond_signal(w->event));
         }
     }
     pthread_mutex_unlock(&lock);
@@ -130,8 +151,9 @@ static int32_t wake_all(Sema *s,int32_t result) {
     while (s->first) {
         Waiter *w=s->first; s->first=w->next;
         w->result=result; w->done=1; ++count;
-        host_check(pthread_cond_signal(&w->event));
+        host_check(pthread_cond_signal(w->event));
     }
+    s->last=NULL;
     return count;
 }
 static ABI int32_t sem_cancel(uint32_t id,int32_t count,int32_t *waiters) {
@@ -150,7 +172,7 @@ static ABI int32_t sem_cancel(uint32_t id,int32_t count,int32_t *waiters) {
 }
 static ABI int32_t sem_delete(uint32_t id) {
     pthread_mutex_lock(&lock);
-    Sema **p=&registry;
+    Sema **p=&registry[registry_bucket(id)];
     while (*p && (*p)->id!=id) p=&(*p)->next;
     if (!*p) { pthread_mutex_unlock(&lock); return ERR(3); }
     Sema *s=*p; *p=s->next; s->deleted=1; ++deleted;

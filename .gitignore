@@ -5,6 +5,7 @@ user/
 bbport.ini
 fsr4_shaders/
 pgo/
+.ccache/
 *.png
 last_run.log
 dist/

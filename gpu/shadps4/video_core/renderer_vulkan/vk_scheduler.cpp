@@ -14,12 +14,14 @@
 #endif
 #include <functional>
 
+#include "bbport_cpu.h"
 #include "bbport_copy.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/landing_gate.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/spin_wait.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -34,6 +36,15 @@ extern void (*g_gpu_stall_report)();
 bool (*g_draw_pipe_busy)() = nullptr;
 
 namespace {
+/// bbport: settings asked once per submission (or per recorded command) from static storage.
+#ifdef _WIN32
+/// BB_SUBMIT_THREADS=1 names each thread that submits through this scheduler (once).
+const bool SubmitThreads = std::getenv("BB_SUBMIT_THREADS") != nullptr;
+#endif
+const bool RecorderTrace = [] {
+    const char* env = std::getenv("BB_RECORDER_TRACE");
+    return env && env[0] == '1';
+}();
 // bbport: the last submissions to the graphics queue (all schedulers share it), printed when a
 // GPU wait stalls: which timeline value each one signals and which semaphores it waits for.
 struct SubmitRecord {
@@ -55,9 +66,13 @@ void Scheduler::ReportStall() {
     for (const auto& [scheduler, inst] : g_schedulers) {
         const VkSemaphore timeline = scheduler->work_semaphore.Handle();
         const auto [result, value] = inst->GetDevice().getSemaphoreCounterValue(timeline);
-        std::printf("GPU stall: scheduler %p timeline %p: GPU reached %llu, next tick %llu\n",
-                    static_cast<const void*>(scheduler), static_cast<void*>(timeline),
+        std::printf("GPU stall: scheduler %p ('%s') timeline %p: GPU reached %llu, last "
+                    "submitted %llu, next tick %llu\n",
+                    static_cast<const void*>(scheduler),
+                    scheduler->work_semaphore.GetName(), static_cast<void*>(timeline),
                     static_cast<unsigned long long>(value),
+                    static_cast<unsigned long long>(
+                        scheduler->work_semaphore.LastSubmitted()),
                     static_cast<unsigned long long>(scheduler->work_semaphore.CurrentTick()));
     }
     const u64 count = std::min<u64>(g_recent_count, g_recent.size());
@@ -69,6 +84,9 @@ void Scheduler::ReportStall() {
         for (u32 w = 0; w < r.waits; ++w) {
             std::printf(" %p=%llu", static_cast<void*>(r.wait_semaphore[w]),
                         static_cast<unsigned long long>(r.wait_value[w]));
+            // bbport: which timeline that is and how far it got: a wait the port can never
+            // satisfy says so here (its value is above what the owner ever submitted).
+            DescribeTimeline(r.wait_semaphore[w]);
         }
         std::printf("\n");
     }
@@ -192,11 +210,7 @@ void Scheduler::EndRendering() {
 }
 
 void Scheduler::TraceDirectRecording(void* caller) {
-    static const bool enabled = [] {
-        const char* env = std::getenv("BB_RECORDER_TRACE");
-        return env && env[0] == '1';
-    }();
-    if (!enabled) {
+    if (!RecorderTrace) {
         return;
     }
     static std::mutex mutex;
@@ -273,23 +287,35 @@ void Scheduler::WaitDeferredSignals() {
     }
     BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
     KickRecording(true);
-    while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
-        if (VideoCore::LandingGate::Stopped()) {
-            break; // shutdown: the labels waiting on the landing thread were dropped
-        }
-        // Helps the copy threads the signals wait for.
-        BbCopy::WaitAsync();
-        std::this_thread::yield();
-    }
+    // The GPU thread helps the copy threads the signals wait for. Asking the pool for work is
+    // its lock and a queue check, so the spin asks once per 256 checks instead of once per
+    // pause, and a park asks again before it yields.
+    u32 checks = 0;
+    deferred_governor.Wait(
+        [&] {
+            if (!(++checks & 255)) {
+                BbCopy::WaitAsync();
+            }
+            return deferred_signals_done->load(std::memory_order_acquire) >= issued ||
+                   VideoCore::LandingGate::Stopped();
+        },
+        [] {
+            BbCopy::WaitAsync();
+            std::this_thread::yield();
+        });
 }
 
 void Scheduler::WaitHostCopies() {
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
         BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
-        BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
+        BbStats::Count(BbStats::host_copy_waits);
         KickRecording(true);
+        u32 spins = 0;
         while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
-            std::this_thread::yield();
+            Common::CpuRelax();
+            if (!(++spins & 1023)) {
+                std::this_thread::yield();
+            }
         }
     }
     BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};
@@ -343,20 +369,29 @@ void Scheduler::SyncRecording() {
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("bb:VkRecorder");
+    // The command thread kicks this one and then waits for the chunk it carries (bbport_cpu.h).
+    BbCpu::InitSyncThread();
     while (true) {
         // Spin briefly before sleeping: the next chunk usually follows within microseconds,
         // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. With few
         // hardware threads (Steam Deck: 8) the spin would take time from guest threads.
         static const auto spin_time = std::chrono::microseconds(
             BbThreads::Available() >= 12 ? 200 : 20);
-        const auto spin_until = std::chrono::steady_clock::now() + spin_time;
-        for (u32 spins = 1; queued_chunks.load(std::memory_order_acquire) == 0; ++spins) {
-            __builtin_ia32_pause();
-            // The clock is read every 256 pauses, not per iteration.
-            if (!(spins & 255) &&
-                (stoken.stop_requested() || std::chrono::steady_clock::now() >= spin_until)) {
-                break;
-            }
+        // The clock is read at the first park, not per iteration: the governor spins for the
+        // budget this site has learned (the next chunk of the same draw follows in
+        // microseconds) and only then asks the clock whether the spin is over.
+        if (queued_chunks.load(std::memory_order_acquire) == 0) {
+            const auto spin_until = std::chrono::steady_clock::now() + spin_time;
+            recorder_governor.WaitUntilParked(
+                [&] {
+                    return queued_chunks.load(std::memory_order_acquire) != 0 ||
+                           stoken.stop_requested();
+                },
+                [&] {
+                    // Once per budget: the queue is still empty and the site has spun as long
+                    // as it ever pays to; the condition variable below blocks from here.
+                    return std::chrono::steady_clock::now() >= spin_until;
+                });
         }
         std::unique_ptr<RecordChunk> chunk;
         {
@@ -445,6 +480,9 @@ void Scheduler::PopPendingOperations() {
 }
 
 void Scheduler::AllocateWorkerCommandBuffers() {
+    // bbport: whichever thread records here (the GPU command thread or the draw recording one)
+    // is on the frame's critical path; see bbport_cpu.h. Cheap after the first call.
+    BbCpu::InitCommandThread();
     const vk::CommandBufferBeginInfo begin_info = {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
@@ -454,6 +492,8 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
+    // A new command buffer holds no binding state: everything the echo remembers is gone.
+    ClearEcho();
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -467,10 +507,8 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
-    // bbport: BB_SUBMIT_THREADS=1 names each thread that submits through this scheduler (once).
-    static const bool submit_threads = std::getenv("BB_SUBMIT_THREADS") != nullptr;
 #ifdef _WIN32
-    if (submit_threads) {
+    if (SubmitThreads) {
         static std::mutex seen_mutex;
         static std::vector<std::pair<const Scheduler*, u32>> seen;
         const u32 tid = static_cast<u32>(GetCurrentThreadId());
@@ -568,7 +606,11 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         }
     }
     ImGui::Core::TextureManager::Submit();
+    // bbport: the tick this submission carries, so a stall report can tell a tick the queue never
+    // took (a submit still in progress) from one the GPU has not reached (see DescribeTimeline).
+    work_semaphore.NoteSubmitting(signal_value);
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    work_semaphore.NoteSubmitted(signal_value);
     if (submit_result == vk::Result::eErrorDeviceLost) {
         std::printf("Device lost during submit\n");
         DeviceLost(instance.GetDevice());
