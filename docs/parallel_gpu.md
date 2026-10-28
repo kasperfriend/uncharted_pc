@@ -72,6 +72,14 @@ Rejected: "hot pages" (never re-protect pages written repeatedly, upload them on
 binding) — the set grew to ~14k pages, re-uploads dropped the frame rate to 33 FPS and a GPU
 ring timeout followed. Left opt-in behind BB_HOT_PAGES=1.
 
+Rejected: a repeat memo in the barrier tracker. A draw ends with one access per bound buffer and
+the next draw binds the same ranges, so the insert looked like a search for a node the tree
+already holds. Measured on the tracker itself (`FindRange` against the memo), that search is
+**1.1 ns** — the tracker's hash of the resource picks one of 64 roots, so each bucket holds the
+few ranges of one buffer and the walk is two or three compares. The memo (index, 16 slots,
+comparison) costs **3.0 ns**, and it has to be dropped whenever the tree loses coverage. The
+insert stays as it is.
+
 Texture description cache 2-way/4096, same-target fast path, LRU touch skip, no per-texture
 meta lookup: other outdoor view, 93.9 FPS; with the texture memos off (mask 1056) 65.6 FPS.
 Close to the 100 Hz display cap (vblank-paced), so further gains need an uncapped test.
