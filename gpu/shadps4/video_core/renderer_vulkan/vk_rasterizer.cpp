@@ -3660,13 +3660,13 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
     const u32 num_color = std::bit_width(key.mrt_mask);
     for (u32 cb = 0; cb < num_color && cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
         sig.ids[cb] = cb_descs[cb].first;
+        // The uid in the same pass: a signature is built per draw, and eight more slot lookups
+        // for the targets this draw does not use are eight lookups nobody reads.
+        sig.uids[cb] = cb_descs[cb].first ? texture_cache.ImageUid(cb_descs[cb].first) : 0;
         if (cb_descs[cb].first) {
             sig.views[cb] = cb_descs[cb].second.view_info;
         }
         sig.color_samples[cb] = key.color_samples[cb];
-    }
-    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
-        sig.uids[cb] = sig.ids[cb] ? texture_cache.ImageUid(sig.ids[cb]) : 0;
     }
     sig.ids[AmdGpu::NUM_COLOR_BUFFERS] = db_desc.first;
     sig.uids[AmdGpu::NUM_COLOR_BUFFERS] =
