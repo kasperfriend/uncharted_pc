@@ -182,8 +182,8 @@ written into the source, and both halves of that were wrong on the machine the p
   drops to the 5-microsecond floor until its waits are short again. Six such helpers spinning
   their way to a fixed 200-microsecond deadline cost the machine 10.4–10.5 % of six threads in
   `tests/bench_wait.cpp`; governed, 5.6–6.4 % of them (**−43 % … −46 %** over runs of the same
-  host), and the pickup of the work they wait for is no slower (p50 495–512 µs against 81–111 µs
-  on those runs).
+  host), and the pickup of the work they wait for is no slower (p50 495–512 µs against
+  81–111 µs on those runs).
 
 The sites converted: `DrawPipe::Drain` (stage A waiting for stage B), `DrawPipe::WaitForSpace`,
 stage B's idle wait, `BindHelper::Join` (which spun with no yield at all: a helper that lost its
@@ -465,7 +465,14 @@ image search they were meant to skip.
   to 32 bytes of one info. A stage appends its buffers, then its images, then its samplers, so
   the infos of consecutive writes are consecutive entries of one vector: the writes are copied
   one run at a time (`vk_pipeline_common.cpp`), 20 writes in 4 calls instead of 21. The loop
-  costs 1.5× less (70 → 46 ns per draw, `tests/bench_record_data.cpp`).
+  costs 1.5× less (70 → 46 ns per draw, `tests/bench_record_data.cpp`). The writes themselves
+  no longer live in a `std::vector` that is cleared and resized per draw either: `resize()`
+  value-initializes every entry it adds — 80 bytes, for every descriptor, before the binding
+  code writes the fields it fills anyway — so they are a buffer of slots that is grown but
+  never shrunk, and the draw only says how many of them it used (`BbToggle::DescriptorSlots`).
+  Staging 16 descriptors costs 33.5 → 19.8 ns per draw, 32 of them 58.2 → 38.9 ns
+  (`tests/bench_echo.cpp`), and a slot is fully written by `Rasterizer::DescriptorWrite()`
+  because a reused slot would otherwise carry the pointers of the draw before it.
 - **Dynamic state.** Every draw derives its Vulkan dynamic state from a handful of register
   groups: the viewports and the three scissors, depth and stencil state, the primitive state, the
   line width and the blend state. That is ~30-45 ns of arithmetic per draw
@@ -504,6 +511,23 @@ image search they were meant to skip.
   dropped when the scheduler's invalidating count moves (a new command buffer needs the state
   again), which is the same edge `UpdateDynamicState` uses. `BB_FRAME_STATS=1` prints emitted
   against reused, and `BbToggle::VertexInputMemo` turns it off.
+- **Commands that restate the command buffer (`common/binding_echo.h`).** A draw is five
+  commands, and most of them only restate state the command buffer already holds: every draw of
+  a material binds the same pipeline, every draw of a pass pushes the same constants, the next
+  batch of a mesh rebinds its vertex buffer, the next stream keeps its index buffer. The
+  recorder cannot know that — only the state holder can — so the scheduler keeps one memo per
+  kind of binding (pipeline per bind point, push constants by layout/stage mask/bytes, vertex
+  buffers by count/handles/offsets/sizes/strides, index buffer by handle/offset/type) and each
+  recorded command asks it first. A repeat records nothing: not the driver call, not the
+  closure, not the arrays the command points at. A near miss records, and the comparisons are
+  cheap by construction — the first handle of a vertex binding differs for almost every draw,
+  so one compare decides those, and the rest of the list is compared only for a real repeat
+  (`tests/bench_echo.cpp`; 38 % of a modelled scene pass's commands are repeats, 5.00 → 3.12
+  per draw). The memos describe one command buffer, so `AllocateWorkerCommandBuffers()` clears
+  them. `tests/test_binding_echo.cpp` checks every repeat that must drop and every near miss
+  that must not — one changed byte, handle, offset, size, stride, count, layout or stage mask —
+  under ASan and UBSan, because a wrong skip here is a wrong picture. `BB_FRAME_STATS=1` prints
+  what a frame dropped, and `BbToggle::BindingEcho` turns the memo off.
 - **Buffer uses.** `NoteGpuUse` stamps the frame on every 4 KiB page a binding touches, in an
   8 MiB table of `u32`. A batch of draws binds the same vertex stream, the same constants and
   the same storage buffers again and again, and stamping a page that already carries this frame
@@ -594,6 +618,12 @@ decides about images the frame just used, not about a heap that changed in the l
 same `.github/actions/windows-build` the release uses) and runs the host-side tests on Linux
 (`tools/ci/linux-tests.sh` plus the launcher's tests). `.github/workflows/release.yml` builds
 `dist/uncharted-windows.zip` on demand and attaches it, with its SHA-256, to a GitHub release.
+
+`tools/ci/linux-tests.sh` stages the host-side checks one at a time — the instruction rewriting,
+the guest runtime's synchronization and file layer, the bit arrays, the page-use table, the
+register fold, the per-draw benches, the binding echo (`tests/test_binding_echo.cpp`,
+`tests/bench_echo.cpp`) — then reruns the memory-checking ones under ASan and UBSan and the guest
+synchronization under ThreadSanitizer.
 
 A failed build step's log is only reachable through a signed URL, so the Windows build step
 tees the build output and turns the error lines into annotations of the run and the tail into the

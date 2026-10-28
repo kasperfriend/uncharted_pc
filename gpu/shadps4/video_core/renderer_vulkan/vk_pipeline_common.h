@@ -57,8 +57,28 @@ public:
         return is_compute;
     }
 
-    using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
-    void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
+    /// bbport: the writes of one draw: a buffer of slots and how many of them are in use
+    /// (Rasterizer::set_writes, BbToggle::DescriptorSlots). Not a std::vector: its resize()
+    /// value-initializes every new entry -- 80 bytes each, per draw -- before the binding code
+    /// writes the fields it fills anyway.
+    struct DescriptorWrites {
+        vk::WriteDescriptorSet* data{};
+        u32 count{};
+
+        [[nodiscard]] bool Empty() const noexcept {
+            return count == 0;
+        }
+        [[nodiscard]] vk::WriteDescriptorSet* begin() const noexcept {
+            return data;
+        }
+        [[nodiscard]] vk::WriteDescriptorSet* end() const noexcept {
+            return data + count;
+        }
+        [[nodiscard]] vk::WriteDescriptorSet& operator[](u32 index) const noexcept {
+            return data[index];
+        }
+    };
+    void BindResources(DescriptorWrites set_writes, const Shader::PushData& push_data) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;

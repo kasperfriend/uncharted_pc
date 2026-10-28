@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <mutex>
 #include <vector>
 
@@ -418,7 +419,35 @@ private:
     boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
 
     u32 set_write_index{};
-    Pipeline::DescriptorWrites set_writes;
+    /// bbport: the descriptor writes of the draw being prepared, as a buffer of slots that is
+    /// grown but never shrunk (DescriptorSlots): `set_writes` used to be cleared and resized on
+    /// every draw, and a vector's resize() value-initializes the new entries -- 80 bytes each,
+    /// for every descriptor of every draw, before the binding code writes them anyway.
+    std::vector<vk::WriteDescriptorSet> set_writes;
+    u32 num_set_writes{};
+    void ReserveSetWrites(u32 count) {
+        if (set_writes.size() < count) {
+            set_writes.resize(std::max<size_t>(count, 64));
+        }
+        num_set_writes = count;
+    }
+    /// bbport: the write slot of the next descriptor. The slots are reused between draws, so
+    /// every pointer a write does not use is nulled here rather than left over from the draw
+    /// that had this slot last.
+    vk::WriteDescriptorSet& DescriptorWrite(u32& write_index, u32 binding, u32 descriptor_count,
+                                            vk::DescriptorType type) {
+        auto& write = set_writes[write_index++];
+        write.pNext = nullptr;
+        write.dstSet = VK_NULL_HANDLE;
+        write.dstBinding = binding;
+        write.dstArrayElement = 0;
+        write.descriptorCount = descriptor_count;
+        write.descriptorType = type;
+        write.pImageInfo = nullptr;
+        write.pBufferInfo = nullptr;
+        write.pTexelBufferView = nullptr;
+        return write;
+    }
     Shader::PushData push_data;
 
     // bbport: bindings point at their description instead of copying it (a hot spot): into

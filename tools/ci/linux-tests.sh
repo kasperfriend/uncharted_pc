@@ -196,6 +196,18 @@ echo '== draw setup: env flags, vertex input state, sampler lookups'
 # ... and what one such lookup costs against the zero-filled 256-byte key it replaced. XXH3 comes
 # from the GPU build's dependency, so in a plain checkout the bench hashes with a local fold and
 # says so.
+# The binding echo (common/binding_echo.h): the memos that drop a command restating what the
+# command buffer already has live. A wrong skip is a wrong picture and no assertion catches it,
+# so the checks are exact: every repeat must drop, every near miss must record.
+echo '== binding echo (commands that restate the command buffer)'
+"$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_binding_echo.cpp \
+    -o "$out/binding-echo-test"
+"$out/binding-echo-test" | tail -2
+echo '== what the binding echo and the kept descriptor slots take off a draw'
+"$cxx" -std=c++20 -O2 -g -march=x86-64-v2 -mavx -mf16c -mno-avx2 -mno-fma -mno-bmi \
+    -mno-bmi2 -mtune=core-avx-i -mprefer-vector-width=128 -Wall -Wextra -Werror \
+    -Igpu/shadps4 tests/bench_echo.cpp -o "$out/bench-echo"
+"$out/bench-echo"
 # What a draw's descriptor writes cost in the recording chunk: one RecordData() call per write
 # against one per contiguous run (video_core/renderer_vulkan/vk_pipeline_common.cpp).
 echo '== descriptor writes per draw in the recording chunk'
@@ -212,7 +224,8 @@ echo '== target memo lookup cost (256-byte zero-filled key against the per-call 
 # vector and the span is memory the previous query left behind.
 if "$cxx" -fsanitize=address,undefined -x c++ -c /dev/null -o /dev/null 2>/dev/null; then
     echo '== page stamp, residency span and memo keys, ASan + UBSan'
-    for source in tests/test_page_stamp.cpp tests/test_resident_span.cpp tests/test_byte_key.cpp; do
+    for source in tests/test_page_stamp.cpp tests/test_resident_span.cpp tests/test_byte_key.cpp \
+                  tests/test_binding_echo.cpp; do
         "$cxx" -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
             -Igpu/shadps4 "$source" -o "$out/sanitized-test"
         "$out/sanitized-test" | tail -1

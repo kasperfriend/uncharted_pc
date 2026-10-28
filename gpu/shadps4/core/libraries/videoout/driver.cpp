@@ -468,6 +468,20 @@ void VideoOutDriver::Flip(const Request& req) {
                         BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
+            // bbport: what the binding echo dropped (common/binding_echo.h): commands that only
+            // restated state the command buffer already had live.
+            const u64 echoed_pipes = BbStats::echoed_pipelines.exchange(0);
+            const u64 echoed_pushes = BbStats::echoed_pushes.exchange(0);
+            const u64 echoed_vbs = BbStats::echoed_vertex_binds.exchange(0);
+            const u64 echoed_ibs = BbStats::echoed_index_binds.exchange(0);
+            if (const u64 echoed = echoed_pipes + echoed_pushes + echoed_vbs + echoed_ibs;
+                echoed != 0 && frames != 0) {
+                std::printf("Binding echo: %.1f commands per frame dropped (pipelines %.1f, push "
+                            "constant blocks %.1f, vertex binds %.1f, index binds %.1f)\n",
+                            double(echoed) / frames, double(echoed_pipes) / frames,
+                            double(echoed_pushes) / frames, double(echoed_vbs) / frames,
+                            double(echoed_ibs) / frames);
+            }
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
             if (intervals.size() > 2) {
                 std::vector<double> sorted = intervals;
