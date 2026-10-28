@@ -394,7 +394,7 @@ image search they were meant to skip.
   compares. It is not shared with the texture binding helper, which binds on another thread, and
   every entry carries the texture cache's `SamplerEpoch()`, which a sampler collection bumps: a
   collected sampler's handle is destroyed, and an entry filled before that is no hit.
-  `BB_DCB_STATS=1` reports its hits and misses next to the render target memo's.
+  `BB_FRAME_STATS=1` reports its hits and misses next to the render target memo's.
 - **Descriptor writes.** A draw's write list and the infos each write points at are copied into
   the recording chunk that the recording thread executes later. That was one `RecordData()` call
   per write -- an allocation in the chunk, its headroom checks and its two prefetches, for the 24
