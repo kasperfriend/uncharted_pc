@@ -140,15 +140,69 @@ buffer-cache copies; the GPU thread waits for them only at a fence that needs th
   instead of pulling the cache line across on every attempt. Two threads taking the same lock in
   turn: **36–45 ns → 10–13 ns** per acquire; uncontended cost unchanged.
 - `Common::SpinWait`/`SpinWaitShort` (`common/spin_wait.h`) are the same idea for the flags the
-  copy pool, the scheduler's fence waits and the presenter's frame pacing spin on: pauses for a
-  short wait, then a yield, never a sleep.
-- The presenter paces frames with pauses and one clock read in 32 instead of a yield per
-  iteration, which cost a reschedule per frame.
+  copy pool, the scheduler's fence waits and the presenter's frame pacing spin on, with the
+  length of the spin decided by the wait governor below.
+- The presenter paces frames with pauses and one clock read in 32 and **no yield at all**: a
+  yield there gave the core away (and asked the scheduler) hundreds of times in the last
+  microsecond of every frame, for a wait whose whole point is to present on time.
+- `Common::SpinLock`'s backoff doubles per round (32 → 512 pauses, then a yield): a lock held
+  through a preemption stops costing the waiting core a probe of the line every few hundred
+  cycles.
 - Debug markers (`BB_VK_MARKERS`) used to be checked *after* `DrainDrawPipe()`: with markers
   off — the default — every marker call still flushed the parallel draw pipeline, and the three
   host sites in the rasterizer built their label with `fmt::format` first. The clear/resolve/
   depth-copy paths now drain explicitly, once each instead of twice through their begin/end
   markers, and the label is only formatted when it is written.
+
+## Waiting between the port's threads (`common/wait_governor.h`)
+
+The port's threads hand work to each other many times per frame and wait for it: the GPU thread
+for the draw recorder and the bind helper, the recorder for its next packet, the copy pool's
+callers for their copies. Every one of those waits was a hand-rolled loop with a pause budget
+written into the source, and both halves of that were wrong on the machine the port runs on:
+
+- **A pause is not a fixed length.** Its cost is about five cycles on some cores and about a
+  hundred and forty on others, so `4096 pauses` is a 7-microsecond spin on one machine and a
+  190-microsecond one on another. `Gov::PauseCost()` measures it once (a loop of pauses against
+  an empty loop, best of three) and every budget is kept in cycles, so one budget means the same
+  time everywhere.
+- **A wait is not a fixed length either.** A draw packet arrives in microseconds and the next
+  frame in milliseconds, and both move with the scene; a fixed budget is therefore either a park
+  on every hand-off or a spin through the whole idle gap. `Gov::SpinGovernor` keeps an average of
+  the waits *its own site* completes and spins for about three of them (clamped to 5–200 µs
+  worth of cycles), so a burst of draws stays a pure spin with no system call and a frame's idle
+  time is waited out on the event.
+- **Yields were the expensive way out.** A site that yielded every 1024 pauses (1.7
+  microseconds of spinning) asked the scheduler hundreds of times for a wait that outlived it by
+  two orders of magnitude; the governor spends one park per budget instead, and the park is the
+  site's event where it has one (stage B's `wake`, the bind helper's `posted`, the recorder's
+  condition variable) and a yield where it has not.
+- **An idle site stops spinning through the gap.** A site whose recent waits all reached their
+  park (the draw recorder and the binding helper between frames) is spinning for nothing: it
+  drops to the 5-microsecond floor until its waits are short again. Six such helpers spinning
+  their way to a fixed 200-microsecond deadline cost the machine 10.4–10.5 % of six threads in
+  `tests/bench_wait.cpp`; governed, 5.6–6.4 % of them (**−43 % … −46 %** over runs of the same
+  host), and the pickup of the work they wait for is no slower (p50 495–512 µs against 81–111 µs
+  on those runs).
+
+The sites converted: `DrawPipe::Drain` (stage A waiting for stage B), `DrawPipe::WaitForSpace`,
+stage B's idle wait, `BindHelper::Join` (which spun with no yield at all: a helper that lost its
+core to the game's own threads spun the GPU thread at 100 %) and its idle wait,
+`Scheduler::WaitHostCopies` and `WaitDeferredSignals` (whose loop called into the copy pool --
+its mutex included -- once per *pause*, now once per park), the recorder thread's spin for work,
+`Common::SpinWait`/`SpinWaitShort`, and the copy pool's two waits. Measured on the port's own
+hand-off distribution (70 % a fraction of a microsecond, 20 % a few, 10 % a stall) in
+`tests/bench_wait.cpp`: **yields per wait 1.13 → 0.55 (−43 % … −47 % across runs)**, the
+consumer's CPU time unchanged (±0.7 %), and the wake latency unchanged at the median (0.22–0.34
+microseconds either way; the tail of a shared host is scheduler noise, not the wait).
+
+The guest kernel's small-timer wait (`EqueueInternal::WaitForSmallTimer`) was the one real CPU
+hog left on the guest side: a thread waiting for a timer read the clock, took the queue's mutex
+and asked the scheduler for another thread **on every iteration of the whole timeout**, so a
+guest thread waiting one millisecond held a core for that millisecond. It now sleeps on the
+queue's own timer condition variable until the earliest deadline (a new or removed timer notifies
+it, and the earliest-timer walk happens once per wake), which is the same measurement in the
+bench: **24.00 ms → 0.01 ms of CPU** for 24 one-millisecond timers, and no spin at all.
 
 ## Guest synchronization and range queries (`src/`)
 

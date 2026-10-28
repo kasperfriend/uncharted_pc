@@ -23,6 +23,7 @@
 #include "common/assert.h"
 #include "common/interval_set.h"
 #include "common/unique_function.h"
+#include "common/wait_governor.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
@@ -969,6 +970,12 @@ private:
     // bbport: whether recorder_thread runs, read on every Record(). std::jthread::joinable()
     // compares thread ids, which on Windows (libc++ over winpthreads) costs two system calls.
     bool recording_threaded{false};
+    /// Waits of the GPU thread that the governor schedules: host copies before a submission or
+    /// a fence, the deferred signals behind them, and the recorder thread's own spin for work.
+    Common::Gov::SpinGovernor host_copy_governor{16'000};
+    Common::Gov::SpinGovernor deferred_governor{16'000};
+    Common::Gov::SpinGovernor recorder_governor{64'000};
+
     std::jthread recorder_thread;
     tracy::VkCtxScope* profiler_scope{};
 };

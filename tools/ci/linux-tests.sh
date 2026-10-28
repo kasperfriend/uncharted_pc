@@ -247,6 +247,15 @@ else
     echo '== ThreadSanitizer not available in this compiler, skipped'
 fi
 
+# What a wait between two of the port's threads costs (common/wait_governor.h): the governor's
+# pause cost, the hand-off distribution, six idle helpers, and the guest kernel's small-timer
+# wait against the yield loop it replaced. The helper block prints negative percentages when the
+# governor is the cheaper one.
+echo '== waits: pause cost, hand-off and idle waits, guest small timers'
+"$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 -pthread \
+    tests/bench_wait.cpp -o "$out/bench-wait"
+"$out/bench-wait"
+
 echo '== streaming guest-memory copy'
 "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -mavx -Igpu/shim tests/test_stream_copy.cpp \
     gpu/shim/bbport_memcpy.cpp -o "$out/stream-copy-test"

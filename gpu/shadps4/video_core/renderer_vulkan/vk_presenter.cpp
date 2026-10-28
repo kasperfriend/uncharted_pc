@@ -744,18 +744,17 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
     const auto wait_until = [](std::chrono::steady_clock::time_point at) {
         // The system sleep is coarse: sleep most of the way, then spin. The spin is pauses with
-        // the clock read one time in 32: a yield per iteration gave the core away (and asked
-        // the scheduler) hundreds of times in the last microsecond of every frame.
+        // the clock read one time in 32 and no yield at all: a yield there gave the core away
+        // (and asked the scheduler) hundreds of times in the last microsecond of every frame,
+        // for a wait whose whole point is to present on time.
         constexpr auto spin = std::chrono::microseconds(1500);
         const auto now = std::chrono::steady_clock::now();
         if (at - now > spin) {
             std::this_thread::sleep_for(at - now - spin);
         }
-        u32 pauses = 0;
         while (std::chrono::steady_clock::now() < at) {
-            Common::CpuRelax();
-            if (!(++pauses & 32)) {
-                std::this_thread::yield();
+            for (u32 i = 0; i < 32; ++i) {
+                Common::CpuRelax();
             }
         }
     };

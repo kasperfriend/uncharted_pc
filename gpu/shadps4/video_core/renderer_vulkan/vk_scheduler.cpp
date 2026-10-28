@@ -279,20 +279,22 @@ void Scheduler::WaitDeferredSignals() {
     }
     BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
     KickRecording(true);
-    u32 spins = 0;
-    while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
-        if (VideoCore::LandingGate::Stopped()) {
-            break; // shutdown: the labels waiting on the landing thread were dropped
-        }
-        // Helps the copy threads the signals wait for.
-        BbCopy::WaitAsync();
-        // Pause instead of a system call: the signal usually lands within a few hundred cycles,
-        // and giving the core away here costs the GPU thread a reschedule.
-        Common::CpuRelax();
-        if (!(++spins & 1023)) {
+    // The GPU thread helps the copy threads the signals wait for. Asking the pool for work is
+    // its lock and a queue check, so the spin asks once per 256 checks instead of once per
+    // pause, and a park asks again before it yields.
+    u32 checks = 0;
+    deferred_governor.Wait(
+        [&] {
+            if (!(++checks & 255)) {
+                BbCopy::WaitAsync();
+            }
+            return deferred_signals_done->load(std::memory_order_acquire) >= issued ||
+                   VideoCore::LandingGate::Stopped();
+        },
+        [] {
+            BbCopy::WaitAsync();
             std::this_thread::yield();
-        }
-    }
+        });
 }
 
 void Scheduler::WaitHostCopies() {
@@ -365,14 +367,21 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
         // hardware threads (Steam Deck: 8) the spin would take time from guest threads.
         static const auto spin_time = std::chrono::microseconds(
             BbThreads::Available() >= 12 ? 200 : 20);
-        const auto spin_until = std::chrono::steady_clock::now() + spin_time;
-        for (u32 spins = 1; queued_chunks.load(std::memory_order_acquire) == 0; ++spins) {
-            __builtin_ia32_pause();
-            // The clock is read every 256 pauses, not per iteration.
-            if (!(spins & 255) &&
-                (stoken.stop_requested() || std::chrono::steady_clock::now() >= spin_until)) {
-                break;
-            }
+        // The clock is read at the first park, not per iteration: the governor spins for the
+        // budget this site has learned (the next chunk of the same draw follows in
+        // microseconds) and only then asks the clock whether the spin is over.
+        if (queued_chunks.load(std::memory_order_acquire) == 0) {
+            const auto spin_until = std::chrono::steady_clock::now() + spin_time;
+            recorder_governor.WaitUntilParked(
+                [&] {
+                    return queued_chunks.load(std::memory_order_acquire) != 0 ||
+                           stoken.stop_requested();
+                },
+                [&] {
+                    // Once per budget: the queue is still empty and the site has spun as long
+                    // as it ever pays to; the condition variable below blocks from here.
+                    return std::chrono::steady_clock::now() >= spin_until;
+                });
         }
         std::unique_ptr<RecordChunk> chunk;
         {

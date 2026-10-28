@@ -13,6 +13,7 @@
 
 #include "common/thread.h"
 #include "common/types.h"
+#include "common/wait_governor.h"
 
 namespace Vulkan {
 
@@ -71,9 +72,11 @@ public:
         const u64 target = posted.load(std::memory_order_relaxed);
         if (done.load(std::memory_order_acquire) != target) {
             const u64 start = __rdtsc();
-            while (done.load(std::memory_order_acquire) != target) {
-                __builtin_ia32_pause();
-            }
+            // The task is one draw's texture binding: microseconds. The wait is governed by
+            // what the joins have measured, and a helper that lost its core to the game's own
+            // threads costs a yield per budget instead of spinning the GPU thread at 100%.
+            join_governor.Wait([&] { return done.load(std::memory_order_acquire) == target; },
+                               [] { std::this_thread::yield(); });
             wait_cycles += __rdtsc() - start;
         }
         active = false;
@@ -89,17 +92,22 @@ private:
         on_helper = true;
         u64 seen = 0;
         while (!stop.stop_requested()) {
-            // Draws arrive every few microseconds while a frame is recorded: spin, and sleep
-            // only after a pause longer than that (between frames).
-            const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
+            // Draws arrive every few microseconds while a frame is recorded, so the wait
+            // spins; between frames it parks. The governor learns which of the two this is
+            // (an idle site stops spinning through the gap) instead of spinning to a fixed
+            // 100 us deadline between every frame.
             u64 now = posted.load(std::memory_order_acquire);
-            for (u32 spins = 1; now == seen; ++spins) {
-                __builtin_ia32_pause();
-                if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
-                    sleeping.store(true, std::memory_order_seq_cst);
-                    posted.wait(seen, std::memory_order_seq_cst);
-                    sleeping.store(false, std::memory_order_relaxed);
-                }
+            if (now == seen) {
+                idle_governor.Wait(
+                    [&] {
+                        return posted.load(std::memory_order_acquire) != seen ||
+                               stop.stop_requested();
+                    },
+                    [&] {
+                        sleeping.store(true, std::memory_order_seq_cst);
+                        posted.wait(seen, std::memory_order_seq_cst);
+                        sleeping.store(false, std::memory_order_relaxed);
+                    });
                 now = posted.load(std::memory_order_acquire);
             }
             if (stop.stop_requested()) {
@@ -117,6 +125,8 @@ private:
     Task task = nullptr;
     void* context = nullptr;
     bool active = false;
+    Common::Gov::SpinGovernor join_governor{16'000}; ///< GPU thread, per join
+    Common::Gov::SpinGovernor idle_governor{64'000}; ///< helper, between tasks
     alignas(64) std::atomic<u64> posted{0};
     alignas(64) std::atomic<u64> done{0};
     alignas(64) std::atomic<bool> sleeping{false};

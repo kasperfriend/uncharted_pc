@@ -4,6 +4,7 @@
 
 #include "common/spin_lock.h"
 
+#include <algorithm>
 #include <thread>
 
 #if _MSC_VER
@@ -36,11 +37,14 @@ void ThreadPause() {
 
 /// Pauses between two attempts at the flag: long enough that the holder's critical section
 /// (a few hundred cycles in the region manager and the page manager) finishes inside it, short
-/// enough not to add latency when the lock is contended.
+/// enough not to add latency when the lock is contended. The backoff doubles per round: a lock
+/// that is held through a preemption stops costing the waiting core a read-modify-write of the
+/// line per few hundred cycles.
 constexpr unsigned BackoffPauses = 32;
-/// Attempts after which the waiting thread lets the scheduler run the holder (the lock is
-/// never held for long, so this only happens when the holder was preempted).
-constexpr unsigned SpinsBeforeYield = 64;
+constexpr unsigned MaxBackoffPauses = 512;
+/// Rounds after which the waiting thread lets the scheduler run the holder (the lock is never
+/// held for long, so this only happens when the holder was preempted).
+constexpr unsigned SpinsBeforeYield = 2;
 
 #if defined(_MSC_VER)
 #define BB_NOINLINE __declspec(noinline)
@@ -51,13 +55,15 @@ constexpr unsigned SpinsBeforeYield = 64;
 /// Everything a waiting thread does. Out of line on purpose: lock() stays the one locked
 /// read-modify-write of the uncontended case, with no loop and no branch around it.
 BB_NOINLINE void LockSlow(std::atomic_flag& lck) {
-    for (unsigned spins = 0;; ++spins) {
+    unsigned pauses = BackoffPauses;
+    for (unsigned round = 0;;) {
         while (lck.test(std::memory_order_relaxed)) {
-            for (unsigned pause = 0; pause < BackoffPauses; ++pause) {
+            for (unsigned pause = 0; pause < pauses; ++pause) {
                 ThreadPause();
             }
-            if (spins++ >= SpinsBeforeYield) {
-                spins = 0;
+            if (++round >= SpinsBeforeYield) {
+                round = 0;
+                pauses = std::min(pauses * 2, MaxBackoffPauses);
                 std::this_thread::yield();
             }
         }

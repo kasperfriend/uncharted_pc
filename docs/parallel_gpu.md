@@ -489,6 +489,9 @@ Frame rate at the level entrance, 16 threads, FSR 4 Ultra Performance: ~134 -> ~
 
 `Frame stats` now prints, next to the drain counts, the share of stage A's time each drain
 reason and each call site (`function:line`, `DrainDrawPipe` records `__builtin_LINE`) waited.
+The waits themselves (the drain spin, the ring's space wait, stage B's idle wait) are sized by
+the wait governor now, not by a fixed pause count: see `docs/PERFORMANCE.md`, "Waiting between
+the port's threads".
 Stage A waits ~25% of its time, almost all at one drain per frame: whichever drain comes first
 after a long stretch of draws waits for stage B to finish them. It was `DrawIndirect` (21%),
 then `DispatchIndirect`, then a `DumpConstRam` once those were pipelined. So stage A is faster
