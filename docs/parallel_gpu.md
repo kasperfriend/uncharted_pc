@@ -587,3 +587,59 @@ now reads guest memory for the constant ring, is not treated as a GPU-side threa
 (`IsGpuSideThreadId` accepts only stage B). Next: a run with `BB_WRITE_LOG=1` that crashes
 prints which logged write landed near the corrupted block; bisect the pipeline toggles
 (38 tasks, 39 pending fence waits, 41 recorder fences, 42 memory writes, 36 constant ring).
+
+## Device lost after fast movement: a guest address written as a device one (2026-10-28)
+
+Reported log (Windows, RTX 3080, driver 617.14.0.0, 3440x1440, FSR 3.1 frame generation 2x):
+`write to an invalid address at 0x10e765e000 (+- 0x1000)`, `instruction pointer (fault) at
+0xf004ff6c0`, after multi-second GPU stalls on one timeline and while the camera was moving fast.
+The buffer cache printed `BDA page table at GPU 0xfa8200000`, two arenas (guest
+`0x1100000000-0x1200000000` = GPU `0xfb9f10000-0x10b9f10000`, guest `0x1000000000-0x1100000000`
+= GPU `0x1117800000-0x1217800000`) and 462 resident ranges.
+
+What the numbers say:
+
+| address | where it is |
+| --- | --- |
+| `0x10e765e000` | in arena 2's **guest** range (offset `0xe765e000`), in no **device** range |
+| its block `0x10e765` | **not** resident (462 resident ranges, none covering it) |
+| if it were resident | GPU `0x1117800000 + 0xe765e000` = `0x11fee5e000` |
+| `0xf004ff6c0` (fault IP) | below the page table and both arenas: not a BDA data address |
+
+So the shader wrote to an address in the *guest* form of the arena while the page table can only
+hand out *device* addresses (`arena BDA + block offset`) and returns 0 for a page that is not
+resident (that path marks the page in the fault buffer and returns a null pointer instead). A write
+at a guest-form address therefore means a page-table entry held a guest address, and nothing in the
+resident set could account for it.
+
+Where a guest-form entry can come from. `EnsureResident` published `arena->BufferDeviceAddress() +
+(resident block address - arena.cpu_addr)` for every block of every gap it filled, *after* checking
+whether that block was inside the arena - it printed a complaint and then wrote the entry anyway.
+A range outside its arena (an arena page that was migrated by `GetArena`, a fault on an address
+outside it, an arena whose device address the driver did not hand out) produced
+`arena BDA + underflowed offset`: an address outside the arena's own memory, and for an arena with
+no device address at all, the guest address itself. Fast movement streams new pages, so those paths
+run hundreds of times a second exactly when the crash happened.
+
+Changes:
+
+- `EnsureResident` clamps a gap to the arena it is being bound into, counts it (`clipped_ranges`)
+  and prints at most 16 of them; a range that ends up empty publishes nothing. Every page-table
+  entry it writes is now inside `[arena BDA, arena BDA + size)`, i.e. a device address of a live
+  buffer. An arena whose `BufferDeviceAddress()` is 0 no longer publishes entries at all (the
+  shader's own fault path retries its pages instead of writing to guest memory as if it were
+  device memory).
+- The crash report answers "where is this address" for each fault address the driver names: the
+  page-table index and offset, which arena's guest or device range it falls in, whether its block
+  is resident, the device address it would have, the nearest resident range below and above, and
+  the last residency decisions (guest range, device address, memory, memory offset) that covered
+  the page. The nearest tracked buffer is printed even when it is far away, so a stale address
+  still names the buffer that used to own it.
+- The guest pages shaders faulted on (the port's own BDA page faults) are kept, newest last, and
+  printed with the same report: the streaming that came just before a device lost is the list of
+  pages that were made resident in the seconds before it.
+
+Verified without a GPU by replaying the reported address against the arena, resident-set and clamp
+arithmetic (`/tmp/crash_logic.cpp`, checks the guest-range verdict, the would-be device address and
+that a clamped gap never publishes an entry outside its arena). The full report and the clamp run
+only on faults, residency and the crash path: nothing here is on the per-draw path.

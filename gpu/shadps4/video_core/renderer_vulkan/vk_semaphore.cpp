@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
@@ -20,6 +21,10 @@ constexpr u64 WAIT_TIMEOUT = std::numeric_limits<u64>::max();
 void (*g_gpu_stall_report)() = nullptr;
 // bbport: more context for a GPU crash (the buffer cache's address ranges).
 void (*g_gpu_crash_context)() = nullptr;
+// bbport: the addresses the driver named for the fault (READ/WRITE/EXECUTE), so the crash
+// report can say where they are: an arena's guest or device range, a resident page or neither.
+std::array<u64, 4> g_gpu_crash_addresses{};
+u32 g_gpu_crash_address_count = 0;
 // bbport: the draws and dispatches the GPU last reached (BB_GPU_CHECKPOINTS=1).
 void (*g_gpu_checkpoint_report)() = nullptr;
 extern bool g_device_fault_ext;
@@ -58,9 +63,13 @@ namespace Vulkan {
                         static_cast<unsigned long long>(a.reportedAddress),
                         static_cast<unsigned long long>(a.addressPrecision));
         }
+        g_gpu_crash_address_count = 0;
         for (const auto& a : addresses) {
             if (a.addressType >= VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT &&
                 a.addressType <= VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT) {
+                if (g_gpu_crash_address_count < g_gpu_crash_addresses.size()) {
+                    g_gpu_crash_addresses[g_gpu_crash_address_count++] = a.reportedAddress;
+                }
                 VideoCore::DumpBuffersNear(a.reportedAddress);
                 if (AddressReportEnabled()) {
                     DumpAddressBindings(a.reportedAddress);
