@@ -463,9 +463,22 @@ void main() {
     if (tiled_offset >= info.tiled_bytes || BYTES_PER_PIXEL > info.tiled_bytes - tiled_offset) {
         return;
     }
+    // bbport: and both sides are also bounded by the descriptors this dispatch was bound, which
+    // is what the buffers really have -- not by the parameter block, which says what the host
+    // computed. The linear side used to be bounded by nothing but the texel count: a dispatch
+    // whose scratch was smaller than the mips it was told to walk wrote past it, into memory
+    // nothing maps (a lost device, a few MiB past a 16 MiB staging block), and the log of the
+    // crash never named it. length() of a runtime array is the bound of its descriptor, so
+    // neither a host that miscounted nor a stale parameter block can take this shader outside
+    // the memory it was given.
+    const uint linear_index = gl_GlobalInvocationID.x;
+    const uint tiled_index = tiled_offset / BYTES_PER_PIXEL;
+    if (linear_index >= uint(linear_data.length()) || tiled_index >= uint(tiled_data.length())) {
+        return;
+    }
     if (IS_TILER != 0) {
-        tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];
+        tiled_data[tiled_index] = linear_data[linear_index];
     } else {
-        linear_data[gl_GlobalInvocationID.x] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
+        linear_data[linear_index] = tiled_data[tiled_index];
     }
 }

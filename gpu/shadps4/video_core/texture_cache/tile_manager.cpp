@@ -253,6 +253,10 @@ void TileManager::DumpDispatches() const {
     u32 printed = 0;
     for (u64 n = total; n > oldest && printed < 8; --n) {
         const auto& r = dispatches[(n - 1) % DispatchRecords];
+        // bbport: which side the covered texels do not fit, if either (see DetileImage).
+        const char* verdict = r.covered > r.tiled_size    ? " OUT OF THE TILED BUFFER"
+                              : r.covered > r.linear_size ? " OUT OF THE LINEAR BUFFER"
+                                                          : "";
         std::printf("GPU crash:   %s #%llu %u mips %u bits %u texels (%u groups): tiled "
                     "0x%llx+0x%llx, linear 0x%llx+0x%llx, covers 0x%llx of guest 0x%llx%s\n",
                     r.tiler ? "tile" : "detile", static_cast<unsigned long long>(n - 1),
@@ -262,8 +266,7 @@ void TileManager::DumpDispatches() const {
                     static_cast<unsigned long long>(r.linear_address),
                     static_cast<unsigned long long>(r.linear_size),
                     static_cast<unsigned long long>(r.covered),
-                    static_cast<unsigned long long>(r.guest_size),
-                    r.covered > r.tiled_size ? " OUT OF THE TILED BUFFER" : "");
+                    static_cast<unsigned long long>(r.guest_size), verdict);
         ++printed;
     }
 }
@@ -330,13 +333,6 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     if (covered == 0 || info.num_bits == 0) {
         return {in_buffer, in_offset};
     }
-    // bbport: every texel of the filled mips, and no texel past the last one (the shader stops
-    // at num_texels), so the dispatch cannot address outside the buffers it was given.
-    const u32 texels = static_cast<u32>(
-        std::min<u64>(covered / (info.num_bits / 8), std::numeric_limits<u32>::max()));
-    const u32 dim_x = (texels + 63) / 64;
-    params.num_texels = texels;
-
     // bbport: the tiled side is bound for the image's guest size, but the buffer behind it can
     // hold less than that after the offset (an image at the end of an arena chunk, a staging
     // block): the descriptor range is cut to what is there and the shader drops the texels the
@@ -348,16 +344,37 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     const u64 tiled_bytes = std::min<u64>(info.guest_size, in_buffer->SizeBytes() - in_offset);
     params.tiled_bytes = static_cast<u32>(std::min<u64>(tiled_bytes, ~u32{0}));
 
+    // bbport: the linear side is this dispatch's own scratch and the shader writes all the
+    // covered texels into it, so the dispatch is sized from what the pool granted and not from
+    // what was asked for. A texel the linear side has no room for is not dispatched (the shader
+    // drops it as well: the descriptor is the bound now, see tiling.comp).
+    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
+    if (staging.size < info.guest_size) {
+        return {in_buffer, in_offset};
+    }
+    if (covered > staging.size) {
+        static std::atomic<u32> printed{0};
+        if (printed.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::printf("Tiling: detile of a %ux%u image: the covered 0x%llx bytes do not fit the "
+                        "0x%llx-byte scratch it was given; dispatching what fits\n",
+                        info.size.width, info.size.height,
+                        static_cast<unsigned long long>(covered),
+                        static_cast<unsigned long long>(staging.size));
+        }
+    }
+    const u64 linear_bytes = std::min<u64>(covered, staging.size);
+    // bbport: every texel of the filled mips, and no texel past the last one (the shader stops
+    // at num_texels), so the dispatch cannot address outside the buffers it was given.
+    const u32 texels = static_cast<u32>(std::min<u64>(
+        linear_bytes / (info.num_bits / 8), std::numeric_limits<u32>::max()));
+    const u32 dim_x = (texels + 63) / 64;
+    params.num_texels = texels;
+
     const vk::DescriptorBufferInfo params_buffer_info{
         .buffer = stream_buffer.Handle(),
         .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
         .range = sizeof(params),
     };
-
-    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
-    if (staging.size < info.guest_size) {
-        return {in_buffer, in_offset};
-    }
 
     scheduler.EndRendering();
     runtime.FlushBarriers();
@@ -370,12 +387,12 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     const vk::DescriptorBufferInfo linear_buffer_info{
         .buffer = staging.buffer->Handle(),
         .offset = staging.offset,
-        .range = info.guest_size,
+        .range = staging.size,
     };
-    NoteDispatch({.tiled_address = in_buffer->BufferDeviceAddress(),
-                  .tiled_size = in_buffer->SizeBytes(),
-                  .linear_address = staging.buffer->BufferDeviceAddress(),
-                  .linear_size = staging.buffer->SizeBytes(),
+    NoteDispatch({.tiled_address = in_buffer->BufferDeviceAddress() + in_offset,
+                  .tiled_size = in_buffer->SizeBytes() - in_offset,
+                  .linear_address = staging.buffer->BufferDeviceAddress() + staging.offset,
+                  .linear_size = staging.size,
                   .covered = covered,
                   .guest_size = info.guest_size,
                   .dim_x = dim_x,
@@ -428,12 +445,6 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     if (covered == 0 || info.num_bits == 0) {
         return;
     }
-    // bbport: every texel of the filled mips, and no texel past the last one (see DetileImage).
-    const u32 texels = static_cast<u32>(
-        std::min<u64>(covered / (info.num_bits / 8), std::numeric_limits<u32>::max()));
-    const u32 dim_x = (texels + 63) / 64;
-    params.num_texels = texels;
-
     // bbport: see DetileImage: the tiler writes the tiled side, so that range is cut to the
     // buffer and the shader drops the texels it would put past it.
     if (out_offset >= out_buffer->SizeBytes()) {
@@ -446,6 +457,24 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     if (staging.size < info.guest_size) {
         return;
     }
+    // bbport: the download below fills this dispatch's linear side and the shader reads all the
+    // covered texels from it, so both are sized from what the pool granted (see DetileImage).
+    if (covered > staging.size) {
+        static std::atomic<u32> printed{0};
+        if (printed.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::printf("Tiling: tile of a %ux%u image: the covered 0x%llx bytes do not fit the "
+                        "0x%llx-byte scratch it was given; tiling what fits\n",
+                        info.size.width, info.size.height,
+                        static_cast<unsigned long long>(covered),
+                        static_cast<unsigned long long>(staging.size));
+        }
+    }
+    const u64 linear_bytes = std::min<u64>(covered, staging.size);
+    // bbport: every texel of the filled mips, and no texel past the last one (see DetileImage).
+    const u32 texels = static_cast<u32>(
+        std::min<u64>(linear_bytes / (info.num_bits / 8), std::numeric_limits<u32>::max()));
+    const u32 dim_x = (texels + 63) / 64;
+    params.num_texels = texels;
 
     const vk::DescriptorBufferInfo params_buffer_info{
         .buffer = stream_buffer.Handle(),
@@ -467,12 +496,12 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     const vk::DescriptorBufferInfo linear_buffer_info{
         .buffer = staging.buffer->Handle(),
         .offset = staging.offset,
-        .range = info.guest_size,
+        .range = staging.size,
     };
-    NoteDispatch({.tiled_address = out_buffer->BufferDeviceAddress(),
-                  .tiled_size = out_buffer->SizeBytes(),
-                  .linear_address = staging.buffer->BufferDeviceAddress(),
-                  .linear_size = staging.buffer->SizeBytes(),
+    NoteDispatch({.tiled_address = out_buffer->BufferDeviceAddress() + out_offset,
+                  .tiled_size = out_buffer->SizeBytes() - out_offset,
+                  .linear_address = staging.buffer->BufferDeviceAddress() + staging.offset,
+                  .linear_size = staging.size,
                   .covered = covered,
                   .guest_size = info.guest_size,
                   .dim_x = dim_x,

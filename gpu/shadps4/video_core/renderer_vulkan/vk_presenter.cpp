@@ -136,6 +136,10 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
+    // bbport: the stall report names these timelines (see Scheduler::ReportStall).
+    draw_scheduler.SetTimelineName("draw");
+    present_scheduler.SetTimelineName("present");
+    flip_scheduler.SetTimelineName("flip");
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
 

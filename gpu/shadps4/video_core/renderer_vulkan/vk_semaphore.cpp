@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <vector>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -15,7 +17,6 @@
 
 namespace Vulkan {
 
-constexpr u64 WAIT_TIMEOUT = std::numeric_limits<u64>::max();
 // bbport: called once by a GPU wait that has blocked for 5 seconds (the scheduler prints what
 // the queue is waiting for).
 void (*g_gpu_stall_report)() = nullptr;
@@ -103,6 +104,38 @@ namespace Vulkan {
     std::_Exit(5);
 }
 
+namespace {
+// bbport: every timeline the port creates, so the stall report can name the one a submission
+// waits for and say how far it got. Guarded (submissions are made from several threads) and
+// deliberately leaked: a timeline destroyed after this vector was destroyed at exit would
+// otherwise write into freed memory.
+std::mutex& TimelinesMutex() {
+    static auto* mutex = new std::mutex;
+    return *mutex;
+}
+
+std::vector<const Semaphore*>& Timelines() {
+    static auto* timelines = new std::vector<const Semaphore*>;
+    return *timelines;
+}
+} // Anonymous namespace
+
+void DescribeTimeline(vk::Semaphore handle) {
+    std::scoped_lock lk{TimelinesMutex()};
+    for (const Semaphore* timeline : Timelines()) {
+        if (timeline->Handle() != handle) {
+            continue;
+        }
+        std::printf(" ['%s': GPU %llu, submitted %llu, next %llu%s]", timeline->GetName(),
+                    static_cast<unsigned long long>(timeline->KnownGpuTick()),
+                    static_cast<unsigned long long>(timeline->LastSubmitted()),
+                    static_cast<unsigned long long>(timeline->CurrentTick()),
+                    timeline->Submitting() ? " (inside a queue submit)" : "");
+        return;
+    }
+    std::printf(" [not a timeline of the port]");
+}
+
 Semaphore::Semaphore(const Instance& instance_) : instance{instance_} {
     const vk::StructureChain semaphore_chain = {
         vk::SemaphoreCreateInfo{},
@@ -116,9 +149,16 @@ Semaphore::Semaphore(const Instance& instance_) : instance{instance_} {
     ASSERT_MSG(semaphore_result == vk::Result::eSuccess, "Failed to create master semaphore: {}",
                vk::to_string(semaphore_result));
     semaphore = std::move(sem);
+    {
+        std::scoped_lock lk{TimelinesMutex()};
+        Timelines().push_back(this);
+    }
 }
 
-Semaphore::~Semaphore() = default;
+Semaphore::~Semaphore() {
+    std::scoped_lock lk{TimelinesMutex()};
+    std::erase(Timelines(), this);
+}
 
 void Semaphore::Refresh() {
     u64 this_tick{};
@@ -155,20 +195,33 @@ void Semaphore::Wait(u64 tick) {
     };
 
     constexpr u64 StallReport = 5'000'000'000ull;
-    bool reported = false;
+    u32 reports = 0;
     vk::Result result;
-    while ((result = instance.GetDevice().waitSemaphores(
-                &wait_info, reported ? WAIT_TIMEOUT : StallReport)) != vk::Result::eSuccess) {
+    // bbport: the first timeout prints what the queue is waiting for (the schedulers' timelines
+    // and the last submissions, see Scheduler::ReportStall). The wait used to go on with no
+    // timeout at all, so a device that never advances hung the game with nothing more in the log;
+    // it is re-asked every 5 s now and the report is repeated (12 times), so a log ends with
+    // what was stuck instead of ending nowhere.
+    while ((result = instance.GetDevice().waitSemaphores(&wait_info, StallReport)) !=
+           vk::Result::eSuccess) {
         if (result == vk::Result::eErrorDeviceLost) {
             DeviceLost(instance.GetDevice());
         }
-        if (!reported && g_gpu_stall_report) {
-            std::printf("GPU stall: waiting 5 s for tick %llu of timeline %p\n",
-                        static_cast<unsigned long long>(tick),
+        if (result != vk::Result::eTimeout) {
+            // Any other failure leaves a timeline that will not advance: report and end, the game
+            // cannot continue with a GPU that is gone (this used to loop forever).
+            std::printf("GPU stall: waiting for tick %llu of timeline '%s' failed: %s\n",
+                        static_cast<unsigned long long>(tick), GetName(),
+                        vk::to_string(result).c_str());
+            DeviceLost(instance.GetDevice());
+        }
+        if (g_gpu_stall_report && reports < 12) {
+            ++reports;
+            std::printf("GPU stall: waiting %u s for tick %llu of timeline '%s' (%p)\n",
+                        reports * 5u, static_cast<unsigned long long>(tick), GetName(),
                         reinterpret_cast<void*>(static_cast<VkSemaphore>(Handle())));
             g_gpu_stall_report();
         }
-        reported = true;
     }
     Refresh();
 }

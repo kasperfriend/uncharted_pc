@@ -1010,6 +1010,12 @@ public:
         return &work_semaphore;
     }
 
+    /// bbport: names this scheduler's timeline for the GPU stall report ("draw", "present",
+    /// "flip"), so a wait that never completes says whose timeline it waits for.
+    void SetTimelineName(const char* timeline_name) noexcept {
+        work_semaphore.SetName(timeline_name);
+    }
+
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Will be run when submitting or calling PopPendingOperations.
     void DeferOperation(Common::UniqueFunction<void>&& func) {

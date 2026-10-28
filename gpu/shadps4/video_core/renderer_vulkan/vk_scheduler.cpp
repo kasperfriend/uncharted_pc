@@ -66,9 +66,13 @@ void Scheduler::ReportStall() {
     for (const auto& [scheduler, inst] : g_schedulers) {
         const VkSemaphore timeline = scheduler->work_semaphore.Handle();
         const auto [result, value] = inst->GetDevice().getSemaphoreCounterValue(timeline);
-        std::printf("GPU stall: scheduler %p timeline %p: GPU reached %llu, next tick %llu\n",
-                    static_cast<const void*>(scheduler), static_cast<void*>(timeline),
+        std::printf("GPU stall: scheduler %p ('%s') timeline %p: GPU reached %llu, last "
+                    "submitted %llu, next tick %llu\n",
+                    static_cast<const void*>(scheduler),
+                    scheduler->work_semaphore.GetName(), static_cast<void*>(timeline),
                     static_cast<unsigned long long>(value),
+                    static_cast<unsigned long long>(
+                        scheduler->work_semaphore.LastSubmitted()),
                     static_cast<unsigned long long>(scheduler->work_semaphore.CurrentTick()));
     }
     const u64 count = std::min<u64>(g_recent_count, g_recent.size());
@@ -80,6 +84,9 @@ void Scheduler::ReportStall() {
         for (u32 w = 0; w < r.waits; ++w) {
             std::printf(" %p=%llu", static_cast<void*>(r.wait_semaphore[w]),
                         static_cast<unsigned long long>(r.wait_value[w]));
+            // bbport: which timeline that is and how far it got: a wait the port can never
+            // satisfy says so here (its value is above what the owner ever submitted).
+            DescribeTimeline(r.wait_semaphore[w]);
         }
         std::printf("\n");
     }
@@ -599,7 +606,11 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         }
     }
     ImGui::Core::TextureManager::Submit();
+    // bbport: the tick this submission carries, so a stall report can tell a tick the queue never
+    // took (a submit still in progress) from one the GPU has not reached (see DescribeTimeline).
+    work_semaphore.NoteSubmitting(signal_value);
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    work_semaphore.NoteSubmitted(signal_value);
     if (submit_result == vk::Result::eErrorDeviceLost) {
         std::printf("Device lost during submit\n");
         DeviceLost(instance.GetDevice());
