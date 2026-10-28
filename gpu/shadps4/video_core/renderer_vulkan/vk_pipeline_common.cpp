@@ -57,19 +57,45 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
         scheduler.ReserveRecordData(bytes);
         const auto writes = scheduler.RecordData(std::span<const vk::WriteDescriptorSet>{set_writes});
         auto* patched = const_cast<vk::WriteDescriptorSet*>(writes.data());
-        for (size_t i = 0; i < writes.size(); ++i) {
-            auto& write = patched[i];
-            if (write.pBufferInfo) {
-                write.pBufferInfo = scheduler.RecordData(std::span{write.pBufferInfo, write.descriptorCount}).data();
+        // A stage appends its buffers, then its images, then its samplers, so the infos of
+        // consecutive writes are usually consecutive entries of one vector: copy a run of them
+        // with one RecordData() (an allocation in the chunk, its capacity checks and its
+        // prefetches cost more than the few dozen bytes they carry) instead of one per write.
+        const size_t count = writes.size();
+        const auto coalesce = [&scheduler, patched, count](auto get, auto set) {
+            for (size_t i = 0; i < count;) {
+                const auto* base = get(patched[i]);
+                if (!base) {
+                    ++i;
+                    continue;
+                }
+                size_t total = patched[i].descriptorCount;
+                size_t j = i + 1;
+                while (j < count && get(patched[j]) == base + total) {
+                    total += patched[j].descriptorCount;
+                    ++j;
+                }
+                const auto copied = scheduler.RecordData(std::span{base, total});
+                size_t offset = 0;
+                for (size_t k = i; k < j; ++k) {
+                    set(patched[k], copied.data() + offset);
+                    offset += patched[k].descriptorCount;
+                }
+                i = j;
             }
-            if (write.pImageInfo) {
-                write.pImageInfo = scheduler.RecordData(std::span{write.pImageInfo, write.descriptorCount}).data();
-            }
-            if (write.pTexelBufferView) {
-                write.pTexelBufferView =
-                    scheduler.RecordData(std::span{write.pTexelBufferView, write.descriptorCount}).data();
-            }
-        }
+        };
+        coalesce([](const vk::WriteDescriptorSet& write) { return write.pBufferInfo; },
+                 [](vk::WriteDescriptorSet& write, const vk::DescriptorBufferInfo* infos) {
+                     write.pBufferInfo = infos;
+                 });
+        coalesce([](const vk::WriteDescriptorSet& write) { return write.pImageInfo; },
+                 [](vk::WriteDescriptorSet& write, const vk::DescriptorImageInfo* infos) {
+                     write.pImageInfo = infos;
+                 });
+        coalesce([](const vk::WriteDescriptorSet& write) { return write.pTexelBufferView; },
+                 [](vk::WriteDescriptorSet& write, const vk::BufferView* views) {
+                     write.pTexelBufferView = views;
+                 });
         scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
             cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
         });

@@ -395,6 +395,13 @@ image search they were meant to skip.
   every entry carries the texture cache's `SamplerEpoch()`, which a sampler collection bumps: a
   collected sampler's handle is destroyed, and an entry filled before that is no hit.
   `BB_DCB_STATS=1` reports its hits and misses next to the render target memo's.
+- **Descriptor writes.** A draw's write list and the infos each write points at are copied into
+  the recording chunk that the recording thread executes later. That was one `RecordData()` call
+  per write -- an allocation in the chunk, its headroom checks and its two prefetches, for the 24
+  to 32 bytes of one info. A stage appends its buffers, then its images, then its samplers, so
+  the infos of consecutive writes are consecutive entries of one vector: the writes are copied
+  one run at a time (`vk_pipeline_common.cpp`), 20 writes in 4 calls instead of 21. The loop
+  costs 1.5× less (70 → 46 ns per draw, `tests/bench_record_data.cpp`).
 - **Buffer uses.** `NoteGpuUse` stamps the frame on every 4 KiB page a binding touches, in an
   8 MiB table of `u32`. A batch of draws binds the same vertex stream, the same constants and
   the same storage buffers again and again, and stamping a page that already carries this frame

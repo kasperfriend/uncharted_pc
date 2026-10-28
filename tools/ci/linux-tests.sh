@@ -134,6 +134,13 @@ gcc "${c11[@]}" -pthread -I. -Isrc tests/test_runtime_sync.c src/runtime_sema.c 
 # ... and what one such lookup costs against the zero-filled 256-byte key it replaced. XXH3 comes
 # from the GPU build's dependency, so in a plain checkout the bench hashes with a local fold and
 # says so.
+# What a draw's descriptor writes cost in the recording chunk: one RecordData() call per write
+# against one per contiguous run (video_core/renderer_vulkan/vk_pipeline_common.cpp).
+echo '== descriptor writes per draw in the recording chunk'
+"$cxx" -std=c++20 -O2 -g -march=x86-64-v2 -mavx -mf16c -mno-avx2 -mno-fma -mno-bmi \
+    -mno-bmi2 -mtune=core-avx-i -mprefer-vector-width=128 -Wall -Wextra -Werror \
+    tests/bench_record_data.cpp -o "$out/bench-record-data"
+"$out/bench-record-data"
 echo '== target memo lookup cost (256-byte zero-filled key against the per-call key)'
 "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -march=x86-64-v2 -mavx -mf16c -mno-avx2 \
     -mno-fma -mno-bmi -mno-bmi2 -mtune=core-avx-i -mprefer-vector-width=128 -Igpu/shadps4 \
