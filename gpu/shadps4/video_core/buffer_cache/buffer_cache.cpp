@@ -1640,7 +1640,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
             backing.start << block_shift,
             backing.end << block_shift,
             event_device_address,
-            static_cast<u64>(static_cast<VkDeviceMemory>(device_memory)),
+            static_cast<u64>(reinterpret_cast<uintptr_t>(
+                static_cast<VkDeviceMemory>(device_memory))),
             memory_offset,
         };
         memory_offset += bind.size;
