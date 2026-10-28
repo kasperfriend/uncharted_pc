@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -2707,8 +2708,9 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
 
     // Map buffers for merged ranges
     static const bool force_vb_upload = std::getenv("BB_FORCE_VB_UPLOAD") != nullptr;
+    const u32 force_upload_vs = ForceUploadVs(false);
     const bool force_this_draw =
-        force_vb_upload || (ForceUploadVs(false) && ForceUploadVs(false) == current_vs_hash);
+        force_vb_upload || (force_upload_vs && force_upload_vs == current_vs_hash);
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
         if (force_this_draw) {
@@ -2773,7 +2775,8 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
     static const bool force_ib_upload = std::getenv("BB_FORCE_VB_UPLOAD") != nullptr;
-    if (force_ib_upload || (ForceUploadVs(true) && ForceUploadVs(true) == current_vs_hash)) {
+    const u32 force_upload_vs = ForceUploadVs(true);
+    if (force_ib_upload || (force_upload_vs && force_upload_vs == current_vs_hash)) {
         buffer_cache.ForceUpload(index_address, index_buffer_size);
     }
     const auto [buffer, offset] =
@@ -3321,7 +3324,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             set_write.descriptorType = vk::DescriptorType::eSampledImage;
             set_write.pImageInfo = &image_infos[first_image_idx + i];
         }
-        BindSamplers(stage, prepared, binding, write_index);
+        BindSamplers(stage, prepared, binding, write_index, false);
         return;
     }
     image_bindings.clear();
@@ -3594,17 +3597,51 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         binding.unified += array_size;
     }
 
-    BindSamplers(stage, prepared, binding, write_index);
+    BindSamplers(stage, prepared, binding, write_index, on_helper);
+}
+
+vk::Sampler Rasterizer::BindSampler(const AmdGpu::Sampler& sharp, bool is_depth, float lod_bias,
+                                    bool memo) {
+    const u64 border = Regs().ta_bc_base.base_addr;
+    const u32 epoch = memo ? texture_cache.SamplerEpoch() : 0;
+    SamplerMemoEntry* entry = nullptr;
+    if (memo) {
+        const u64 hash = sharp.raw0 * 0x9E3779B97F4A7C15ull ^ sharp.raw1 * 0xFF51AFD7ED558CCDull ^
+                         border * 0xC4CEB9FE1A85EC53ull ^
+                         u64(std::bit_cast<u32>(lod_bias)) << 5 ^ u64(is_depth);
+        entry = &sampler_memo[(hash ^ hash >> 29) & (SamplerMemoSize - 1)];
+        if (entry->valid && entry->epoch == epoch && entry->raw0 == sharp.raw0 &&
+            entry->raw1 == sharp.raw1 && entry->border == border &&
+            entry->is_depth == u32(is_depth) && entry->lod_bias == lod_bias) {
+            ++sampler_memo_hits;
+            return entry->sampler;
+        }
+        ++sampler_memo_misses;
+    }
+    const vk::Sampler sampler =
+        texture_cache.GetSampler(sharp, Regs().ta_bc_base, is_depth, lod_bias);
+    if (entry) {
+        entry->raw0 = sharp.raw0;
+        entry->raw1 = sharp.raw1;
+        entry->border = border;
+        entry->lod_bias = lod_bias;
+        entry->is_depth = u32(is_depth);
+        entry->epoch = epoch;
+        entry->valid = true;
+        entry->sampler = sampler;
+    }
+    return sampler;
 }
 
 void Rasterizer::BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
-                              Shader::Backend::Bindings& binding, u32& write_index) {
+                              Shader::Backend::Bindings& binding, u32& write_index,
+                              bool on_helper) {
     for (u32 sampler_index = 0; sampler_index < stage.samplers.size(); ++sampler_index) {
         const auto& sampler = stage.samplers[sampler_index];
         auto ssharp =
             prepared ? prepared->sampler_sharps[sampler_index] : sampler.GetSharp(stage);
-        const auto vk_sampler = texture_cache.GetSampler(
-            ssharp, Regs().ta_bc_base, sampler.is_depth, sampler.is_depth ? 0.0f : sampler_lod_bias);
+        const vk::Sampler vk_sampler = BindSampler(
+            ssharp, sampler.is_depth, sampler.is_depth ? 0.0f : sampler_lod_bias, !on_helper);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
@@ -3768,13 +3805,17 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                     (unsigned long long)texture_set_why[2], (unsigned long long)texture_set_why[3]);
         std::printf("  scene proxies sampled directly: %llu bindings\n",
                     static_cast<unsigned long long>(proxy_samples));
-        std::printf("  render targets: %llu memo hits, %llu misses\n",
+        std::printf("  render targets: %llu memo hits, %llu misses; samplers: %llu hits, "
+                    "%llu misses\n",
                     static_cast<unsigned long long>(target_memo_hits),
-                    static_cast<unsigned long long>(target_memo_misses));
+                    static_cast<unsigned long long>(target_memo_misses),
+                    static_cast<unsigned long long>(sampler_memo_hits),
+                    static_cast<unsigned long long>(sampler_memo_misses));
         proxy_samples = 0;
         texture_set_why = {};
         begin_memo_hits = begin_memo_misses = texture_set_hits = texture_set_misses = 0;
         target_memo_hits = target_memo_misses = 0;
+        sampler_memo_hits = sampler_memo_misses = 0;
     }
     BeginSignature signature;
     if (memo_on) {

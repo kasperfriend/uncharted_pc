@@ -99,12 +99,12 @@ for variant in "-O0" "-O2" "-O2 -mavx -mno-avx2" "-O2 -mavx2" "-O2 -msse4.2 -mno
     printf '   %-22s ' "$variant"
     "$out/bit-array-test" | tail -1
 done
-echo '== bit array timings (AVX 256-bit against SSE2, same source)'
-for variant in "-mavx -mno-avx2" "-mno-avx"; do
+echo '== bit array timings (the AVX1 build against the plain one, same source)'
+for variant in "-mavx -mno-avx2 -mf16c -mno-fma -mprefer-vector-width=128" "-mno-avx"; do
     # shellcheck disable=SC2086
     "$cxx" -std=c++20 -O2 -g $variant -Igpu/shadps4 tests/bench_bit_array.cpp \
         -o "$out/bench-bit-array"
-    printf '   %-18s ' "$variant"
+    printf '   %-30s ' "$variant"
     "$out/bench-bit-array"
 done
 echo '== guest semaphores and rwlocks'

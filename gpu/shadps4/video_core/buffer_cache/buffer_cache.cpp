@@ -676,6 +676,22 @@ namespace {
 constexpr VAddr GpuUseLow = 0x1000000000ull, GpuUseHigh = 0x1200000000ull;
 std::unique_ptr<u32[]> gpu_use_frame{new u32[(GpuUseHigh - GpuUseLow) >> 12]{}};
 
+/// bbport: the ranges already stamped with the current frame, per thread.
+///
+/// The page table above is one entry per 4 KiB page of an 8 GiB window -- 8 MiB, and every
+/// binding of every draw stamps its own pages. A pass binds the same buffers over and over (the
+/// same vertex stream in every draw of a batch, the constants of every draw, a storage buffer
+/// read by a whole group of draws), and stamping a page that already carries this frame writes
+/// the value it holds. A small table of the ranges stamped so far in this frame turns those
+/// repeats into one compare, instead of a handful of scattered loads into the table.
+struct StampedRange {
+    VAddr begin{};
+    VAddr end{}; ///< exclusive
+    u32 frame{};
+};
+constexpr u32 StampedSlots = 1024; ///< power of two
+thread_local std::array<StampedRange, StampedSlots> stamped_ranges{};
+
 void NoteGpuUse(VAddr address, u64 size) {
     const VAddr begin = std::max(address, GpuUseLow);
     const VAddr end = std::min(address + size, GpuUseHigh);
@@ -683,8 +699,20 @@ void NoteGpuUse(VAddr address, u64 size) {
         return;
     }
     const u32 frame = g_guest_frames.load(std::memory_order_relaxed);
+    auto& memo = stamped_ranges[((begin >> 12) * 0x9E3779B97F4A7C15ull >> 54) &
+                                (StampedSlots - 1)];
+    if (memo.frame == frame && memo.begin == begin && memo.end >= end) {
+        return;
+    }
     PageStamp::Mark(gpu_use_frame.get(), (begin - GpuUseLow) >> 12, (end - 1 - GpuUseLow) >> 12,
                     frame, !BbToggle::Disabled(BbToggle::GpuUseStamp));
+    // The pages of the old range (if it was this frame's) carry the same frame, so the wider
+    // range of both is stamped too.
+    if (memo.frame == frame && memo.begin == begin) {
+        memo.end = std::max(memo.end, end);
+    } else {
+        memo = {begin, end, frame};
+    }
 }
 
 // bbport diagnosis: the latest resolutions of CPU writes to pages holding GPU data, printed on

@@ -1307,6 +1307,7 @@ void TextureCache::GarbageCollectSamplers() {
         return;
     }
     std::scoped_lock lock{samplers_mutex};
+    const size_t samplers_before = samplers.size();
     bool pressured = false;
     bool aggresive = false;
     u64 ticks_to_destroy = 0;
@@ -1338,6 +1339,10 @@ void TextureCache::GarbageCollectSamplers() {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
         sampler_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    }
+    if (samplers.size() != samplers_before) {
+        // Destroyed handles: a memo that holds one must not hand it out again.
+        sampler_epoch.fetch_add(1, std::memory_order_relaxed);
     }
 }
 

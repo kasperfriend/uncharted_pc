@@ -386,6 +386,24 @@ image search they were meant to skip.
 - **Texture sets.** A memoized set validates per entry by uid and prefetches the next two images
   of the set: the images of one draw are scattered over a large slot array and each check
   depends on the loads of the previous one.
+- **Samplers.** Every stage of every draw asks the texture cache for the sampler of each S# it
+  binds, and the answer depends on the S# bytes, the depth flag, the LOD bias and the border
+  color base — nothing else. The cache hashes the S#, takes a mutex, probes a hash map and
+  touches an LRU entry; a frame binds the same handful of S#s over and over. A 512-entry
+  direct-mapped table of the answers serves the repeats: two multiplies, a mask and five
+  compares. It is not shared with the texture binding helper, which binds on another thread, and
+  every entry carries the texture cache's `SamplerEpoch()`, which a sampler collection bumps: a
+  collected sampler's handle is destroyed, and an entry filled before that is no hit.
+  `BB_DCB_STATS=1` reports its hits and misses next to the render target memo's.
+- **Buffer uses.** `NoteGpuUse` stamps the frame on every 4 KiB page a binding touches, in an
+  8 MiB table of `u32`. A batch of draws binds the same vertex stream, the same constants and
+  the same storage buffers again and again, and stamping a page that already carries this frame
+  writes the value it holds. A per-thread table of the 1024 ranges stamped so far in the frame
+  (`StampedSlots`) turns a repeat into one compare; a range that starts where a stamped one did
+  widens it, anything else replaces the entry. Stamping a batch's repeated bindings costs 2.3×
+  less (5.8 → 2.5 ns per bind), and a frame that walks more distinct ranges than the table holds
+  pays 15 % more per bind than the plain stamp it would have done — the tails of
+  `tests/bench_page_stamp.cpp`.
 
 ## Measuring
 

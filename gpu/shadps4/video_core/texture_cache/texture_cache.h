@@ -332,6 +332,13 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// bbport: counts the times a cached sampler was destroyed. A caller that remembers a sampler
+    /// handle (the rasterizer's per-draw sampler memo) compares this with the epoch it filled the
+    /// entry at, and drops the entry when a collection may have destroyed the sampler under it.
+    [[nodiscard]] u32 SamplerEpoch() const noexcept {
+        return sampler_epoch.load(std::memory_order_relaxed);
+    }
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
@@ -490,6 +497,7 @@ private:
     std::atomic<u64> registration_generation{0};
     u32 button_prompt_switches = 0;
     std::mutex samplers_mutex;
+    std::atomic<u32> sampler_epoch{0};
     std::mutex download_images_mutex;
     struct MetaDataInfo {
         MetaType type;

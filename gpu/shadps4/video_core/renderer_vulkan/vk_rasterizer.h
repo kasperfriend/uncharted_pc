@@ -273,7 +273,34 @@ private:
                       bool on_helper = false);
     bool BindResources(const Pipeline* pipeline);
     void BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
-                      Shader::Backend::Bindings& binding, u32& write_index);
+                      Shader::Backend::Bindings& binding, u32& write_index, bool on_helper);
+    /// bbport: the sampler of an S#, through the sampler memo below (or the texture cache's
+    /// hashed sampler map when the memo cannot be used).
+    vk::Sampler BindSampler(const AmdGpu::Sampler& sharp, bool is_depth, float lod_bias,
+                            bool memo);
+    /// The S# of the last few sampler bindings and the sampler it resolved to.
+    ///
+    /// Every stage of every draw asks the texture cache for its samplers, and that answer only
+    /// depends on the S# bytes, the depth flag, the LOD bias and the border color base -- yet
+    /// the cache hashes the S#, takes its mutex, probes a hash map and touches an LRU entry for
+    /// each one. A frame binds the same handful of S#s over and over, so a small direct-mapped
+    /// table of the answers serves all of the repeats: two multiplies, a mask and five compares.
+    /// Not used by the texture binding helper, which runs on another thread.
+    struct SamplerMemoEntry {
+        u64 raw0 = 0;
+        u64 raw1 = 0;
+        u64 border = 0;
+        vk::Sampler sampler{};
+        float lod_bias = 0.0f;
+        u32 is_depth = 0;
+        /// The texture cache's SamplerEpoch() when this was filled: a collection that destroyed a
+        /// sampler bumps it, and every entry filled before is then not a hit any more.
+        u32 epoch = 0;
+        bool valid = false;
+    };
+    static constexpr u32 SamplerMemoSize = 512; ///< power of two
+    std::array<SamplerMemoEntry, SamplerMemoSize> sampler_memo{};
+    u64 sampler_memo_hits = 0, sampler_memo_misses = 0;
     /// bbport: a stage's resolved textures remembered by its prepared T# hashes
     /// (TextureSetMemo): a hit only redoes the per-draw effects (binding flags, transitions).
     struct TextureSetEntry {
@@ -424,7 +451,8 @@ private:
     // while streaming.
     // The largest key is a color target -- a u32 tag, the 60-byte color buffer register and the
     // 4-byte extent hint, 68 bytes; a depth target is 56. The assert in FindTargetMemoized fails
-    // the build if a call ever passes more.
+    // the build if a call ever passes more. The capacity used to be 256, which made the key, and
+    // every LastTarget and memo entry holding one, four times as wide as the bytes compared.
     static constexpr u32 TargetKeyBytes = 72;
     /// The key of a target lookup: exactly the bytes of the call's parts (common/byte_key.h).
     using TargetKey = Common::ByteKey<TargetKeyBytes>;
