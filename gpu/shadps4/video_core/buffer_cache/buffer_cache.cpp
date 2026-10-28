@@ -1735,8 +1735,10 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
             LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
         }
     }
-    // bbport: most texel buffers alias no image; remember misses until images change.
-    const u64 generation = texture_cache.RegistryGeneration();
+    // bbport: most texel buffers alias no image; remember misses until an image appears. Keyed
+    // on registrations only: collecting an image cannot make a range covered, and a streaming
+    // frame collects far more often than it registers.
+    const u64 generation = texture_cache.RegistrationGeneration();
     auto& miss = image_miss_cache[((device_addr >> 6) ^ size * 0x9E3779B1u) % image_miss_cache.size()];
     if (miss.address == device_addr && miss.size == size && miss.generation == generation &&
         !BbToggle::Disabled(BbToggle::TextureBindingMemo)) {

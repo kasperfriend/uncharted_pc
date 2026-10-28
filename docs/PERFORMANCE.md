@@ -347,6 +347,46 @@ Both can be switched off at runtime (`BB_TOGGLE_FILE`): `GpuUseStamp` for the st
 residency span has no toggle because it changes nothing observable, only how the same answer is
 reached.
 
+## Per-draw memos in the draw path (`video_core/renderer_vulkan/`)
+
+A frame submits a few thousand draws, and each one asks the same four questions before any
+command is recorded: which image is this render target, which set of images does this shader
+sample, does this draw begin a new render area, and what is the state behind it? The answers
+barely change between consecutive draws, so each question has a memo — and every memo used to be
+validated against `TextureCache::RegistryGeneration()`, a counter that changes whenever *any*
+image is registered or collected. A streaming frame registers and collects images constantly, so
+all four memos were thrown away several times per frame and most of their lookups became the
+image search they were meant to skip.
+
+- **Lifetime token.** An image's `image_uid` is handed out once and never reused, so "the image
+  in this slot still carries the uid I stored" is exactly "my image is still alive", and nothing
+  else. The memos (render targets, the render-state signature, the texture set, the per-slot
+  image descriptions) validate by uid instead. `TextureCache::ImageUid` answers 0 for an empty id
+  and for a slot that has been freed, which is what makes a memoized id safe to check: no memo
+  indexes the slot array before the uid matches. A memo now dies when, and only when, its own
+  image does.
+- **Key size.** A target lookup keys on the raw bytes of the target registers (56 bytes for
+  depth, 68 for a color target). It used to zero-fill a 256-byte buffer per lookup, keep 256
+  bytes of it in the last-hit and memo entries, and hash it word at a time; it now stores exactly
+  the bytes of the call's parts (`common/byte_key.h`) and hashes those with XXH3:
+
+  | Lookup | 256-byte zero-filled key | Per-call key | |
+  |---|---|---|---|
+  | target unchanged since the previous draw | 53 ns | 12 ns | 4.4–4.6× |
+  | target changes every draw | 72 ns | 28 ns | 2.5–2.6× |
+  | uid validation of a memo hit | — | 1.6 ns | |
+
+  (`tests/bench_target_key.cpp`, which prints exactly that table; `tests/test_byte_key.cpp`
+  checks that the key is byte-exact — a single flipped bit in any part, or a shorter key with the
+  same prefix, must not match — under ASan and UBSan.)
+- **Image misses.** A texel buffer usually aliases no image at all, and `SynchronizeMemoryFromImage`
+  remembers that so the range query is not repeated. Collecting an image cannot make a range
+  covered, so that memo keys on registrations only (`RegistrationGeneration`) and survives the
+  eviction side of a streaming frame.
+- **Texture sets.** A memoized set validates per entry by uid and prefetches the next two images
+  of the set: the images of one draw are scattered over a large slot array and each check
+  depends on the loads of the previous one.
+
 ## Measuring
 
 - `BB_DCB_STATS=1` prints the GPU thread's per-frame counters (see `docs/parallel_gpu.md`).

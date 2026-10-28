@@ -131,6 +131,14 @@ gcc "${c11[@]}" -pthread -I. -Isrc tests/test_runtime_sync.c src/runtime_sema.c 
 "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_byte_key.cpp \
     -o "$out/byte-key-test"
 "$out/byte-key-test"
+# ... and what one such lookup costs against the zero-filled 256-byte key it replaced. XXH3 comes
+# from the GPU build's dependency, so in a plain checkout the bench hashes with a local fold and
+# says so.
+echo '== target memo lookup cost (256-byte zero-filled key against the per-call key)'
+"$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -march=x86-64-v2 -mavx -mf16c -mno-avx2 \
+    -mno-fma -mno-bmi -mno-bmi2 -mtune=core-avx-i -mprefer-vector-width=128 -Igpu/shadps4 \
+    tests/bench_target_key.cpp -o "$out/bench-target-key"
+"$out/bench-target-key"
 # ... and both again with the sanitizers, because the stamping reads and writes a page table by
 # vector and the span is memory the previous query left behind.
 if "$cxx" -fsanitize=address,undefined -x c++ -c /dev/null -o /dev/null 2>/dev/null; then

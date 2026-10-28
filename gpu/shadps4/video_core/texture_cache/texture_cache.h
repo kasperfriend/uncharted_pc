@@ -94,6 +94,14 @@ public:
         return registry_generation.load(std::memory_order_acquire);
     }
 
+    /// bbport: changes only when an image becomes registered. A memo that remembers "no image
+    /// here" (a texel buffer that aliases nothing, buffer_cache.cpp) stays true when images are
+    /// collected -- only a new registration can make a range covered -- so it keys on this and
+    /// survives the whole eviction side of a streaming frame.
+    [[nodiscard]] u64 RegistrationGeneration() const noexcept {
+        return registration_generation.load(std::memory_order_acquire);
+    }
+
     /// bbport: the identity of whatever image occupies `image_id`'s slot, 0 when the slot is
     /// free. Image uids are handed out once and never reused, so two lookups returning the same
     /// non-zero value mean the same image is still there -- which is what the per-draw memos
@@ -479,6 +487,7 @@ private:
     };
     std::array<FindImageCacheEntry, 1024> find_image_cache{};
     std::atomic<u64> registry_generation{0};
+    std::atomic<u64> registration_generation{0};
     u32 button_prompt_switches = 0;
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;

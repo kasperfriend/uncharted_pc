@@ -1007,6 +1007,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     ++registry_generation;
+    ++registration_generation;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     registered_image_bytes += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
