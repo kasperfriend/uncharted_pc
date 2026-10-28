@@ -541,6 +541,27 @@ private:
     static inline thread_local const AmdGpu::ComputeProgram* stage_cs = nullptr;
     AmdGpu::Regs pipe_regs{};
     bool pipe_synced = false;
+    /// bbport: the dynamic-state groups (a bit each) the register blocks the packet the
+    /// recording thread is running wrote belong to; 0xff when every register may have changed
+    /// (a resync), so UpdateDynamicState recomputes every group it names.
+    u8 pipe_touched_groups = 0xff;
+    /// bbport: the per-draw inputs of the dynamic state that are not registers, as the last
+    /// computation saw them.
+    struct DynamicStateMemo {
+        std::array<float, 2> target_scale{};
+        std::array<float, 2> draw_jitter{};
+        /// The pipeline's write masks by value: a pipeline the cache rebuilt can reuse the
+        /// address of one it destroyed, so the masks are compared, not the pointer.
+        ColorWriteMasks write_masks{};
+        bool feedback_loop = false;
+        /// The scheduler's Invalidate() count these values were derived at: after one the state
+        /// has to be re-derived so the new command buffer gets it.
+        u32 invalidation = ~0u;
+    };
+    mutable DynamicStateMemo dynamic_memo{};
+    /// bbport: per group (viewport, depth/stencil, primitive, rasterization, blend), how many
+    /// draws recomputed it and how many skipped it (BB_FRAME_STATS).
+    mutable std::array<u64, 5> dynamic_state_updates{}, dynamic_state_skips{};
     std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> pipe_cb_extent{};
     AmdGpu::CbDbExtent pipe_db_extent{};
     /// Stage A: small read-only guest buffers copied into the constant ring for a packet.

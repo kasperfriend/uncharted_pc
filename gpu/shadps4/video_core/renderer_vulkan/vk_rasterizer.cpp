@@ -18,6 +18,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
+#include "video_core/amdgpu/dynamic_state_blocks.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -522,6 +523,9 @@ struct DrawPacket {
     u32 index_offset;
     u8 is_indexed;
     u8 regs_reset;
+    /// The register copy was replaced wholesale (the pipe resynced): every register may differ,
+    /// even though no block is listed.
+    u8 regs_wholesale;
     u16 num_blocks;
     u32 num_stages;
     u32 verify;
@@ -546,8 +550,6 @@ const u32 VerifyInterval = [] {
     const char* env = std::getenv("BB_PIPE_VERIFY");
     return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
 }();
-} // namespace
-
 bool Rasterizer::DrawPipeWanted() {
     const char* env = std::getenv("BB_DRAW_PIPE");
     if (env && env[0]) {
@@ -719,11 +721,14 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
                           bool is_indexed, u32 index_offset, const AmdGpu::ComputeProgram* cs,
                           const IndirectDraw* indirect) {
     auto& dirty = liverpool->pipe_dirty;
+    bool wholesale = false;
     if (!pipe_synced) {
-        // Stage B has not run yet: its register copy starts as this one.
+        // Stage B has not run yet: its register copy starts as this one. Every register may
+        // differ from what the recording thread last saw, and no block says so.
         pipe_regs = liverpool->regs;
         dirty.Clear();
         pipe_synced = true;
+        wholesale = true;
     }
     std::array<u16, AmdGpu::RegDirty::NumBlocks> blocks;
     u32 num_blocks = 0;
@@ -777,6 +782,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     packet.index_offset = index_offset;
     packet.is_indexed = is_indexed;
     packet.regs_reset = dirty.reset;
+    packet.regs_wholesale = wholesale;
     packet.num_blocks = static_cast<u16>(num_blocks);
     packet.num_stages = num_stages;
     packet.verify = verify;
@@ -886,10 +892,16 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     const auto* blocks = reinterpret_cast<const u16*>(in);
     in += AlignPacket(packet.num_blocks * sizeof(u16));
     auto& regs = self.pipe_regs;
+    // bbport: which dynamic-state groups this packet's registers can have changed
+    // (UpdateDynamicState). A reset or a resync replaces the whole register set: every group.
+    const auto& groups = AmdGpu::DynamicStateRegGroups::Get();
+    self.pipe_touched_groups =
+        (packet.regs_reset || packet.regs_wholesale) ? AmdGpu::DynamicStateRegGroups::AllGroups : 0;
     if (packet.regs_reset) {
         regs.SetDefaults();
     }
     for (u32 i = 0; i < packet.num_blocks; ++i) {
+        self.pipe_touched_groups |= groups.group_of_block[blocks[i]];
         std::memcpy(regs.reg_array.data() + blocks[i] * AmdGpu::RegDirty::BlockWords, in,
                     AmdGpu::RegDirty::BlockWords * sizeof(u32));
         in += AmdGpu::RegDirty::BlockWords * sizeof(u32);
@@ -3811,11 +3823,23 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                     static_cast<unsigned long long>(target_memo_misses),
                     static_cast<unsigned long long>(sampler_memo_hits),
                     static_cast<unsigned long long>(sampler_memo_misses));
+        // bbport: the five dynamic-state groups (viewport, depth/stencil, primitive,
+        // rasterization, blend): how often a draw's packet left each one untouched.
+        std::printf("  dynamic state recomputed/skipped:");
+        static const char* const names[5] = {"viewport", "depth", "primitive", "raster", "blend"};
+        for (u32 i = 0; i < 5; ++i) {
+            std::printf(" %s %llu/%llu", names[i],
+                        static_cast<unsigned long long>(dynamic_state_updates[i]),
+                        static_cast<unsigned long long>(dynamic_state_skips[i]));
+        }
+        std::printf("\n");
         proxy_samples = 0;
         texture_set_why = {};
         begin_memo_hits = begin_memo_misses = texture_set_hits = texture_set_misses = 0;
         target_memo_hits = target_memo_misses = 0;
         sampler_memo_hits = sampler_memo_misses = 0;
+        dynamic_state_updates = {};
+        dynamic_state_skips = {};
     }
     BeginSignature signature;
     if (memo_on) {
@@ -4446,13 +4470,68 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
-    UpdateViewportScissorState();
-    UpdateDepthStencilState();
-    UpdatePrimitiveState(is_indexed);
-    UpdateRasterizationState();
-    UpdateColorBlendingState(pipeline);
-
+    // bbport: only the groups whose inputs changed are recomputed. On the draw pipe the packet's
+    // register blocks say what changed; without the pipe (or after a resync, which marks every
+    // block) everything is recomputed as before. CommitWith still runs every draw: it flushes
+    // whatever a previous draw left dirty.
     auto& dynamic_state = scheduler.GetDynamicState();
+    const bool tracking = DrawPipe::OnStageB();
+    const bool stats = BbStats::enabled && tracking;
+    // Without the pipe nothing says what changed: every group is recomputed, as before. A new
+    // command buffer (DynamicState::Invalidate) needs every group re-derived too, so the values
+    // are set again in it.
+    const u32 invalidation = dynamic_state.InvalidationGeneration();
+    const bool fresh = invalidation != dynamic_memo.invalidation;
+    dynamic_memo.invalidation = invalidation;
+    const u8 touched = (tracking && !fresh) ? pipe_touched_groups
+                                            : AmdGpu::DynamicStateRegGroups::AllGroups;
+    const auto changed = [touched](u8 group) { return (touched & group) != 0; };
+    const auto count = [stats](u64& updated, u64& skipped, const bool recomputed) {
+        if (!stats) {
+            return;
+        }
+        if (recomputed) {
+            ++updated;
+        } else {
+            ++skipped;
+        }
+    };
+
+    if (changed(AmdGpu::DynamicStateRegGroups::Viewport) ||
+        target_scale != dynamic_memo.target_scale || draw_jitter != dynamic_memo.draw_jitter) {
+        UpdateViewportScissorState();
+        dynamic_memo.target_scale = target_scale;
+        dynamic_memo.draw_jitter = draw_jitter;
+        count(dynamic_state_updates[0], dynamic_state_skips[0], true);
+    } else {
+        count(dynamic_state_updates[0], dynamic_state_skips[0], false);
+    }
+    const bool depth_changed = changed(AmdGpu::DynamicStateRegGroups::DepthStencil);
+    if (depth_changed) {
+        UpdateDepthStencilState();
+    }
+    count(dynamic_state_updates[1], dynamic_state_skips[1], depth_changed);
+    const bool primitive_changed = changed(AmdGpu::DynamicStateRegGroups::Primitive);
+    if (primitive_changed) {
+        UpdatePrimitiveState(is_indexed);
+    }
+    count(dynamic_state_updates[2], dynamic_state_skips[2], primitive_changed);
+    const bool raster_changed = changed(AmdGpu::DynamicStateRegGroups::Rasterization);
+    if (raster_changed) {
+        UpdateRasterizationState();
+    }
+    count(dynamic_state_updates[3], dynamic_state_skips[3], raster_changed);
+    const auto& write_masks = pipeline->GetGraphicsKey().write_masks;
+    const bool blend_changed = changed(AmdGpu::DynamicStateRegGroups::ColorBlend) ||
+                               write_masks != dynamic_memo.write_masks ||
+                               attachment_feedback_loop != dynamic_memo.feedback_loop;
+    if (blend_changed) {
+        UpdateColorBlendingState(pipeline);
+        dynamic_memo.write_masks = write_masks;
+        dynamic_memo.feedback_loop = attachment_feedback_loop;
+    }
+    count(dynamic_state_updates[4], dynamic_state_skips[4], blend_changed);
+
     dynamic_state.CommitWith(instance.IsDepthBoundsSupported(),
                              instance.IsDynamicColorWriteMaskSupported(),
                              instance.IsAttachmentFeedbackLoopLayoutSupported(),

@@ -175,6 +175,8 @@ struct DynamicState {
     ColorWriteMasks color_write_masks{};
     float line_width{};
     bool feedback_loop_enabled{};
+    /// Incremented by Invalidate(); see InvalidationGeneration().
+    std::atomic<u32> invalidation{0};
 
     /// Commits the dynamic state to the provided command buffer (a null one only clears the
     /// flags that committing clears).
@@ -370,8 +372,17 @@ struct DynamicState {
         return std::memcmp(&pending, &clean, sizeof(pending)) != 0;
     }
 
+    /// bbport: counts the Invalidate()s. A caller that remembers which state it has already
+    /// derived from the registers (Rasterizer::UpdateDynamicState) must recompute everything
+    /// after one: the state is about to be emitted again, so re-deriving it is what sets the
+    /// flags that emit it.
+    [[nodiscard]] u32 InvalidationGeneration() const noexcept {
+        return invalidation.load(std::memory_order_acquire);
+    }
+
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
+        invalidation.fetch_add(1, std::memory_order_release);
         // bbport: named flags only; padding bits set by a memset made AnyDirty() always true.
         dirty_state.viewports = true;
         dirty_state.scissors = true;

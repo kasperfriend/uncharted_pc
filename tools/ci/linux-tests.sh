@@ -126,6 +126,19 @@ gcc "${c11[@]}" -pthread -I. -Isrc tests/test_runtime_sync.c src/runtime_sema.c 
 "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_resident_span.cpp \
     -o "$out/resident-span-test"
 "$out/resident-span-test"
+# The dynamic-state skip (video_core/amdgpu/dynamic_state_blocks.h): Rasterizer::UpdateDynamicState
+# keeps a register group's state when the draw's packet wrote none of its blocks. The register
+# headers include fmt and spdlog, so the stubs in tests/stubs stand in for the submodules this job
+# does not check out; -Wno-unused-variable because one of those headers has an unused constexpr.
+"$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Wno-unused-variable -Itests/stubs \
+    -Igpu/shadps4 tests/test_dynamic_state_blocks.cpp -o "$out/dynamic-state-test"
+"$out/dynamic-state-test"
+# ... and what a draw recomputes against what the skip costs.
+echo '== dynamic state per draw (recompute against the register-block memo)'
+"$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -march=x86-64-v2 -mavx -mf16c -mno-avx2 \
+    -mno-fma -mno-bmi -mno-bmi2 -mtune=core-avx-i -mprefer-vector-width=128 \
+    tests/bench_dynamic_state.cpp -o "$out/bench-dynamic-state"
+"$out/bench-dynamic-state"
 # The memo key of the render-target and render-state lookups (common/byte_key.h): a false match
 # there binds the wrong target, so the key must be exactly the bytes it was given.
 "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_byte_key.cpp \

@@ -402,6 +402,22 @@ image search they were meant to skip.
   the infos of consecutive writes are consecutive entries of one vector: the writes are copied
   one run at a time (`vk_pipeline_common.cpp`), 20 writes in 4 calls instead of 21. The loop
   costs 1.5× less (70 → 46 ns per draw, `tests/bench_record_data.cpp`).
+- **Dynamic state.** Every draw derives its Vulkan dynamic state from a handful of register
+  groups: the viewports and the three scissors, depth and stencil state, the primitive state, the
+  line width and the blend state. That is ~30-45 ns of arithmetic per draw
+  (`tests/bench_dynamic_state.cpp`), and inside a batch the registers it reads have not changed
+  since the previous draw. The draw pipe's packets already carry the 32-word register blocks they
+  wrote (`RegDirty`), so the recording thread classifies those blocks once
+  (`video_core/amdgpu/dynamic_state_blocks.h`: one byte per block, built from the members'
+  offsets at first use) and recomputes only the groups a touched block belongs to — one table
+  lookup per block, 0.5 ns, against the 30-45 ns of work it elides. `CommitWith()` still runs
+  every draw, so nothing left dirty by an earlier draw is lost. Three cases force the full path:
+  no draw pipe (nothing says what changed), a `ClearState` packet (defaults every register), and
+  a new command buffer (`DynamicState::Invalidate()`), which marks every state dirty precisely so
+  it is emitted again — the memo compares the scheduler's invalidation count for that.
+  `tests/test_dynamic_state_blocks.cpp` checks the classification against the real register file
+  (every register a group reads must report its group; a shader-register write must report none),
+  and `BB_FRAME_STATS=1` prints how often each group was recomputed against skipped.
 - **Buffer uses.** `NoteGpuUse` stamps the frame on every 4 KiB page a binding touches, in an
   8 MiB table of `u32`. A batch of draws binds the same vertex stream, the same constants and
   the same storage buffers again and again, and stamping a page that already carries this frame
