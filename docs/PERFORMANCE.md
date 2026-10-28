@@ -418,6 +418,27 @@ image search they were meant to skip.
   `tests/test_dynamic_state_blocks.cpp` checks the classification against the real register file
   (every register a group reads must report its group; a shader-register write must report none),
   and `BB_FRAME_STATS=1` prints how often each group was recomputed against skipped.
+- **Samplers on the texture binding helper.** The helper thread binds a draw's textures while the
+  GPU thread binds its buffers, and it used to skip the sampler memo above — the table belonged
+  to the GPU thread -- so every S# it bound took the texture cache's path: hash the S#, take the
+  sampler mutex, probe the hash map, touch the LRU entry, with the GPU thread taking the same
+  mutex for its own bindings. Each thread now has its own table (`helper_sampler_memo`, written
+  only by the helper), keyed and epoch-guarded exactly like the GPU thread's, and the stats line
+  reports both halves. `tests/bench_draw_setup.cpp` measures the shape of the two lookups (a hash,
+  an uncontended mutex, a map probe and an LRU touch against two multiplies and five compares):
+  **4.4 ns against 2.5 ns** for a sampler a frame binds over and over, and the cache's own path
+  adds what the harness cannot show — the XXH3 call over the S#, a second `at()` lookup on a
+  miss, and a lock the GPU thread also takes.
+- **Vertex input state.** A draw sets the vertex formats, strides and attribute offsets as dynamic
+  state (`setVertexInputEXT`), and a batch of draws of one pipeline describes the same set. The
+  state stays live in the command buffer until something sets it again, so a draw whose description
+  equals the last one emitted records nothing: two `memcmp`s (nine 16-byte entries) stand in front
+  of the two copies into the recording chunk and the command that carries them, 3.1 ns against
+  3.6 ns of chunk work in `tests/bench_draw_setup.cpp` — and the recorded command itself, a driver
+  call that validates the description and writes it into the command buffer, is gone. The memo is
+  dropped when the scheduler's invalidating count moves (a new command buffer needs the state
+  again), which is the same edge `UpdateDynamicState` uses. `BB_FRAME_STATS=1` prints emitted
+  against reused, and `BbToggle::VertexInputMemo` turns it off.
 - **Buffer uses.** `NoteGpuUse` stamps the frame on every 4 KiB page a binding touches, in an
   8 MiB table of `u32`. A batch of draws binds the same vertex stream, the same constants and
   the same storage buffers again and again, and stamping a page that already carries this frame
@@ -427,6 +448,25 @@ image search they were meant to skip.
   less (5.8 → 2.5 ns per bind), and a frame that walks more distinct ranges than the table holds
   pays 15 % more per bind than the plain stamp it would have done — the tails of
   `tests/bench_page_stamp.cpp`.
+
+## Settings the hot paths ask about
+
+Every one of the draw path's diagnostics (`BB_FRAME_STATS`, `BB_TRACE_BUFFERS`, `BB_VERTEX_CHECK`,
+`BB_BONE_CHECK`, `BB_FULL_BARRIER`, the buffer cache's `BB_CLOBBER_CHECK` / `BB_STABLE_CHECK` /
+`BB_BUFFER_STATS`, the texture cache's `BB_TINY_READBACK`, the draw preparation's `BB_PREP_COMPUTE`)
+was read through a function-local static, which is initialized once but *asked* on every draw,
+binding or submission: the ask is a guard variable's acquire load and a branch. They are now
+`const` objects in static storage, read at load. `tests/bench_draw_setup.cpp` measures the
+difference the way the call sites see it — **0.69 ns against 0.47 ns** per ask, times the handful
+of asks per draw -- and the same treatment was given to the settings the draw-preparation workers
+and the scheduler ask per submission.
+
+The texture cache's memory query is the other side of the same coin: `TextureCache`'s collector
+asks the driver for the current usage and budget of its heaps on every submission
+(`vkGetPhysicalDeviceMemoryProperties2`), and a budget that other processes move over hundreds of
+milliseconds does not need a fresh look every few milliseconds. `Instance::QueryMemory` keeps its
+answer for 4 ms, which is well below the rate at which the collector's own accounting moves (it
+decides about images the frame just used, not about a heap that changed in the last millisecond).
 
 ## Measuring
 

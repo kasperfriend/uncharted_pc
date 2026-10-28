@@ -91,14 +91,17 @@ void TextureCache::ProcessDownloadImages() {
 // fence), so the CPU read a stale value: the focus sat at ~2 m and everything behind Drake was
 // blurred while aiming. Images of at most 4x4 pixels (1x1 of any tiling, else linear) the GPU
 // writes are now copied back after each use without waiting. BB_TINY_READBACK=0: off.
+// bbport: read once, not through a function-local static: this is asked for every image a draw
+// binds (the guard variable was a load and a branch per ask).
+const bool TinyReadbackEnabled = [] {
+    // On for Uncharted 2 (run.py): its aim blur; elsewhere it costs ~13% (U3 square).
+    const char* env = std::getenv("BB_TINY_READBACK");
+    return env && env[0] == '1';
+}();
+
 bool TextureCache::TinyReadback(const Image& image) {
-    static const bool enabled = [] {
-        // On for Uncharted 2 (run.py): its aim blur; elsewhere it costs ~13% (U3 square).
-        const char* env = std::getenv("BB_TINY_READBACK");
-        return env && env[0] == '1';
-    }();
     const auto& size = image.info.size;
-    return enabled && image.info.guest_address != 0 && size.depth == 1 &&
+    return TinyReadbackEnabled && image.info.guest_address != 0 && size.depth == 1 &&
            size.width * size.height <= 16 &&
            (!image.info.props.is_tiled || (size.width == 1 && size.height == 1));
 }

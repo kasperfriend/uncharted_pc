@@ -274,10 +274,6 @@ private:
     bool BindResources(const Pipeline* pipeline);
     void BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
                       Shader::Backend::Bindings& binding, u32& write_index, bool on_helper);
-    /// bbport: the sampler of an S#, through the sampler memo below (or the texture cache's
-    /// hashed sampler map when the memo cannot be used).
-    vk::Sampler BindSampler(const AmdGpu::Sampler& sharp, bool is_depth, float lod_bias,
-                            bool memo);
     /// The S# of the last few sampler bindings and the sampler it resolved to.
     ///
     /// Every stage of every draw asks the texture cache for its samplers, and that answer only
@@ -285,7 +281,6 @@ private:
     /// the cache hashes the S#, takes its mutex, probes a hash map and touches an LRU entry for
     /// each one. A frame binds the same handful of S#s over and over, so a small direct-mapped
     /// table of the answers serves all of the repeats: two multiplies, a mask and five compares.
-    /// Not used by the texture binding helper, which runs on another thread.
     struct SamplerMemoEntry {
         u64 raw0 = 0;
         u64 raw1 = 0;
@@ -299,8 +294,23 @@ private:
         bool valid = false;
     };
     static constexpr u32 SamplerMemoSize = 512; ///< power of two
-    std::array<SamplerMemoEntry, SamplerMemoSize> sampler_memo{};
-    u64 sampler_memo_hits = 0, sampler_memo_misses = 0;
+    /// A table of answers and its counters. Each thread that binds samplers has one: the GPU
+    /// thread this object's, the texture binding helper its own (`helper_sampler_memo`).
+    struct SamplerMemoTable {
+        std::array<SamplerMemoEntry, SamplerMemoSize> entries{};
+        u64 hits = 0, misses = 0;
+    };
+    /// bbport: the sampler of an S#, through `memo` (the texture cache's hashed sampler map on a
+    /// miss). Every caller passes its own thread's table: both tables are written by one thread
+    /// each, so no lock is involved.
+    vk::Sampler BindSampler(const AmdGpu::Sampler& sharp, bool is_depth, float lod_bias,
+                            SamplerMemoTable& memo);
+    SamplerMemoTable sampler_memo;
+    /// The texture binding helper's own table: the helper used to skip the memo (the table above
+    /// belonged to the GPU thread), so every S# of a draw it bound took the texture cache's mutex,
+    /// its hash map probe and an LRU touch. Its counters are read only after the task's join,
+    /// which publishes the writes.
+    SamplerMemoTable helper_sampler_memo;
     /// bbport: a stage's resolved textures remembered by its prepared T# hashes
     /// (TextureSetMemo): a hit only redoes the per-draw effects (binding flags, transitions).
     struct TextureSetEntry {
@@ -499,6 +509,19 @@ private:
         VertexInputs<vk::DeviceSize> host_strides;
         u32 num_buffers = 0;
     } vertex_binds;
+    /// bbport: the vertex input state (formats, strides, divisors, offsets) last emitted into the
+    /// current command buffer. Consecutive draws of a pipeline describe the same set, and dynamic
+    /// state stays live in the buffer until something sets it again, so an identical one costs
+    /// only the comparison. `generation` is the scheduler's invalidation count, which moves when
+    /// the draw pipe starts recording into a new command buffer.
+    struct VertexInputMemo {
+        std::array<vk::VertexInputBindingDescription2EXT, MaxVertexBufferCount> bindings;
+        std::array<vk::VertexInputAttributeDescription2EXT, MaxVertexBufferCount> attributes;
+        u32 num_bindings = 0;
+        u32 num_attributes = 0;
+        u32 generation = ~0u;
+    } vertex_input_memo;
+    u64 vertex_input_emits = 0, vertex_input_skips = 0;
     struct IndexBind {
         vk::Buffer handle;
         u64 offset;

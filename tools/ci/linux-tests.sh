@@ -139,6 +139,16 @@ echo '== dynamic state per draw (recompute against the register-block memo)'
     -mno-fma -mno-bmi -mno-bmi2 -mtune=core-avx-i -mprefer-vector-width=128 \
     tests/bench_dynamic_state.cpp -o "$out/bench-dynamic-state"
 "$out/bench-dynamic-state"
+# The rest of a draw's setup (renderer_vulkan/vk_rasterizer.cpp): the diagnostics flag each draw
+# asks about, the vertex input state emitted against reused, and one sampler binding through the
+# texture cache against the memo table the texture binding helper now uses too. The last block
+# also checks the rule the vertex input memo must keep -- a skip is only sound while the state the
+# command buffer holds is the one the draw needs -- and fails the run when it does not hold.
+echo '== draw setup: env flags, vertex input state, sampler lookups'
+"$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -march=x86-64-v2 -mavx -mf16c -mno-avx2 \
+    -mno-fma -mno-bmi -mno-bmi2 -mtune=core-avx-i -mprefer-vector-width=128 \
+    tests/bench_draw_setup.cpp -o "$out/bench-draw-setup"
+"$out/bench-draw-setup"
 # The memo key of the render-target and render-state lookups (common/byte_key.h): a false match
 # there binds the wrong target, so the key must be exactly the bytes it was given.
 "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_byte_key.cpp \

@@ -580,12 +580,70 @@ namespace {
 std::unordered_map<const char*, std::unordered_map<u32, u64>> drain_sites;
 } // namespace
 
+namespace {
+/// bbport: the diagnostics settings the draw path asks about, read once at load. Each of these was
+/// a function-local static on a per-draw or per-packet path, so every draw paid its guard variable
+/// -- an acquire load and a branch -- to ask a question whose answer cannot change while the game
+/// runs. One `const` in static storage is a load with no branch.
+const bool FrameStats = std::getenv("BB_FRAME_STATS") != nullptr;
+/// BB_VERTEX_CHECK=N: every Nth frame, check the vertex streams of every draw.
+const u64 VertexCheckEvery = [] {
+    const char* env = std::getenv("BB_VERTEX_CHECK");
+    return env ? std::max<u64>(1, std::strtoull(env, nullptr, 10)) : 0ull;
+}();
+const bool BoneCheck = std::getenv("BB_BONE_CHECK") != nullptr;
+const bool ObjectMotionAll = [] {
+    const char* value = std::getenv("BB_OBJECT_MOTION_ALL");
+    return value && value[0] == '1';
+}();
+/// BB_READBACK_SMALL_BUFFERS=1 (off by default: in one area it halved the frame rate).
+const bool ReadbackSmallBuffers = [] {
+    const char* env = std::getenv("BB_READBACK_SMALL_BUFFERS");
+    return env && env[0] == '1';
+}();
+/// BB_FULL_BARRIER=1|2: a full barrier after (2: also before) every dispatch.
+const int FullBarrier = [] {
+    const char* env = std::getenv("BB_FULL_BARRIER");
+    return env ? std::atoi(env) : 0;
+}();
+const u64 TraceBuffers = [] {
+    const char* env = std::getenv("BB_TRACE_BUFFERS");
+    return env ? std::strtoull(env, nullptr, 16) : 0ull;
+}();
+const u64 TraceTextures = [] {
+    const char* env = std::getenv("BB_TRACE_SHADER");
+    return env ? std::strtoull(env, nullptr, 16) : 0ull;
+}();
+const u64 TraceCompute = [] {
+    const char* env = std::getenv("BB_TRACE_CS");
+    return env ? std::strtoull(env, nullptr, 16) : 0ull;
+}();
+const u64 TraceComputeBones = [] {
+    const char* env = std::getenv("BB_CS_BONE_CHECK");
+    return env ? std::strtoull(env, nullptr, 16) : 0ull;
+}();
+/// BB_FORCE_VB_UPLOAD=1: upload every draw's vertex, index and read-only buffers again.
+const bool ForceUploadAll = std::getenv("BB_FORCE_VB_UPLOAD") != nullptr;
+const bool RingCheck = std::getenv("BB_RING_CHECK") != nullptr;
+const bool WarnMetaTexture = std::getenv("BB_WARN_META_TEXTURE") != nullptr;
+/// BB_FORCE_UPLOAD_VS=<hash>[:index|:buffers]: the shader whose draws upload their data again.
+const std::pair<u32, int> ForceUploadShader = [] {
+    const char* env = std::getenv("BB_FORCE_UPLOAD_VS");
+    if (!env) {
+        return std::pair<u32, int>{0, 0};
+    }
+    char* end;
+    const u32 hash = static_cast<u32>(std::strtoull(env, &end, 16));
+    const int kind = !std::strcmp(end, ":index") ? 1 : !std::strcmp(end, ":buffers") ? 2 : 3;
+    return std::pair<u32, int>{hash, kind};
+}();
+} // namespace
+
 void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
     if (!draw_pipe || !OnStageA()) {
         return;
     }
-    static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
-    if (!stats) {
+    if (!FrameStats) {
         draw_pipe->Drain(reason);
         return;
     }
@@ -1020,8 +1078,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
 }
 
 void Rasterizer::PrintPipeStats() {
-    static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
-    if (!stats || (draw_pipe->packets & 1023) != 0) {
+    if (!FrameStats || (draw_pipe->packets & 1023) != 0) {
         return;
     }
     static auto window = std::chrono::steady_clock::now();
@@ -1265,17 +1322,7 @@ void Rasterizer::CheckConstants() {
 // draws upload their index data and/or read-only buffers from guest memory again (as
 // BB_FORCE_VB_UPLOAD does for every draw).
 static u32 ForceUploadVs(bool index) {
-    static const std::pair<u32, int> setting = [] {
-        const char* env = std::getenv("BB_FORCE_UPLOAD_VS");
-        if (!env) {
-            return std::pair<u32, int>{0, 0};
-        }
-        char* end;
-        const u32 hash = static_cast<u32>(std::strtoull(env, &end, 16));
-        const int kind = !std::strcmp(end, ":index") ? 1 : !std::strcmp(end, ":buffers") ? 2 : 3;
-        return std::pair<u32, int>{hash, kind};
-    }();
-    return (setting.second & (index ? 1 : 2)) ? setting.first : 0;
+    return (ForceUploadShader.second & (index ? 1 : 2)) ? ForceUploadShader.first : 0;
 }
 
 // bbport diagnosis: BB_SHADER_DEBUG_FILE=<file>, re-read every 250 ms while the game runs, so a
@@ -1521,10 +1568,6 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // bbport diagnosis: BB_VERTEX_CHECK=N, every Nth frame: vertex shader buffers (elements of
     // 12 to 64 bytes) whose elements start with impossible positions (NaN, infinity, beyond 1e5)
     // or with many exact zero triples, in guest memory as the draw is recorded.
-    static const u64 vertex_check = [] {
-        const char* env = std::getenv("BB_VERTEX_CHECK");
-        return env ? std::max<u64>(1, std::strtoull(env, nullptr, 10)) : 0ull;
-    }();
     if (StaleCheckEnabled()) {
         const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
         auto& t = Stale();
@@ -1565,7 +1608,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             }
         }
     }
-    if (vertex_check && BbStats::gpu_frames.load(std::memory_order_relaxed) % vertex_check == 0) {
+    if (VertexCheckEvery &&
+        BbStats::gpu_frames.load(std::memory_order_relaxed) % VertexCheckEvery == 0) {
         const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
         for (u32 b = 0; b < vs.buffers.size(); ++b) {
             const auto& resource = vs.buffers[b];
@@ -1604,8 +1648,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     // bbport diagnosis: BB_BONE_CHECK=1 reports vertex shader bone palettes (stride-16 buffers)
     // holding values no bone matrix has (NaN, infinity, beyond 1e5) as the draw is recorded.
-    static const bool bone_check = std::getenv("BB_BONE_CHECK") != nullptr;
-    if (bone_check) {
+    if (BoneCheck) {
         const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
         for (u32 b = 0; b < vs.buffers.size(); ++b) {
             const auto& resource = vs.buffers[b];
@@ -1655,11 +1698,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         // Without a character-size skeleton the draw is gated on its bone palette changing
         // since last frame (model constants follow the camera, the palette does not). The
         // check comes first: most gated draws are static world pieces with long index lists.
-        static const bool all_motion = [] {
-            const char* value = std::getenv("BB_OBJECT_MOTION_ALL");
-            return value && value[0] == '1';
-        }();
-        bool gated = !all_motion;
+        bool gated = !ObjectMotionAll;
         u64 palette = 0;
         for (const auto& resource : vs.buffers) {
             if (resource.IsSpecial()) continue;
@@ -1944,12 +1983,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
 }
 
 void Rasterizer::NoteSmallWrittenBuffers(const Shader::Info& stage) {
-    static const bool enabled = [] {
-        // Off by default: in U3's Cartagena square it halved the frame rate (94 -> 46 FPS).
-        const char* env = std::getenv("BB_READBACK_SMALL_BUFFERS");
-        return env && env[0] == '1';
-    }();
-    if (!enabled) {
+    if (!ReadbackSmallBuffers) {
         return;
     }
     for (const auto& desc : stage.buffers) {
@@ -2031,11 +2065,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     }
     // bbport diagnosis: BB_TRACE_CS=<hash>: that compute shader's buffers (first 200 dispatches),
     // with the buffer cache's view of them before binding.
-    static const u64 trace_cs = [] {
-        const char* env = std::getenv("BB_TRACE_CS");
-        return env ? std::strtoull(env, nullptr, 16) : 0ull;
-    }();
-    if (trace_cs && u32(cs.pgm_hash) == u32(trace_cs)) {
+    if (TraceCompute && u32(cs.pgm_hash) == u32(TraceCompute)) {
         static std::atomic<u32> traced{0};
         if (traced.load() == 0) {
             std::printf("Trace cs %08x: workgroup %ux%ux%u, LDS %u bytes, subgroup %u; lane id %d, "
@@ -2096,11 +2126,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     // bbport diagnosis: BB_CS_BONE_CHECK=<cs hash>: that compute shader's small read-only
     // buffers of 3x4 matrices (multiples of 48 bytes up to 64 KiB) with values no transform has
     // (NaN, infinity, beyond 1e5) or all-zero matrices, in guest memory at the dispatch.
-    static const u64 cs_bone_check = [] {
-        const char* env = std::getenv("BB_CS_BONE_CHECK");
-        return env ? std::strtoull(env, nullptr, 16) : 0ull;
-    }();
-    if (cs_bone_check && u32(cs.pgm_hash) == u32(cs_bone_check)) {
+    if (TraceComputeBones && u32(cs.pgm_hash) == u32(TraceComputeBones)) {
         static u64 checked = 0, reports = 0;
         for (u32 b = 0; b < cs.buffers.size(); ++b) {
             const auto& desc = cs.buffers[b];
@@ -2202,10 +2228,6 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     // bbport diagnosis: BB_FULL_BARRIER=1 — every dispatch is followed by a barrier from all
     // commands to all commands (a missing compute -> later read dependency shows as gone);
     // BB_FULL_BARRIER=2 also precedes it with one (earlier reads -> its writes).
-    static const int full_barrier = [] {
-        const char* env = std::getenv("BB_FULL_BARRIER");
-        return env ? std::atoi(env) : 0;
-    }();
     const void* checkpoint = NoteCheckpoint("dispatch", cs.pgm_hash, 0, dim_x, dim_y, dim_z, 0);
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         const vk::MemoryBarrier2 barrier = {
@@ -2218,7 +2240,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
             .memoryBarrierCount = 1,
             .pMemoryBarriers = &barrier,
         };
-        if (full_barrier >= 2) {
+        if (FullBarrier >= 2) {
             cmdbuf.pipelineBarrier2(dependency);
         }
         if (checkpoint) {
@@ -2226,7 +2248,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
-        if (full_barrier >= 1) {
+        if (FullBarrier >= 1) {
             cmdbuf.pipelineBarrier2(dependency);
         }
     });
@@ -2470,8 +2492,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     bool uses_dma = false;
 
-    static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
-    if (stats && ((helper_full + helper_partial + helper_serial) & 1023) == 0) {
+    if (FrameStats && ((helper_full + helper_partial + helper_serial) & 1023) == 0) {
         static auto window = std::chrono::steady_clock::now();
         const auto now = std::chrono::steady_clock::now();
         if (now - window >= std::chrono::seconds(5)) {
@@ -2586,16 +2607,47 @@ void Rasterizer::EmitVertexBuffers() {
     auto& v = vertex_binds;
     const bool dynamic_input = instance.IsVertexInputDynamicState();
     const u32 num_buffers = v.num_buffers;
+    // bbport: a batch of draws repeats the same vertex formats. The dynamic state stays live in
+    // the command buffer until something sets it again, so emitting an identical description only
+    // costs the copy into the chunk and the command that carries it. The comparison is the bytes
+    // of the two lists (a few 16-byte entries); a new command buffer clears the memo through the
+    // scheduler's invalidation count, the same edge the dynamic state itself is re-emitted on.
+    const u32 generation = dynamic_input ? scheduler.GetDynamicState().InvalidationGeneration()
+                                         : 0u;
+    const u32 num_bindings = static_cast<u32>(v.bindings.size());
+    const u32 num_attributes = static_cast<u32>(v.attributes.size());
+    bool emit_input = dynamic_input;
+    if (dynamic_input && !BbToggle::Disabled(BbToggle::VertexInputMemo)) {
+        emit_input = vertex_input_memo.generation != generation ||
+                     vertex_input_memo.num_bindings != num_bindings ||
+                     vertex_input_memo.num_attributes != num_attributes ||
+                     std::memcmp(vertex_input_memo.bindings.data(), v.bindings.data(),
+                                 num_bindings * sizeof(v.bindings[0])) != 0 ||
+                     std::memcmp(vertex_input_memo.attributes.data(), v.attributes.data(),
+                                 num_attributes * sizeof(v.attributes[0])) != 0;
+    }
     scheduler.ReserveRecordData(
-        v.bindings.size() * sizeof(v.bindings[0]) + v.attributes.size() * sizeof(v.attributes[0]) +
+        (emit_input ? v.bindings.size() * sizeof(v.bindings[0]) +
+                          v.attributes.size() * sizeof(v.attributes[0])
+                    : 0) +
         num_buffers * (sizeof(vk::Buffer) + 3 * sizeof(vk::DeviceSize)) + 128);
-    if (dynamic_input) {
+    if (emit_input) {
+        ++vertex_input_emits;
+        vertex_input_memo.generation = generation;
+        vertex_input_memo.num_bindings = num_bindings;
+        vertex_input_memo.num_attributes = num_attributes;
+        std::memcpy(vertex_input_memo.bindings.data(), v.bindings.data(),
+                    num_bindings * sizeof(v.bindings[0]));
+        std::memcpy(vertex_input_memo.attributes.data(), v.attributes.data(),
+                    num_attributes * sizeof(v.attributes[0]));
         scheduler.Record([bindings = scheduler.RecordData(std::span<const vk::VertexInputBindingDescription2EXT>{v.bindings.data(), v.bindings.size()}),
                           attributes = scheduler.RecordData(std::span<const vk::VertexInputAttributeDescription2EXT>{
                               v.attributes.data(), v.attributes.size()})](
                              vk::CommandBuffer cmdbuf) {
             cmdbuf.setVertexInputEXT(bindings, attributes);
         });
+    } else if (dynamic_input) {
+        ++vertex_input_skips;
     }
     if (num_buffers == 0) {
         return;
@@ -2719,10 +2771,9 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     }
 
     // Map buffers for merged ranges
-    static const bool force_vb_upload = std::getenv("BB_FORCE_VB_UPLOAD") != nullptr;
     const u32 force_upload_vs = ForceUploadVs(false);
     const bool force_this_draw =
-        force_vb_upload || (force_upload_vs && force_upload_vs == current_vs_hash);
+        ForceUploadAll || (force_upload_vs && force_upload_vs == current_vs_hash);
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
         if (force_this_draw) {
@@ -2786,9 +2837,8 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
-    static const bool force_ib_upload = std::getenv("BB_FORCE_VB_UPLOAD") != nullptr;
     const u32 force_upload_vs = ForceUploadVs(true);
-    if (force_ib_upload || (force_upload_vs && force_upload_vs == current_vs_hash)) {
+    if (ForceUploadAll || (force_upload_vs && force_upload_vs == current_vs_hash)) {
         buffer_cache.ForceUpload(index_address, index_buffer_size);
     }
     const auto [buffer, offset] =
@@ -2969,11 +3019,6 @@ const VAddr WatchedGpuWrite = [] {
     const char* env = std::getenv("BB_WATCH_GPU_WRITE");
     return env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
 }();
-/// bbport: the buffer-binding diagnostics, read once. Each was a function-local static inside the
-/// per-buffer loop, so every binding of every draw paid its guard variable.
-const bool ForceBufferUpload = std::getenv("BB_FORCE_VB_UPLOAD") != nullptr;
-const bool RingCheck = std::getenv("BB_RING_CHECK") != nullptr;
-const bool WarnMetaTexture = std::getenv("BB_WARN_META_TEXTURE") != nullptr;
 } // namespace
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
@@ -2982,11 +3027,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
     const u64 alignment = instance.StorageMinAlignment();
     // bbport diagnosis: BB_TRACE_BUFFERS=<hash> prints the V# of every buffer binding of that
     // shader and the first bytes of guest memory behind it (first 6 draws).
-    static const u64 trace_hash = [] {
-        const char* env = std::getenv("BB_TRACE_BUFFERS");
-        return env ? std::strtoull(env, nullptr, 16) : 0ull;
-    }();
-    if (trace_hash && u32(stage.pgm_hash) == u32(trace_hash)) {
+    if (TraceBuffers && u32(stage.pgm_hash) == u32(TraceBuffers)) {
         static std::atomic<u32> traced{0};
         if (traced.fetch_add(1, std::memory_order_relaxed) < 6) {
             for (u32 i = 0; i < stage.buffers.size(); ++i) {
@@ -3141,7 +3182,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 // One setting read, not two: the value is the shader hash this pull applies to.
                 const u32 force_upload_vs = desc.is_written ? 0 : ForceUploadVs(false);
                 if (!desc.is_written &&
-                    (ForceBufferUpload ||
+                    (ForceUploadAll ||
                      (force_upload_vs != 0 && force_upload_vs == u32(stage.pgm_hash)))) {
                     buffer_cache.ForceUpload(vsharp.base_address, size);
                 }
@@ -3236,11 +3277,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
     const u32 first_image_idx = image_infos.size();
     // bbport diagnosis: BB_TRACE_SHADER=<hash> prints the T# of every texture binding of that
     // shader (first 8 draws).
-    static const u64 env_trace_hash = [] {
-        const char* env = std::getenv("BB_TRACE_SHADER");
-        return env ? std::strtoull(env, nullptr, 16) : 0ull;
-    }();
-    u64 trace_hash = env_trace_hash;
+    u64 trace_hash = TraceTextures;
     u32 trace_generation = 0;
     if (LiveShaderDebugOn) {
         auto& live = LiveDebug();
@@ -3613,35 +3650,30 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
 }
 
 vk::Sampler Rasterizer::BindSampler(const AmdGpu::Sampler& sharp, bool is_depth, float lod_bias,
-                                    bool memo) {
+                                    SamplerMemoTable& memo) {
     const u64 border = Regs().ta_bc_base.base_addr;
-    const u32 epoch = memo ? texture_cache.SamplerEpoch() : 0;
-    SamplerMemoEntry* entry = nullptr;
-    if (memo) {
-        const u64 hash = sharp.raw0 * 0x9E3779B97F4A7C15ull ^ sharp.raw1 * 0xFF51AFD7ED558CCDull ^
-                         border * 0xC4CEB9FE1A85EC53ull ^
-                         u64(std::bit_cast<u32>(lod_bias)) << 5 ^ u64(is_depth);
-        entry = &sampler_memo[(hash ^ hash >> 29) & (SamplerMemoSize - 1)];
-        if (entry->valid && entry->epoch == epoch && entry->raw0 == sharp.raw0 &&
-            entry->raw1 == sharp.raw1 && entry->border == border &&
-            entry->is_depth == u32(is_depth) && entry->lod_bias == lod_bias) {
-            ++sampler_memo_hits;
-            return entry->sampler;
-        }
-        ++sampler_memo_misses;
+    const u32 epoch = texture_cache.SamplerEpoch();
+    const u64 hash =
+        sharp.raw0 * 0x9E3779B97F4A7C15ull ^ sharp.raw1 * 0xFF51AFD7ED558CCDull ^
+        border * 0xC4CEB9FE1A85EC53ull ^ u64(std::bit_cast<u32>(lod_bias)) << 5 ^ u64(is_depth);
+    SamplerMemoEntry& entry = memo.entries[(hash ^ hash >> 29) & (SamplerMemoSize - 1)];
+    if (entry.valid && entry.epoch == epoch && entry.raw0 == sharp.raw0 &&
+        entry.raw1 == sharp.raw1 && entry.border == border &&
+        entry.is_depth == u32(is_depth) && entry.lod_bias == lod_bias) {
+        ++memo.hits;
+        return entry.sampler;
     }
+    ++memo.misses;
     const vk::Sampler sampler =
         texture_cache.GetSampler(sharp, Regs().ta_bc_base, is_depth, lod_bias);
-    if (entry) {
-        entry->raw0 = sharp.raw0;
-        entry->raw1 = sharp.raw1;
-        entry->border = border;
-        entry->lod_bias = lod_bias;
-        entry->is_depth = u32(is_depth);
-        entry->epoch = epoch;
-        entry->valid = true;
-        entry->sampler = sampler;
-    }
+    entry.raw0 = sharp.raw0;
+    entry.raw1 = sharp.raw1;
+    entry.border = border;
+    entry.lod_bias = lod_bias;
+    entry.is_depth = u32(is_depth);
+    entry.epoch = epoch;
+    entry.valid = true;
+    entry.sampler = sampler;
     return sampler;
 }
 
@@ -3652,8 +3684,9 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, const PreparedStage* pr
         const auto& sampler = stage.samplers[sampler_index];
         auto ssharp =
             prepared ? prepared->sampler_sharps[sampler_index] : sampler.GetSharp(stage);
-        const vk::Sampler vk_sampler = BindSampler(
-            ssharp, sampler.is_depth, sampler.is_depth ? 0.0f : sampler_lod_bias, !on_helper);
+        const vk::Sampler vk_sampler =
+            BindSampler(ssharp, sampler.is_depth, sampler.is_depth ? 0.0f : sampler_lod_bias,
+                        on_helper ? helper_sampler_memo : sampler_memo);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
@@ -3818,11 +3851,19 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         std::printf("  scene proxies sampled directly: %llu bindings\n",
                     static_cast<unsigned long long>(proxy_samples));
         std::printf("  render targets: %llu memo hits, %llu misses; samplers: %llu hits, "
-                    "%llu misses\n",
+                    "%llu misses (helper %llu/%llu)\n",
                     static_cast<unsigned long long>(target_memo_hits),
                     static_cast<unsigned long long>(target_memo_misses),
-                    static_cast<unsigned long long>(sampler_memo_hits),
-                    static_cast<unsigned long long>(sampler_memo_misses));
+                    static_cast<unsigned long long>(sampler_memo.hits),
+                    static_cast<unsigned long long>(sampler_memo.misses),
+                    static_cast<unsigned long long>(helper_sampler_memo.hits),
+                    static_cast<unsigned long long>(helper_sampler_memo.misses));
+        // bbport: vertex input descriptions emitted against reused for the draw after it (a batch
+        // of one pipeline's draws describes the same formats).
+        std::printf("  vertex input: %llu emitted, %llu reused\n",
+                    static_cast<unsigned long long>(vertex_input_emits),
+                    static_cast<unsigned long long>(vertex_input_skips));
+        vertex_input_emits = vertex_input_skips = 0;
         // bbport: the five dynamic-state groups (viewport, depth/stencil, primitive,
         // rasterization, blend): how often a draw's packet left each one untouched.
         std::printf("  dynamic state recomputed/skipped:");
@@ -3837,7 +3878,8 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         texture_set_why = {};
         begin_memo_hits = begin_memo_misses = texture_set_hits = texture_set_misses = 0;
         target_memo_hits = target_memo_misses = 0;
-        sampler_memo_hits = sampler_memo_misses = 0;
+        sampler_memo.hits = sampler_memo.misses = 0;
+        helper_sampler_memo.hits = helper_sampler_memo.misses = 0;
         dynamic_state_updates = {};
         dynamic_state_skips = {};
     }

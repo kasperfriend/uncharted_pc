@@ -35,6 +35,15 @@ extern void (*g_gpu_stall_report)();
 bool (*g_draw_pipe_busy)() = nullptr;
 
 namespace {
+/// bbport: settings asked once per submission (or per recorded command) from static storage.
+#ifdef _WIN32
+/// BB_SUBMIT_THREADS=1 names each thread that submits through this scheduler (once).
+const bool SubmitThreads = std::getenv("BB_SUBMIT_THREADS") != nullptr;
+#endif
+const bool RecorderTrace = [] {
+    const char* env = std::getenv("BB_RECORDER_TRACE");
+    return env && env[0] == '1';
+}();
 // bbport: the last submissions to the graphics queue (all schedulers share it), printed when a
 // GPU wait stalls: which timeline value each one signals and which semaphores it waits for.
 struct SubmitRecord {
@@ -193,11 +202,7 @@ void Scheduler::EndRendering() {
 }
 
 void Scheduler::TraceDirectRecording(void* caller) {
-    static const bool enabled = [] {
-        const char* env = std::getenv("BB_RECORDER_TRACE");
-        return env && env[0] == '1';
-    }();
-    if (!enabled) {
+    if (!RecorderTrace) {
         return;
     }
     static std::mutex mutex;
@@ -478,10 +483,8 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
-    // bbport: BB_SUBMIT_THREADS=1 names each thread that submits through this scheduler (once).
-    static const bool submit_threads = std::getenv("BB_SUBMIT_THREADS") != nullptr;
 #ifdef _WIN32
-    if (submit_threads) {
+    if (SubmitThreads) {
         static std::mutex seen_mutex;
         static std::vector<std::pair<const Scheduler*, u32>> seen;
         const u32 tid = static_cast<u32>(GetCurrentThreadId());

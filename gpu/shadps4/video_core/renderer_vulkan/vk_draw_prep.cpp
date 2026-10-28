@@ -20,6 +20,15 @@ namespace Vulkan {
 
 namespace {
 
+/// bbport: settings asked once per submission (or per draw) from static storage, not through a
+/// function-local static: the guard variable was a load and a branch at every ask.
+const bool FrameStats = std::getenv("BB_FRAME_STATS") != nullptr;
+/// BB_PREP_COMPUTE=0: dispatches are left to the GPU command thread.
+const bool ComputePrep = [] {
+    const char* env = std::getenv("BB_PREP_COMPUTE");
+    return !env || env[0] != '0';
+}();
+
 bool IsDirectDraw(AmdGpu::PM4ItOpcode opcode) {
     using AmdGpu::PM4ItOpcode;
     return opcode == PM4ItOpcode::DrawIndex2 || opcode == PM4ItOpcode::DrawIndexOffset2 ||
@@ -414,10 +423,6 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
     sel.cs = cs.get();
     PrepWorker prep_worker{};
     sel.worker = &prep_worker;
-    static const bool compute_prep = [] {
-        const char* env = std::getenv("BB_PREP_COMPUTE"); // 0: dispatches are left to the GPU thread
-        return !env || env[0] != '0';
-    }();
     FlatArena arena;
     std::vector<std::shared_ptr<Submission>> path;
 
@@ -524,7 +529,7 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
                     if (assisting) {
                         abandoned = true;
                     }
-                } else if (compute_prep && index < target->num_dispatches &&
+                } else if (ComputePrep && index < target->num_dispatches &&
                            (cs->dispatch_initiator & 1) &&
                            !target->dispatch_taken[index].exchange(true)) {
                     pipeline_cache.PrepareComputePipeline(sel);
@@ -599,9 +604,8 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
 
 void DrawPreparation::Count(bool was_used) {
     ++(was_used ? used : unused);
-    static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
     // The clock is read every 1024 draws: per draw it was 8% of the GPU thread.
-    if (!stats || ((used + unused) & 1023) != 0) {
+    if (!FrameStats || ((used + unused) & 1023) != 0) {
         return;
     }
     static auto window = std::chrono::steady_clock::now();

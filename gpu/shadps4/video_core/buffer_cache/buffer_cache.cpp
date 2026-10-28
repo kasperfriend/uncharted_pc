@@ -1101,12 +1101,12 @@ void NoteHotUse(VAddr address, u32 size) {
 u64 RegionKey(VAddr address) {
     return (address >> 28) == 0x104 ? (address >> 20) | (1ull << 40) : address >> 28;
 }
+const bool BufferStatsOn = [] {
+    const char* value = std::getenv("BB_BUFFER_STATS");
+    return value && value[0] == '1';
+}();
 bool BufferStatsEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("BB_BUFFER_STATS");
-        return value && value[0] == '1';
-    }();
-    return enabled;
+    return BufferStatsOn;
 }
 BufferStats& Stats() {
     static BufferStats stats;
@@ -1161,12 +1161,12 @@ std::unordered_map<VAddr, StableBinding> stable_bindings;
 u64 stable_checked = 0, stable_changed = 0, stable_printed = 0;
 auto stable_window = std::chrono::steady_clock::now();
 
+const bool StableCheck = [] {
+    const char* env = std::getenv("BB_STABLE_CHECK");
+    return env && env[0] == '1';
+}();
 bool StableCheckEnabled() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("BB_STABLE_CHECK");
-        return env && env[0] == '1';
-    }();
-    return enabled;
+    return StableCheck;
 }
 
 u64 SampleHash(VAddr address, u32 size) {
@@ -1185,12 +1185,14 @@ u64 SampleHash(VAddr address, u32 size) {
 
 // bbport diagnosis: BB_CLOBBER_CHECK=1 — guest memory copied to the GPU over bytes the GPU wrote
 // that were never read back (skinned vertices: guest memory holds zeros there).
+// bbport: read once. These three were function-local statics asked on every buffer binding, so
+// each ask paid a call and the static's guard variable; static storage is one load.
+const bool ClobberCheck = [] {
+    const char* env = std::getenv("BB_CLOBBER_CHECK");
+    return env && env[0] == '1';
+}();
 static bool ClobberCheckEnabled() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("BB_CLOBBER_CHECK");
-        return env && env[0] == '1';
-    }();
-    return enabled;
+    return ClobberCheck;
 }
 
 static void ReportClobber(const char* path, VAddr address, u64 size, VAddr binding, u64 binding_size,

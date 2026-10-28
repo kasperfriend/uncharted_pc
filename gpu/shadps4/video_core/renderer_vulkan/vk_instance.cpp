@@ -983,18 +983,32 @@ u64 Instance::GetDeviceMemoryBudgetNow() const {
 }
 
 void Instance::QueryMemory(u64& usage, u64& budget) const {
-    vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
-    vk::PhysicalDeviceMemoryProperties2 props = {.pNext = &memory_budget_props};
-    physical_device.getMemoryProperties2(&props);
-    usage = 0;
-    budget = 0;
-    for (const size_t heap : valid_heaps) {
-        usage += memory_budget_props.heapUsage[heap];
-        budget += memory_budget_props.heapBudget[heap];
+    // bbport: the collector asks once per submission; the driver call behind this one is not
+    // free, and a budget moved by other processes does not change within a few milliseconds.
+    // The texture cache's own accounting (`pending_free_bytes`, the GC tick) moves with every
+    // frame, so a 4 ms old usage figure still tracks the images the collector is deciding about.
+    constexpr auto RefreshInterval = std::chrono::milliseconds(4);
+    const auto now = std::chrono::steady_clock::now();
+    if (!memory_query_valid || now - memory_query_time >= RefreshInterval) {
+        vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
+        vk::PhysicalDeviceMemoryProperties2 props = {.pNext = &memory_budget_props};
+        physical_device.getMemoryProperties2(&props);
+        u64 queried_usage = 0;
+        u64 queried_budget = 0;
+        for (const size_t heap : valid_heaps) {
+            queried_usage += memory_budget_props.heapUsage[heap];
+            queried_budget += memory_budget_props.heapBudget[heap];
+        }
+        if (const u64 test_limit = Vram::TestLimit(); test_limit && !IsIntegrated()) {
+            queried_budget = std::min<u64>(queried_budget, test_limit / 10 * 9);
+        }
+        memory_query_usage = queried_usage;
+        memory_query_budget = queried_budget;
+        memory_query_time = now;
+        memory_query_valid = true;
     }
-    if (const u64 test_limit = Vram::TestLimit(); test_limit && !IsIntegrated()) {
-        budget = std::min<u64>(budget, test_limit / 10 * 9);
-    }
+    usage = memory_query_usage;
+    budget = memory_query_budget;
 }
 
 bool Instance::VramAllows(u64 bytes) const {
