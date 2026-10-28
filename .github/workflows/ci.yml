@@ -62,7 +62,28 @@ jobs:
           sudo apt-get install -y -qq build-essential curl python3 python3-pil python3-tk
 
       - name: Guest instructions, HLE runtime, bit array, streaming copy
-        run: bash tools/ci/linux-tests.sh
+        run: |
+          mkdir -p out/tests
+          set +e
+          bash tools/ci/linux-tests.sh 2>&1 | tee out/tests/linux-tests.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ $status -ne 0 ]]; then
+            # The step's output is only reachable through a signed URL, so put what broke into
+            # the annotations of this run (and the tail into the job summary) before failing.
+            { echo '### tools/ci/linux-tests.sh failed'; echo '```';
+              tail -n 40 out/tests/linux-tests.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
+            emit() { printf '::error title=host tests::%s\n' "${1//$'\r'/}"; }
+            # The failing command and what the compiler or the test said about it.
+            grep -A6 -m 4 -E 'error:|FAILED|Assertion|assertion|mismatch|Segmentation|terminate called|std::bad_alloc|No such file' \
+              out/tests/linux-tests.log \
+              | grep -v '^--$' | while IFS= read -r line; do emit "${line:0:900}"; done || true
+            # And where the run stopped: the last lines of the log name the section.
+            tail -n 8 out/tests/linux-tests.log \
+              | while IFS= read -r line; do emit "last: ${line:0:900}"; done || true
+            emit "tools/ci/linux-tests.sh exited with status $status"
+            exit 1
+          fi
 
       # test_mods, test_run_settings and test_launcher_stop need a built port or Windows,
       # test_uncharted_i18n wants the launcher's new texts translated first.

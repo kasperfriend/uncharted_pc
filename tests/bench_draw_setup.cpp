@@ -174,8 +174,9 @@ int main() {
             auto* command = new (chunk.Allocate(sizeof(VertexInputCommand),
                                                 alignof(VertexInputCommand)))
                 VertexInputCommand{b, Bindings, a, Attributes};
-            command->Execute(nullptr);
-            command->~CommandBase();
+            CommandBase* base = command;
+            base->Execute(nullptr);
+            base->~CommandBase();
         }
         double t1 = NowNs();
         // Reuse: the state is already what the command buffer holds.
