@@ -715,3 +715,55 @@ All of it is on the tiling and crash paths; nothing was added to a draw. Checked
 replaying the walk and the bound (`/tmp/chk_tile.cpp`): no texel, dispatched or not, leaves the
 filled mip list, the last texel stays on the last mip, and a truncated list covers only its own
 mips.
+
+## Round 13: the third device lost - every transfer cut to its allocation
+
+The tiling bound of round 12 was not the cause: the third crash log's own dispatch record shows the
+detile landing in its 16 MiB staging block with `covers 0x540000 of guest 0x540000` (inside its
+block, nothing flagged), while the fault is a *write* at `0x10e7618000` - 18.09 MiB into that block
+and 2.09 MiB past its end. The nearest live buffer is an unnamed 16 MiB `MemoryType::DeviceLocal`
+buffer, i.e. one of the staging blocks (`StagingBufferPool`'s ring); the address is in no recorded
+allocation at all, so the write went past one. The faulting instruction pointer repeats across all
+three crashes in one 4 KiB page, and the driver's own copy/blit shaders live in that heap: the
+shape of the fault is a transfer, not a game shader (a shader's BDA store can only ever land in an
+arena - the page table holds arena addresses only).
+
+Vulkan makes a transfer that reaches past its buffer or past a level/layer of its image *undefined*:
+the driver writes where nothing is mapped, the device is lost, and the report points at the copy,
+never at the code that recorded it. Every one of the port's transfers is now cut to what the
+resource really has before it is recorded, and the cut is printed (12 times each) with the
+transfer's name:
+
+* `Runtime::UploadImage` / `Runtime::DownloadImage` - each region is checked against the buffer's
+  size and against the *VkImage's own* `mipLevels`/`arrayLayers`/level extent (an image's backing
+  can be a smaller alias of what the guest descriptor describes). Regions that do not fit are cut
+  or dropped; the image-side extent is only ever shrunk, and a block-compressed extent that has to
+  be cut is rounded down to whole blocks.
+* `Runtime::CopyBuffer` - both buffers' sizes bound every region.
+* `Runtime::FillBuffer` / `Runtime::InlineData` - a fill or update past its buffer is cut (it is a
+  transfer write too).
+* `Runtime::CopyImage` - each level's region is cut to both images' real level extent and array
+  layers, keeping the layer counts equal in the ways Vulkan requires (2D arrays copy layer for
+  layer, a 2D-to-3D copy's layer count is the volume's depth).
+* `Runtime::CopyMip` - the source's extent pasted into a destination *mip* used to be the source's
+  base extent unchecked; both are cut to the destination level and its remaining layers.
+* `Runtime::ClearImage` - a clear's subresource range is cut to the image's levels and layers (the
+  range comes from the guest).
+* `Runtime::CopyImageWithBuffer` (color/depth) - the intermediate copy is cut to both images and to
+  the buffer it passes through, and `CopyColorAndDepth` now sizes that buffer from the image
+  (level bytes x layers, at most 512 MiB) instead of always requesting a fixed 128 MiB that a
+  layered or larger image could outgrow.
+* `BufferImageCopySize` returns 64 bits and answers 0 for a region with no width, height or layer
+  (its `num_slices - 1` underflowed to ~4 GiB for an empty copy, which the barrier tracker then
+  used as a real size).
+
+The tiling shader is the one place where an index comes from the guest's own surface maths, so its
+*tiled* side is bounded as well: `TilingInfo` carries `tiled_bytes` (the bytes the bound buffer
+really has after the bind offset, `uint` after `num_texels` - the shader's scalar block has it at
+byte 16, checked), both descriptors' ranges are cut to the buffer, and `tiling.comp` drops a texel
+whose computed offset does not hold a whole element inside `tiled_bytes`. For a well formed surface
+the last texel still fits (checked over six surface shapes plus the block layout in
+`/tmp/r13/tile13.cpp`), so nothing is lost where nothing was wrong.
+
+Net effect: no dispatch or transfer the port records can write outside an allocation any more, and
+if a caller ever hands one a region that would, the log says which transfer and by how much.

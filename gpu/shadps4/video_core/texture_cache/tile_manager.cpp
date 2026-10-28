@@ -40,7 +40,8 @@ struct TilingInfo {
     u32 bank_swizzle;
     u32 num_slices;
     u32 num_mips;
-    u32 num_texels; ///< the texels the filled mips hold (the shader's hard bound)
+    u32 num_texels;  ///< the texels the filled mips hold (the shader's hard bound)
+    u32 tiled_bytes; ///< the bytes the tiled side has (the shader's bound on that side)
     std::array<ImageInfo::MipInfo, 16> mips;
 };
 
@@ -336,6 +337,17 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     const u32 dim_x = (texels + 63) / 64;
     params.num_texels = texels;
 
+    // bbport: the tiled side is bound for the image's guest size, but the buffer behind it can
+    // hold less than that after the offset (an image at the end of an arena chunk, a staging
+    // block): the descriptor range is cut to what is there and the shader drops the texels the
+    // surface maths puts past it (tiling.comp). A read or a write past the buffer is a lost
+    // device, and neither descriptor used to be checked.
+    if (in_offset >= in_buffer->SizeBytes()) {
+        return {in_buffer, in_offset};
+    }
+    const u64 tiled_bytes = std::min<u64>(info.guest_size, in_buffer->SizeBytes() - in_offset);
+    params.tiled_bytes = static_cast<u32>(std::min<u64>(tiled_bytes, ~u32{0}));
+
     const vk::DescriptorBufferInfo params_buffer_info{
         .buffer = stream_buffer.Handle(),
         .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
@@ -343,6 +355,9 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     };
 
     const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
+    if (staging.size < info.guest_size) {
+        return {in_buffer, in_offset};
+    }
 
     scheduler.EndRendering();
     runtime.FlushBarriers();
@@ -350,7 +365,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = in_buffer->Handle(),
         .offset = in_offset,
-        .range = info.guest_size,
+        .range = tiled_bytes,
     };
     const vk::DescriptorBufferInfo linear_buffer_info{
         .buffer = staging.buffer->Handle(),
@@ -419,13 +434,24 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     const u32 dim_x = (texels + 63) / 64;
     params.num_texels = texels;
 
+    // bbport: see DetileImage: the tiler writes the tiled side, so that range is cut to the
+    // buffer and the shader drops the texels it would put past it.
+    if (out_offset >= out_buffer->SizeBytes()) {
+        return;
+    }
+    const u64 tiled_bytes = std::min<u64>(info.guest_size, out_buffer->SizeBytes() - out_offset);
+    params.tiled_bytes = static_cast<u32>(std::min<u64>(tiled_bytes, ~u32{0}));
+
+    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
+    if (staging.size < info.guest_size) {
+        return;
+    }
+
     const vk::DescriptorBufferInfo params_buffer_info{
         .buffer = stream_buffer.Handle(),
         .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
         .range = sizeof(params),
     };
-
-    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
     for (auto& copy : buffer_copies) {
         copy.bufferOffset += staging.offset;
     }
@@ -436,7 +462,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = out_buffer->Handle(),
         .offset = out_offset,
-        .range = info.guest_size,
+        .range = tiled_bytes,
     };
     const vk::DescriptorBufferInfo linear_buffer_info{
         .buffer = staging.buffer->Handle(),
@@ -458,7 +484,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     RecordTilingDispatch(GetTilingPipeline(info, true), tiled_buffer_info, linear_buffer_info,
                          params_buffer_info, dim_x);
 
-    runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
+    runtime.AccessBuffer(out_buffer, out_offset, tiled_bytes,
                          vk::PipelineStageFlagBits2::eComputeShader,
                          vk::AccessFlagBits2::eShaderWrite);
 }

@@ -106,6 +106,10 @@ layout (set = 0, binding = 2, scalar) uniform TilingInfo {
     // bbport: the texels the filled mips hold, so a dispatch of whole workgroups cannot address
     // past them (VideoCore::TilingInfo has the same field in the same place).
     uint num_texels;
+    // bbport: the bytes the tiled side of the dispatch (binding 0) really has after the bind
+    // offset: the surface maths below is the guest's, so an offset it computes past the buffer is
+    // a read or a write into memory nothing maps -- a device lost. Both are dropped.
+    uint tiled_bytes;
     MipInfo mips[16];
 } info;
 
@@ -455,6 +459,10 @@ void main() {
     tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, 0);
 #endif
 
+    // bbport: the element this texel lands on has to be inside the tiled buffer (see tiled_bytes).
+    if (tiled_offset >= info.tiled_bytes || BYTES_PER_PIXEL > info.tiled_bytes - tiled_offset) {
+        return;
+    }
     if (IS_TILER != 0) {
         tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];
     } else {
