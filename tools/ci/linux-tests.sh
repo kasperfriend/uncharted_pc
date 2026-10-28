@@ -7,6 +7,9 @@
 # Needs gcc/g++ and Zydis: from the distribution (Debian/Ubuntu: libzydis-dev), or the script
 # builds Zydis v4.1.1 and Zycore v1.5.0 from source into out/tests/zydis/ (needs curl and tar).
 set -euo pipefail
+# A red run should say where it stopped: the step's output is only reachable through a signed
+# URL, so the failing command and line go to stderr, which is captured like the rest.
+trap 'printf "linux-tests.sh: line %s failed: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 cd -- "$(dirname -- "$0")/../.."
 out=out/tests
 rm -rf "$out"
@@ -15,6 +18,7 @@ mkdir -p "$out"
 # --- Zydis -----------------------------------------------------------------------------------
 zydis_inc=()
 zydis_lib=()
+zydis_ok=1
 if [[ -f /usr/include/Zydis/Zydis.h || -f /usr/local/include/Zydis/Zydis.h ]]; then
     zydis_lib=(-lZydis)
     echo 'Zydis: system'
@@ -22,33 +26,53 @@ else
     echo 'Zydis: building v4.1.1 from source'
     src=$out/zydis/src
     mkdir -p "$src"
-    fetch() { curl -fsSL --retry 3 -o "$src/$2" "https://codeload.github.com/$1/tar.gz/refs/tags/$2"; }
-    fetch zyantific/zydis v4.1.1
-    fetch zyantific/zycore-c v1.5.0
-    mkdir -p "$src/zydis" "$src/zycore"
-    tar xzf "$src/v4.1.1" -C "$src/zydis" --strip-components=1
-    tar xzf "$src/v1.5.0" -C "$src/zycore" --strip-components=1
+    # Two ways to the same tarball: the release host and the repository archive. A fetch that
+    # fails takes the instruction-rewriting test with it, so it is worth the second attempt.
+    fetch() {
+        local repo=$1 tag=$2 url
+        for url in "https://codeload.github.com/$repo/tar.gz/refs/tags/$tag" \
+                   "https://github.com/$repo/archive/refs/tags/$tag.tar.gz"; do
+            if curl -fsSL --retry 4 --retry-all-errors --connect-timeout 20 -o "$src/$tag" "$url"; then
+                return 0
+            fi
+            echo "Zydis: $url did not download"
+        done
+        return 1
+    }
+    if fetch zyantific/zydis v4.1.1 && fetch zyantific/zycore-c v1.5.0; then
+        mkdir -p "$src/zydis" "$src/zycore"
+        tar xzf "$src/v4.1.1" -C "$src/zydis" --strip-components=1
+        tar xzf "$src/v1.5.0" -C "$src/zycore" --strip-components=1
+    else
+        zydis_ok=0
+    fi
     zy=$src/zycore
     zd=$src/zydis
-    flags=(-std=gnu99 -O2 -fPIC -DZYAN_INCLUDE_LIBC=1 -I"$zy/include" -I"$zy/src")
-    for source in "$zy"/src/*.c; do
-        gcc "${flags[@]}" -c "$source" -o "$src/zc_$(basename "${source%.c}").o" 2>>"$out/zydis-build.log"
-    done
-    zflags=(-std=gnu99 -O2 -fPIC -DZYDIS_STATIC_BUILD=1 -DZYAN_INCLUDE_LIBC=1
-            -I"$zy/include" -I"$zd/include" -I"$zd/src")
-    for source in "$zd"/src/*.c; do
-        gcc "${zflags[@]}" -c "$source" -o "$src/zd_$(basename "${source%.c}").o" 2>>"$out/zydis-build.log"
-    done
-    ar rcs "$src/libzydis.a" "$src"/*.o
-    zydis_inc=(-I"$zd/include" -I"$zy/include")
-    zydis_lib=("$src/libzydis.a")
+    if [[ $zydis_ok -eq 1 ]]; then
+        flags=(-std=gnu99 -O2 -fPIC -DZYAN_INCLUDE_LIBC=1 -I"$zy/include" -I"$zy/src")
+        for source in "$zy"/src/*.c; do
+            gcc "${flags[@]}" -c "$source" -o "$src/zc_$(basename "${source%.c}").o" \
+                2>>"$out/zydis-build.log"
+        done
+        zflags=(-std=gnu99 -O2 -fPIC -DZYDIS_STATIC_BUILD=1 -DZYAN_INCLUDE_LIBC=1
+                -I"$zy/include" -I"$zd/include" -I"$zd/src")
+        for source in "$zd"/src/*.c; do
+            gcc "${zflags[@]}" -c "$source" -o "$src/zd_$(basename "${source%.c}").o" \
+                2>>"$out/zydis-build.log"
+        done
+        ar rcs "$src/libzydis.a" "$src"/*.o
+        zydis_inc=(-I"$zd/include" -I"$zy/include")
+        zydis_lib=("$src/libzydis.a")
+    fi
 fi
 
 c11=(-std=c11 -O2 -g -Wall -Wextra -Werror)
 
 # --- CPU instruction rewriting ----------------------------------------------------------------
 # The test runs each instruction natively first and then rewritten, so the CPU must have them.
-if grep -qw bmi1 /proc/cpuinfo && grep -qw movbe /proc/cpuinfo && grep -qw abm /proc/cpuinfo; then
+if [[ ${#zydis_lib[@]} -eq 0 ]]; then
+    echo '== cpu_patch: skipped (Zydis unavailable)'
+elif grep -qw bmi1 /proc/cpuinfo && grep -qw movbe /proc/cpuinfo && grep -qw abm /proc/cpuinfo; then
     gcc "${c11[@]}" -pthread -Isrc "${zydis_inc[@]}" tests/test_cpu_patch.c src/cpu_patch.c \
         "${zydis_lib[@]}" -o "$out/cpu-patch-test"
     echo '== cpu_patch: every rewritten instruction against the native one'

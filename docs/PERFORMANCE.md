@@ -426,15 +426,16 @@ image search they were meant to skip.
   only by the helper), keyed and epoch-guarded exactly like the GPU thread's, and the stats line
   reports both halves. `tests/bench_draw_setup.cpp` measures the shape of the two lookups (a hash,
   an uncontended mutex, a map probe and an LRU touch against two multiplies and five compares):
-  **4.4 ns against 2.5 ns** for a sampler a frame binds over and over, and the cache's own path
-  adds what the harness cannot show — the XXH3 call over the S#, a second `at()` lookup on a
-  miss, and a lock the GPU thread also takes.
+  **4.4 ns against 2.2 ns** for a sampler a frame binds over and over — a draw binds about eight,
+  35 ns against 18 ns — and the cache's own path adds what the harness cannot show: the XXH3 call
+  over the S#, a second `at()` lookup on a miss, and a lock the GPU thread also takes.
 - **Vertex input state.** A draw sets the vertex formats, strides and attribute offsets as dynamic
   state (`setVertexInputEXT`), and a batch of draws of one pipeline describes the same set. The
   state stays live in the command buffer until something sets it again, so a draw whose description
   equals the last one emitted records nothing: two `memcmp`s (nine 16-byte entries) stand in front
-  of the two copies into the recording chunk and the command that carries them, 3.1 ns against
-  3.6 ns of chunk work in `tests/bench_draw_setup.cpp` — and the recorded command itself, a driver
+  of the two copies into the recording chunk and the command that carries them, 2.7 ns against
+  4.6 ns of chunk work in `tests/bench_draw_setup.cpp` (1.7×, measured with the clang the port
+  ships) — and the recorded command itself, a driver
   call that validates the description and writes it into the command buffer, is gone. The memo is
   dropped when the scheduler's invalidating count moves (a new command buffer needs the state
   again), which is the same edge `UpdateDynamicState` uses. `BB_FRAME_STATS=1` prints emitted
@@ -457,7 +458,7 @@ Every one of the draw path's diagnostics (`BB_FRAME_STATS`, `BB_TRACE_BUFFERS`, 
 was read through a function-local static, which is initialized once but *asked* on every draw,
 binding or submission: the ask is a guard variable's acquire load and a branch. They are now
 `const` objects in static storage, read at load. `tests/bench_draw_setup.cpp` measures the
-difference the way the call sites see it — **0.69 ns against 0.47 ns** per ask, times the handful
+difference the way the call sites see it — **0.63 ns against 0.47 ns** per ask, times the handful
 of asks per draw -- and the same treatment was given to the settings the draw-preparation workers
 and the scheduler ask per submission.
 
