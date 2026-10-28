@@ -14,7 +14,6 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
-#include <list>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>

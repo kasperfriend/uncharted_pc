@@ -550,6 +550,8 @@ const u32 VerifyInterval = [] {
     const char* env = std::getenv("BB_PIPE_VERIFY");
     return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
 }();
+} // namespace
+
 bool Rasterizer::DrawPipeWanted() {
     const char* env = std::getenv("BB_DRAW_PIPE");
     if (env && env[0]) {
