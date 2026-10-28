@@ -17,6 +17,7 @@
 #include <vector>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <queue>
 
 #include "bbport_toggles.h"
