@@ -126,11 +126,16 @@ gcc "${c11[@]}" -pthread -I. -Isrc tests/test_runtime_sync.c src/runtime_sema.c 
 "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_resident_span.cpp \
     -o "$out/resident-span-test"
 "$out/resident-span-test"
+# The memo key of the render-target and render-state lookups (common/byte_key.h): a false match
+# there binds the wrong target, so the key must be exactly the bytes it was given.
+"$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -Igpu/shadps4 tests/test_byte_key.cpp \
+    -o "$out/byte-key-test"
+"$out/byte-key-test"
 # ... and both again with the sanitizers, because the stamping reads and writes a page table by
 # vector and the span is memory the previous query left behind.
 if "$cxx" -fsanitize=address,undefined -x c++ -c /dev/null -o /dev/null 2>/dev/null; then
-    echo '== page stamp and residency span, ASan + UBSan'
-    for source in tests/test_page_stamp.cpp tests/test_resident_span.cpp; do
+    echo '== page stamp, residency span and memo keys, ASan + UBSan'
+    for source in tests/test_page_stamp.cpp tests/test_resident_span.cpp tests/test_byte_key.cpp; do
         "$cxx" -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
             -Igpu/shadps4 "$source" -o "$out/sanitized-test"
         "$out/sanitized-test" | tail -1

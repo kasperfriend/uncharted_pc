@@ -545,7 +545,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // An exact match stays valid while that image is registered with the same description;
     // resolved overlaps (views into other images) only until any image registration changes.
     const auto still_exact = [&] {
-        if (cached.view_mip >= 0 || cached.view_slice >= 0 || !cached.image_id) {
+        if (cached.view_mip >= 0 || cached.view_slice >= 0 || !cached.image_id ||
+            !slot_images.is_allocated(cached.image_id)) {
             return false;
         }
         const Image& image = slot_images[cached.image_id];

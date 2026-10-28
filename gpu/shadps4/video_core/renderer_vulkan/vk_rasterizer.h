@@ -6,6 +6,7 @@
 #include <mutex>
 #include <vector>
 
+#include "common/byte_key.h"
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -188,6 +189,10 @@ private:
     /// dispatches end it).
     struct BeginSignature {
         std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS + 1> ids{};
+        /// bbport: the uid of each attachment image, so the memo holds while its own images live
+        /// (the registry generation it used instead dropped every entry whenever any image was
+        /// created or collected).
+        std::array<u64, AmdGpu::NUM_COLOR_BUFFERS + 1> uids{};
         std::array<VideoCore::ImageViewInfo, AmdGpu::NUM_COLOR_BUFFERS + 1> views{};
         u32 mrt_mask = 0;
         u32 num_samples = 0;
@@ -196,7 +201,6 @@ private:
         bool scene_started = false;
         bool raster_scaling = false;
         u64 upscaler_state = 0;
-        u64 generation = 0;
         u32 depth_control = 0;
         bool depth_valid = false;
         bool stencil_valid = false;
@@ -282,16 +286,19 @@ private:
     struct TextureSet {
         u64 key = 0;
         const Shader::Info* stage = nullptr;
-        u64 generation = ~0ull;
         u64 scene_generation = 0; ///< SceneTargets::Generation of the proxy views
         u32 count = 0;
         static constexpr u32 MaxImages = 16; ///< larger sets are not memoized
         std::array<u64, MaxImages> hashes{};
+        /// bbport: the image uid of each entry when the set was recorded. An unrelated image
+        /// being registered or collected used to throw every set away (RegistryGeneration);
+        /// comparing uids keeps the set for exactly as long as its own images live.
+        std::array<u64, MaxImages> uids{};
         std::array<TextureSetEntry, MaxImages> entries{};
     };
     std::array<TextureSet, 32768> texture_sets{};
     u64 texture_set_hits = 0, texture_set_misses = 0;
-    std::array<u64, 4> texture_set_why{}; ///< misses: other key, generation, image check, new
+    std::array<u64, 4> texture_set_why{}; ///< misses: other key, image uid, image check, other
     /// Returns true when the stage's images were bound from the memo.
     bool BindTexturesFromSet(const Shader::Info& stage, const PreparedStage* prepared,
                              u32 first_image_idx, bool& barrier, TextureSet*& slot);
@@ -387,8 +394,10 @@ private:
         std::array<u64, 4> sharp{};
         u32 flags = ~0u;
         VideoCore::TextureCache::ImageDesc desc;
-        // Memoized FindImage for bindings without mip overrides (TextureBindingMemo).
-        u64 found_generation = ~0ULL;
+        // Memoized FindImage for bindings without mip overrides (TextureBindingMemo): the image
+        // it resolved to, and that image's uid (0 while there is no memo). The uid, not the
+        // registry generation, says whether the same image is still in the slot.
+        u64 found_uid = 0;
         VideoCore::ImageId found_id{};
         VideoCore::TextureCache::ImageDesc found_desc;
         u64 pinned = 0; ///< bind_epoch of the BindTextures call referencing found_desc
@@ -404,22 +413,34 @@ private:
     boost::container::static_vector<VideoCore::TextureCache::ImageDesc, Shader::NUM_IMAGES * 2>
         image_desc_storage;
     u64 bind_epoch = 0;
-    // bbport: render/depth target lookups memoized by their raw register bytes while image
-    // registrations are unchanged (the descriptions depend only on those registers).
+    // bbport: render/depth target lookups memoized by the raw register bytes of the target (the
+    // description depends only on those registers, the extent hint and the depth view).
+    //
+    // The key is the concatenation of exactly the bytes the call was given, stored at the size
+    // of the call's parts: it used to be a zero-filled 256-byte array, which cost a 256-byte
+    // store (and on a miss a hash over all 256 bytes) per attachment per draw.
+    // Entries live as long as the image they resolved to: an *unrelated* image being registered
+    // or collected used to invalidate all of them (RegistryGeneration), several times a frame
+    // while streaming.
+    // The largest key is a color target -- a u32 tag, the 60-byte color buffer register and the
+    // 4-byte extent hint, 68 bytes; a depth target is 56. The assert in FindTargetMemoized fails
+    // the build if a call ever passes more.
+    static constexpr u32 TargetKeyBytes = 72;
+    /// The key of a target lookup: exactly the bytes of the call's parts (common/byte_key.h).
+    using TargetKey = Common::ByteKey<TargetKeyBytes>;
     struct TargetMemo {
-        std::array<u8, 256> key{};
-        u32 key_size = 0;
-        u64 generation = ~0ULL;
+        TargetKey key;
+        u64 image_uid = 0;
         VideoCore::ImageId image_id{};
         VideoCore::TextureCache::ImageDesc desc;
     };
     std::array<TargetMemo, 64> target_memo{};
+    u64 target_memo_hits = 0, target_memo_misses = 0;
     // bbport: consecutive draws mostly keep their targets; the slot's description (cb_descs,
     // db_desc) is then still the right one and is neither looked up nor copied.
     struct LastTarget {
-        std::array<u8, 256> key{};
-        u32 key_size = 0;
-        u64 generation = ~0ULL;
+        TargetKey key;
+        u64 image_uid = 0;
         VideoCore::ImageId image_id{};
     };
     std::array<LastTarget, AmdGpu::NUM_COLOR_BUFFERS + 1> last_targets{}; ///< CBs, then DB

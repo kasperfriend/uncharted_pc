@@ -94,6 +94,21 @@ public:
         return registry_generation.load(std::memory_order_acquire);
     }
 
+    /// bbport: the identity of whatever image occupies `image_id`'s slot, 0 when the slot is
+    /// free. Image uids are handed out once and never reused, so two lookups returning the same
+    /// non-zero value mean the same image is still there -- which is what the per-draw memos
+    /// (texture sets, render targets, render-state signature) have to know. They used to compare
+    /// RegistryGeneration instead, which any *unrelated* image being created or collected
+    /// invalidated: during streaming that discarded every memo entry several times a frame.
+    /// Reading a free slot is guarded by the slot vector's allocation bits, so a collected image
+    /// is never touched.
+    [[nodiscard]] u64 ImageUid(ImageId image_id) const noexcept {
+        if (!image_id || !slot_images.is_allocated(image_id)) {
+            return 0;
+        }
+        return slot_images[image_id].image_uid;
+    }
+
     /// bbport: FindImage's access tick for an image found by a memoized lookup. The LRU touch
     /// FindImage also does happens in UpdateImage (FindTexture), which every binding reaches.
     void MarkFound(ImageId image_id) {
@@ -216,6 +231,12 @@ public:
         auto& image = slot_images[id];
         TouchImage(image);
         return image;
+    }
+    /// bbport: the image in `id`'s slot without the LRU touch GetImage does, for read-only
+    /// looks and prefetching (and for reading an image whose slot may have been reused: check
+    /// ImageUid first).
+    [[nodiscard]] const Image& PeekImage(ImageId id) const noexcept {
+        return slot_images[id];
     }
 
     /// Retrieves the image view with the specified id.

@@ -306,53 +306,48 @@ template <typename... Parts>
 VideoCore::ImageId Rasterizer::FindTargetMemoized(VideoCore::TextureCache::ImageDesc& desc,
                                                   LastTarget& last, auto&& make_desc,
                                                   const Parts&... parts) {
-    static_assert((sizeof(Parts) + ...) <= 256, "target memo key too large");
-    std::array<u8, 256> key{};
-    u32 key_size = 0;
-    const auto append = [&](const auto& part) {
-        std::memcpy(key.data() + key_size, &part, sizeof(part));
-        key_size += sizeof(part);
-    };
-    (append(parts), ...);
-    const u64 generation = texture_cache.RegistryGeneration();
+    // The key is exactly the bytes of the call's parts: neither a zero fill of a maximum-size
+    // buffer nor a hash over bytes that were never written.
+    static_assert((sizeof(Parts) + ...) <= TargetKeyBytes, "target memo key too large");
+    TargetKey key;
+    key.Set(parts...);
+
     const bool memo_enabled = !BbToggle::Disabled(BbToggle::TextureBindingMemo);
-    if (memo_enabled && last.generation == generation && last.key_size == key_size &&
-        std::memcmp(last.key.data(), key.data(), key_size) == 0) {
+    // The same image still in its slot (its uid), and the same target registers: this is the
+    // draw after the previous one, which mostly draws into the same place.
+    if (memo_enabled && last.image_uid != 0 &&
+        texture_cache.ImageUid(last.image_id) == last.image_uid && last.key.Equals(key)) {
         texture_cache.MarkFound(last.image_id);
+        ++target_memo_hits;
         return last.image_id;
     }
     const auto remember = [&](VideoCore::ImageId image_id) {
         last.key = key;
-        last.key_size = key_size;
-        last.generation = generation;
         last.image_id = image_id;
+        last.image_uid = texture_cache.ImageUid(image_id);
     };
-    u64 hash = 0xCBF29CE484222325ull;
-    for (u32 i = 0; i < key_size; i += 8) {
-        u64 word;
-        std::memcpy(&word, key.data() + i, 8);
-        hash = (hash ^ word) * 0x100000001B3ull;
-        hash ^= hash >> 29;
-    }
+    const u64 hash = XXH3_64bits(key.bytes, key.size);
     auto& memo = target_memo[hash % target_memo.size()];
-    if (memo.generation == generation && memo.key_size == key_size &&
-        std::memcmp(memo.key.data(), key.data(), key_size) == 0 && memo_enabled) {
+    if (memo_enabled && memo.image_uid != 0 &&
+        texture_cache.ImageUid(memo.image_id) == memo.image_uid && memo.key.Equals(key)) {
         desc = memo.desc;
         texture_cache.MarkFound(memo.image_id);
         remember(memo.image_id);
+        ++target_memo_hits;
         return memo.image_id;
     }
+    ++target_memo_misses;
     make_desc();
     const VideoCore::ImageId image_id = texture_cache.FindImage(desc);
-    if (generation == texture_cache.RegistryGeneration()) {
+    const u64 image_uid = texture_cache.ImageUid(image_id);
+    if (image_uid != 0) {
         memo.key = key;
-        memo.key_size = key_size;
-        memo.generation = generation;
         memo.image_id = image_id;
+        memo.image_uid = image_uid;
         memo.desc = desc;
         remember(image_id);
     } else {
-        last.generation = ~0ULL;
+        last.image_uid = 0;
     }
     return image_id;
 }
@@ -2370,7 +2365,6 @@ bool Rasterizer::HelperEligible(const Pipeline* pipeline) const {
 
 bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
                                           const PreparedStage* prepared) {
-    const u64 generation = texture_cache.RegistryGeneration();
     for (u32 image_index = 0; image_index < stage.images.size(); ++image_index) {
         const auto& image_desc = stage.images[image_index];
         if (image_desc.is_written) {
@@ -2388,7 +2382,10 @@ bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
         const auto& entry =
             prepared ? CachedImageDescEntry(tsharp, image_desc, prepared->image_hashes[image_index])
                      : CachedImageDescEntry(tsharp, image_desc);
-        if (entry.found_generation != generation) {
+        // The helper may only bind images whose description the GPU thread already resolved to
+        // an image that is still there (uid): anything else needs a lookup, an upload or a
+        // barrier, which belong to the GPU thread.
+        if (entry.found_uid == 0 || texture_cache.ImageUid(entry.found_id) != entry.found_uid) {
             return false;
         }
         VideoCore::ImageId image_id = entry.found_id;
@@ -3205,7 +3202,7 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
         entry.desc = VideoCore::TextureCache::ImageDesc{sharp, res};
         entry.sharp = key;
         entry.flags = flags;
-        entry.found_generation = ~0ULL;
+        entry.found_uid = 0;
         entry.view_memo = {};
     }
     return entry;
@@ -3396,9 +3393,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         };
         for (auto i = 0; i < num_bindings; i++) {
             // bbport: a plain binding (no mip override) of the same T# resolves to the same image
-            // while no image was registered or unregistered.
+            // for as long as that image is still in its slot (its uid says so; the registry
+            // generation this used to test dropped the memo whenever any other image changed).
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::None &&
-                desc_entry.found_generation == texture_cache.RegistryGeneration() &&
+                desc_entry.found_uid != 0 &&
+                texture_cache.ImageUid(desc_entry.found_id) == desc_entry.found_uid &&
                 !BbToggle::Disabled(BbToggle::TextureBindingMemo)) {
                 desc_entry.pinned = bind_epoch;
                 auto& [image_id, _] =
@@ -3433,12 +3432,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 desc.view_info.range.extent.levels = 1;
             }
 
-            const u64 generation = texture_cache.RegistryGeneration();
             image_id = texture_cache.FindImage(desc);
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::None &&
-                generation == texture_cache.RegistryGeneration() &&
                 desc_entry.pinned != bind_epoch) {
-                desc_entry.found_generation = generation;
+                desc_entry.found_uid = texture_cache.ImageUid(image_id);
                 desc_entry.found_id = image_id;
                 desc_entry.found_desc = desc;
                 desc_entry.view_memo = {};
@@ -3560,11 +3557,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         }
     }
     if (set_ok && image_bindings.size() == stage.images.size()) {
-        // Remember the set: the same T#s resolve the same way while no image is (un)registered.
-        set_slot->generation = texture_cache.RegistryGeneration();
+        // Remember the set: the same T#s resolve the same way while the images it resolved to
+        // are still the ones in their slots (their uids, not the whole registry, say that).
         set_slot->scene_generation = scene_targets->Generation();
         set_slot->count = static_cast<u32>(stage.images.size());
         std::copy_n(resolved.begin(), set_slot->count, set_slot->entries.begin());
+        for (u32 i = 0; i < set_slot->count; ++i) {
+            set_slot->uids[i] = set_slot->entries[i].id ? texture_cache.ImageUid(set_slot->entries[i].id) : 0;
+        }
     } else if (set_slot) {
         set_slot->key = 0;
     }
@@ -3622,7 +3622,12 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
         }
         sig.color_samples[cb] = key.color_samples[cb];
     }
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        sig.uids[cb] = sig.ids[cb] ? texture_cache.ImageUid(sig.ids[cb]) : 0;
+    }
     sig.ids[AmdGpu::NUM_COLOR_BUFFERS] = db_desc.first;
+    sig.uids[AmdGpu::NUM_COLOR_BUFFERS] =
+        db_desc.first ? texture_cache.ImageUid(db_desc.first) : 0;
     if (db_desc.first) {
         sig.views[AmdGpu::NUM_COLOR_BUFFERS] = db_desc.second.view_info;
     }
@@ -3632,7 +3637,6 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
     sig.scene_started = scene_started;
     sig.raster_scaling = upscaler->RasterScaling();
     sig.upscaler_state = upscaler->RedirectState();
-    sig.generation = texture_cache.RegistryGeneration();
     std::memcpy(&sig.depth_control, &regs.depth_control, sizeof(u32));
     sig.depth_valid = regs.depth_buffer.DepthValid();
     sig.stencil_valid = regs.depth_buffer.StencilValid();
@@ -3651,32 +3655,49 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
             return false;
         }
     }
-    u64 key = XXH3_64bits_withSeed(prepared->image_hashes, count * sizeof(u64),
-                                   reinterpret_cast<u64>(&stage));
-    key |= 1; // 0 marks an empty slot
+    // The key is hashed by the draw-preparation worker (PreparedStage::texture_set_key); only a
+    // draw whose preparation did not survive has to hash its own hashes here.
+    const u64 key = prepared->texture_set_key ? prepared->texture_set_key
+                                              : XXH3_64bits_withSeed(prepared->image_hashes,
+                                                                     count * sizeof(u64),
+                                                                     reinterpret_cast<u64>(&stage)) | 1;
     auto& set = texture_sets[key % texture_sets.size()];
     slot = &set;
-    const u64 generation = texture_cache.RegistryGeneration();
     const bool match = set.key == key && set.stage == &stage && set.count == count &&
-                       set.generation == generation &&
                        set.scene_generation == scene_targets->Generation() &&
                        std::equal(set.hashes.begin(), set.hashes.begin() + count,
                                   prepared->image_hashes);
     if (!match) {
-        ++texture_set_why[set.key != key ? 0 : set.generation != generation ? 1 : 3];
+        ++texture_set_why[set.key != key ? 0 : 3];
         ++texture_set_misses;
         set.key = key;
         set.stage = &stage;
         set.count = 0;
-        set.generation = ~0ull;
+        set.scene_generation = 0;
         std::copy_n(prepared->image_hashes, count, set.hashes.begin());
         return false;
     }
-    // Every image still has the backing its view belongs to and needs no refresh.
+    // Every image is the one this set was recorded with, still has the backing its view belongs
+    // to, and needs no refresh.
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
         if (!entry.id) {
             continue;
+        }
+        // Each step reads an Image out of the slot array (a large array: a scene's textures are
+        // scattered over it), and the checks of one step depend on the loads of the previous
+        // one. Asking for the next two images while this one is checked overlaps those misses.
+        if (i + 1 < count && set.entries[i + 1].id) {
+            __builtin_prefetch(&texture_cache.PeekImage(set.entries[i + 1].id), 0, 1);
+        }
+        if (i + 2 < count && set.entries[i + 2].id) {
+            __builtin_prefetch(&texture_cache.PeekImage(set.entries[i + 2].id), 0, 1);
+        }
+        if (texture_cache.ImageUid(entry.id) != set.uids[i]) {
+            ++texture_set_why[1];
+            ++texture_set_misses;
+            set.key = 0;
+            return false;
         }
         const auto& image = texture_cache.GetImage(entry.id);
         // Proxy entries need a current proxy; native entries of a proxied image go through
@@ -3691,7 +3712,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
             (upscaler->Enabled() && upscaler->RedirectsSampled(entry.id))) {
             ++texture_set_why[2];
             ++texture_set_misses;
-            set.generation = ~0ull;
+            set.key = 0;
             return false;
         }
     }
@@ -3735,7 +3756,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                     static_cast<unsigned long long>(begin_memo_misses),
                     static_cast<unsigned long long>(texture_set_hits),
                     static_cast<unsigned long long>(texture_set_misses));
-        std::printf("  texture set misses: other key %llu, generation %llu, image check %llu, "
+        std::printf("  texture set misses: other key %llu, image uid %llu, image check %llu, "
                     "other %llu\n",
                     (unsigned long long)texture_set_why[0], (unsigned long long)texture_set_why[1],
                     (unsigned long long)texture_set_why[2], (unsigned long long)texture_set_why[3]);
@@ -3872,7 +3893,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         }
         auto* image = &texture_cache.GetImage(image_id);
         if (image->binding.needs_rebind) {
-            last_targets[cb].generation = ~0ULL; // FindImage may rewrite the description
+            last_targets[cb].image_uid = 0; // FindImage may rewrite the description
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             image = &texture_cache.GetImage(image_id);
         }

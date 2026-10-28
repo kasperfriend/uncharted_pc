@@ -119,6 +119,11 @@ void PrepareResources(const Shader::Info& info, PreparedStage& stage, FlatArena&
     stage.num_images = static_cast<u32>(images.size());
     stage.num_samplers = static_cast<u32>(samplers.size());
     stage.num_buffers = static_cast<u32>(buffers.size());
+    // Rasterizer::BindTexturesFromSet's key: 0 marks an empty set slot, so it is never 0 here.
+    stage.texture_set_key =
+        XXH3_64bits_withSeed(hashes.data(), hashes.size() * sizeof(u64),
+                             reinterpret_cast<u64>(&info)) |
+        1;
 }
 
 /// Rasterizer::BindVertexBuffers' pure part (GraphicsPipeline::GetVertexInputs for the dynamic
