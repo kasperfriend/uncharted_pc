@@ -13,10 +13,16 @@
 //  * A busy guest thread at normal priority preempts the command thread mid-draw. The command
 //    thread therefore runs one step above the process.
 //
+//  * a thread the command thread waits on inside a frame -- the recorder it kicks with a chunk,
+//    the landing thread a guest-visible label waits behind, the copy pool a host copy runs on --
+//    is a helper by every other measure (it is idle most of the time, and it was left below
+//    normal priority on purpose), so Windows may clock it down as background work. The command
+//    thread then waits on a thread running at half speed. Those threads are raised here.
+//
 // Everything here is a hint to the scheduler: nothing is pinned, so a machine that needs its
 // cores for something else still gets them. All settings are read once, from
 // bbgpu_init(), and can be overridden with BB_CPU_PRIORITY (normal, above, high, realtime).
-// On platforms other than Windows this file does nothing: the helper policy is in
+// On platforms other than Windows none of this applies: the helper policy is in
 // bbport_threads.h, and there is no per-process throttle to opt out of.
 
 #pragma once
@@ -106,6 +112,19 @@ inline void InitCommandThread() {
     (void)done;
 }
 
+/// Called on the threads the command thread waits on within a frame (the recorder, the landing
+/// thread, the copy pool): they are idle most of the time, so a scheduler that watches their
+/// duty cycle may treat them as background work, and the command thread then spends its frame
+/// waiting on a thread that runs slower than the ones it preempted. Cheap after the first call.
+inline void InitSyncThread() {
+    static thread_local const bool done = [] {
+        Detail::AllowExecutionSpeed(::GetCurrentThread(), false);
+        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+        return true;
+    }();
+    (void)done;
+}
+
 #else
 
 /// No per-process throttle to opt out of; the helper policy is in bbport_threads.h.
@@ -114,6 +133,10 @@ inline void InitProcess() {}
 /// Nothing to raise without privileges: a thread that is not the game's own keeps the
 /// scheduler's default share.
 inline void InitCommandThread() {}
+
+/// The same: a thread created by the port starts at the process's own share, and raising it
+/// above the guest's threads would only trade one wait for another.
+inline void InitSyncThread() {}
 
 #endif
 

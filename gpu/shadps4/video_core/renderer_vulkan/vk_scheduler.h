@@ -606,6 +606,13 @@ public:
         if (offset + sizeof(Command) > Capacity) {
             return false;
         }
+        // bbport: almost every recorded closure holds only handles, spans and numbers, so its
+        // destructor is a no-op call through a vtable slot. One command in a chunk that owns
+        // something (a std::function, a string) turns the destructor calls of the whole chunk
+        // back on: one branch per chunk instead of one indirect call per command.
+        if constexpr (!std::is_trivially_destructible_v<std::decay_t<Func>>) {
+            destroys = true;
+        }
         auto* command = new (storage + offset) Command(std::forward<Func>(func));
         if (last) {
             last->next = command;
@@ -635,14 +642,23 @@ public:
     }
 
     void Execute(vk::CommandBuffer cmdbuf) {
-        for (CommandBase* command = first; command;) {
-            CommandBase* const next = command->next;
-            command->Execute(cmdbuf);
-            command->~CommandBase();
-            command = next;
+        if (destroys) {
+            for (CommandBase* command = first; command;) {
+                CommandBase* const next = command->next;
+                command->Execute(cmdbuf);
+                command->~CommandBase();
+                command = next;
+            }
+        } else {
+            for (CommandBase* command = first; command;) {
+                CommandBase* const next = command->next;
+                command->Execute(cmdbuf);
+                command = next;
+            }
         }
         first = last = nullptr;
         used = 0;
+        destroys = false;
         overflow.clear();
     }
 
@@ -682,6 +698,8 @@ private:
 
     alignas(64) std::byte storage[Capacity];
     size_t used = 0;
+    /// At least one command in this chunk owns something its destructor must release.
+    bool destroys = false;
     std::vector<std::unique_ptr<std::byte[]>> overflow;
     CommandBase* first{};
     CommandBase* last{};

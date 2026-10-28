@@ -215,6 +215,14 @@ echo '== descriptor writes per draw in the recording chunk'
     -mno-bmi2 -mtune=core-avx-i -mprefer-vector-width=128 -Wall -Wextra -Werror \
     tests/bench_record_data.cpp -o "$out/bench-record-data"
 "$out/bench-record-data"
+# What walking the recorded commands costs: the virtual destructor call per command that a chunk
+# of closures owning nothing no longer makes, and one pass over the descriptor writes in place of
+# one per info member (vk_scheduler.h, vk_pipeline_common.cpp).
+echo '== recorded commands and descriptor writes per draw'
+"$cxx" -std=c++20 -O2 -g -march=x86-64-v2 -mavx -mf16c -mno-avx2 -mno-fma -mno-bmi \
+    -mno-bmi2 -mtune=core-avx-i -mprefer-vector-width=128 -Wall -Wextra -Werror \
+    tests/bench_record_walk.cpp -o "$out/bench-record-walk"
+"$out/bench-record-walk"
 echo '== target memo lookup cost (256-byte zero-filled key against the per-call key)'
 "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -march=x86-64-v2 -mavx -mf16c -mno-avx2 \
     -mno-fma -mno-bmi -mno-bmi2 -mtune=core-avx-i -mprefer-vector-width=128 -Igpu/shadps4 \

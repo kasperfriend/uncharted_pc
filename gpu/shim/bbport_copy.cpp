@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "bbport_cpu.h"
 #include "bbport_toggles.h"
 #include "common/spin_wait.h"
 #include "common/thread.h"
@@ -202,6 +203,8 @@ private:
 
     void Loop(unsigned index) {
         Common::SetCurrentThreadName(("bb:Copy" + std::to_string(index)).c_str());
+        // A wait for copies runs on the command thread inside the frame (bbport_cpu.h).
+        BbCpu::InitSyncThread();
         u64 seen = 0;
         std::unique_lock lk{mutex};
         while (true) {

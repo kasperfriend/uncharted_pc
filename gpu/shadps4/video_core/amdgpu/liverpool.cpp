@@ -136,14 +136,19 @@ void Liverpool::Process(std::stop_token stoken) {
 
     while (!stoken.stop_requested()) {
         {
-            const auto idle_start = std::chrono::steady_clock::now();
+            // bbport: the idle clock is a diagnostic; without the stats it would still cost two
+            // clock reads and a locked add on every submission.
+            const auto idle_start = BbStats::enabled ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
-            BbStats::gpu_idle_ns.fetch_add(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - idle_start).count(),
-                std::memory_order_relaxed);
+            if (BbStats::enabled) {
+                BbStats::gpu_idle_ns.fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - idle_start).count(),
+                    std::memory_order_relaxed);
+            }
         }
         if (stoken.stop_requested()) {
             break;

@@ -16,29 +16,45 @@ namespace Vulkan {
 namespace {
 
 /// bbport: copies each run of contiguous descriptor infos into the recording chunk and points the
-/// writes that refer to them at the copies (the chunk is what outlives the vectors here).
+/// writes that refer to them at the copies (the chunk is what outlives the vectors here). Returns
+/// the index of the first write past the run that starts at `i`.
 template <typename T>
-void CopyWriteInfos(Scheduler& scheduler, vk::WriteDescriptorSet* writes, size_t count,
-                    const T* vk::WriteDescriptorSet::*member) {
+size_t CopyRun(Scheduler& scheduler, vk::WriteDescriptorSet* writes, size_t i, size_t count,
+               const T* vk::WriteDescriptorSet::*member) {
+    const T* const base = writes[i].*member;
+    size_t total = writes[i].descriptorCount;
+    size_t j = i + 1;
+    // An entry of another member has this one null, so the comparison alone ends the run.
+    while (j < count && (writes[j].*member) == base + total) {
+        total += writes[j].descriptorCount;
+        ++j;
+    }
+    // One RecordData() per run: an allocation in the chunk, its capacity checks and its
+    // prefetches cost more than the few dozen bytes they carry.
+    const auto copied = scheduler.RecordData(std::span<const T>{base, total});
+    size_t offset = 0;
+    for (size_t k = i; k < j; ++k) {
+        writes[k].*member = copied.data() + offset;
+        offset += writes[k].descriptorCount;
+    }
+    return j;
+}
+
+/// The same walk, once over the writes instead of once per info member: each entry names the
+/// member its infos are in (the other two are null), so the three passes that used to read every
+/// entry are one pass that reads it once.
+void CopyWriteInfos(Scheduler& scheduler, vk::WriteDescriptorSet* writes, size_t count) {
     for (size_t i = 0; i < count;) {
-        const T* base = writes[i].*member;
-        if (!base) {
+        const auto& write = writes[i];
+        if (write.pBufferInfo) {
+            i = CopyRun(scheduler, writes, i, count, &vk::WriteDescriptorSet::pBufferInfo);
+        } else if (write.pImageInfo) {
+            i = CopyRun(scheduler, writes, i, count, &vk::WriteDescriptorSet::pImageInfo);
+        } else if (write.pTexelBufferView) {
+            i = CopyRun(scheduler, writes, i, count, &vk::WriteDescriptorSet::pTexelBufferView);
+        } else {
             ++i;
-            continue;
         }
-        size_t total = writes[i].descriptorCount;
-        size_t j = i + 1;
-        while (j < count && (writes[j].*member) == base + total) {
-            total += writes[j].descriptorCount;
-            ++j;
-        }
-        const auto copied = scheduler.RecordData(std::span{base, total});
-        size_t offset = 0;
-        for (size_t k = i; k < j; ++k) {
-            writes[k].*member = copied.data() + offset;
-            offset += writes[k].descriptorCount;
-        }
-        i = j;
     }
 }
 
@@ -98,10 +114,7 @@ void Pipeline::BindResources(DescriptorWrites set_writes,
         // consecutive writes are usually consecutive entries of one vector: copy a run of them
         // with one RecordData() (an allocation in the chunk, its capacity checks and its
         // prefetches cost more than the few dozen bytes they carry) instead of one per write.
-        CopyWriteInfos(scheduler, patched, writes.size(), &vk::WriteDescriptorSet::pBufferInfo);
-        CopyWriteInfos(scheduler, patched, writes.size(), &vk::WriteDescriptorSet::pImageInfo);
-        CopyWriteInfos(scheduler, patched, writes.size(),
-                       &vk::WriteDescriptorSet::pTexelBufferView);
+        CopyWriteInfos(scheduler, patched, writes.size());
         scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
             cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
         });

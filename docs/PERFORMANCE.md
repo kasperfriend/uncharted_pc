@@ -633,6 +633,36 @@ below-normal threads the command thread waits for — which is exactly what the 
 policy makes them look like. `BB_CPU_PRIORITY=normal|high|realtime` overrides the class
 (default: `above`).
 
+## Walking what was recorded
+
+A draw hands the recording thread three commands and the descriptor writes they carry
+(`docs/PERFORMANCE.md` above, `docs/parallel_gpu.md`). Both walks that follow the recording were
+reading more than they used to.
+
+- **The descriptor writes were walked once per info member.** A write points its infos through
+  one of three members (`pBufferInfo`, `pImageInfo`, `pTexelBufferView`) and leaves the other two
+  null, but `CopyWriteInfos()` walked the whole array for each member: three reads of every write
+  to find the same runs of contiguous infos. It walks once now, dispatching on the member the
+  entry names, and copies the run where it finds it — **58.4 ns a draw to 39.9 ns, 32 % less**
+  (median of five runs, `tests/bench_record_walk.cpp`, 24 writes a draw; a quiet machine measures
+  72.0 against 43.4). That is 15 to 29 ns a draw, **30 to 57 µs per 2000-draw frame**, on the
+  thread that records every draw.
+- **Every command's virtual destructor was called after it ran**, although almost every recorded
+  closure holds only handles, spans and numbers and destroys nothing. A chunk now remembers
+  whether any of its commands owns something and takes the walk without destructor calls when
+  none does. One indirect call per command is below what `tests/bench_record_walk.cpp` can
+  resolve (it moves by less than the run-to-run spread), so nothing is claimed for it; the branch
+  is once per chunk, not once per command.
+- **The threads the command thread waits on now run at frame priority.** The recorder (kicked
+  with every chunk), the landing thread (a guest-visible label waits behind it) and the copy pool
+  (a host copy the command thread waits for) are idle most of the time, which is exactly what
+  Windows' background throttling looks for: the command thread was waiting for a thread the OS
+  was free to clock down. `BbCpu::InitSyncThread()` (gpu/shim/bbport_cpu.h) opts them out of the
+  execution-speed throttle and puts them at normal priority — not above it, so a busy guest still
+  preempts them. Nothing is pinned.
+- **The command thread's idle clock is off with the stats.** `BbStats::gpu_idle_ns` read the clock
+  twice per submission for a number only `BB_FRAME_STATS` prints.
+
 ## Measuring
 
 - `BB_DCB_STATS=1` prints the GPU thread's per-frame counters (see `docs/parallel_gpu.md`).

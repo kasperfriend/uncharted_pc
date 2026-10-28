@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 #include "bbport_copy.h"
+#include "bbport_cpu.h"
 #include "bbport_toggles.h"
 #include "common/thread.h"
 #include "video_core/landing_gate.h"
@@ -517,6 +518,8 @@ bool BufferCache::ExecuteLanding(Landing& landing) {
 
 void BufferCache::LandingWorker() {
     Common::SetCurrentThreadName("bb:Landing");
+    // Guest-visible labels wait behind this thread inside a frame (bbport_cpu.h).
+    BbCpu::InitSyncThread();
     std::unique_lock lk{landing_mutex};
     for (;;) {
         landing_cv.wait(lk, [&] {
