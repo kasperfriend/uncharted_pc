@@ -174,9 +174,19 @@ inline std::atomic<std::uint64_t> echoed_pipelines{0}, echoed_pushes{0}, echoed_
 
 /// Counts a diagnostic event. With BB_FRAME_STATS off this is a branch on a constant false: no
 /// counter, no cache line, and none of the locked read-modify-writes the counters are.
-inline void Count(std::atomic<std::uint64_t>& counter, std::uint64_t by = 1) {
+template <typename T, typename U = T>
+inline void Count(std::atomic<T>& counter, U by = U{1}) {
     if (enabled) {
-        counter.fetch_add(by, std::memory_order_relaxed);
+        counter.fetch_add(static_cast<T>(by), std::memory_order_relaxed);
+    }
+}
+
+/// The reverse of Count(): a counter that is counted up in one place and down in another (the
+/// hot pages one is) must be gated on both sides, or it drifts below zero with the stats off.
+template <typename T, typename U = T>
+inline void Uncount(std::atomic<T>& counter, U by = U{1}) {
+    if (enabled) {
+        counter.fetch_sub(static_cast<T>(by), std::memory_order_relaxed);
     }
 }
 } // namespace BbStats

@@ -1163,17 +1163,20 @@ bool Rasterizer::FilterDrawPasses() const {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* prepared) {
     RENDERER_TRACE;
-    BbStats::draws.fetch_add(1, std::memory_order_relaxed);
+    BbStats::Count(BbStats::draws);
 
     // bbport: with the draw pipeline this thread only selects the pipeline and hands the draw
     // to the recording thread (DrawRecord there); draws FilterDraw handles itself run here.
     const bool pipelined = UseDrawPipe();
-    if (pipelined && !FilterDrawPasses() &&
-        !BbToggle::Disabled(BbToggle::PipelinedMemoryWrites)) {
+    // bbport: the two questions below ask FilterDraw's checks; asking them once also keeps the
+    // third ask further down honest -- nothing between here and there changes a register when
+    // the draw takes the pipelined path (FilterDraw only runs when it does not).
+    const bool filter_passes = FilterDrawPasses();
+    if (pipelined && !filter_passes && !BbToggle::Disabled(BbToggle::PipelinedMemoryWrites)) {
         PostDraw(nullptr, nullptr, false, 0);
         return;
     }
-    if (!pipelined || !FilterDrawPasses()) {
+    if (!pipelined || !filter_passes) {
         DrainDrawPipe(DrawPipe::ReasonDraw);
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
@@ -1191,7 +1194,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
     if (!pipeline) {
         return;
     }
-    if (pipelined && FilterDrawPasses()) {
+    if (pipelined && filter_passes) {
         PostDraw(pipeline, used_prepared, is_indexed, index_offset);
         return;
     }
@@ -2029,7 +2032,7 @@ void Rasterizer::ReadBackSmallWrittenBuffers() {
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
-    BbStats::dispatches.fetch_add(1, std::memory_order_relaxed);
+    BbStats::Count(BbStats::dispatches);
     // bbport: like draws, handed to the draw recording thread after the pipeline selection.
     const bool pipelined = UseDrawPipe() && !BbToggle::Disabled(BbToggle::PipelinedDispatch);
     if (!pipelined) {
@@ -4018,8 +4021,8 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     }
     push_data.scene_size = reduced ? SceneResolution::Pack(scene_targets->Size()) : 0;
     if (BbStats::enabled) {
-        BbStats::reduced_draws.fetch_add(reduced, std::memory_order_relaxed);
-        BbStats::scene_draws.fetch_add(scene_started, std::memory_order_relaxed);
+        BbStats::Count(BbStats::reduced_draws, reduced);
+        BbStats::Count(BbStats::scene_draws, scene_started);
     }
     RenderState state;
     state.width = instance.GetMaxFramebufferWidth();

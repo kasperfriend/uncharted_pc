@@ -286,7 +286,7 @@ private:
             if (writeable.Get(page)) {
                 continue; // not protected: no fault
             }
-            BbStats::tracker_faults.fetch_add(1, std::memory_order_relaxed);
+            BbStats::Count(BbStats::tracker_faults);
             if (!hot_enabled) {
                 continue;
             }
@@ -300,7 +300,7 @@ private:
                 }
                 hot.Set(page);
                 ++num_hot;
-                BbStats::hot_pages.fetch_add(1, std::memory_order_relaxed);
+                BbStats::Count(BbStats::hot_pages);
             }
         }
     }
@@ -312,7 +312,7 @@ private:
         if (!HotPagesEnabled() ||
             std::chrono::steady_clock::now() - hot_since > HotPeriod) {
             // Re-protect them (on this upload) and start counting again.
-            BbStats::hot_pages.fetch_sub(num_hot, std::memory_order_relaxed);
+            BbStats::Uncount(BbStats::hot_pages, num_hot);
             hot.Clear();
             write_faults.fill(0);
             num_hot = 0;

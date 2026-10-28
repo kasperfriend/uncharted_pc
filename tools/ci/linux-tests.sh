@@ -269,6 +269,15 @@ echo '== waits: pause cost, hand-off and idle waits, guest small timers'
     tests/bench_wait.cpp -o "$out/bench-wait"
 "$out/bench-wait"
 
+# What a draw's bookkeeping costs when it does nothing: the diagnostic counters (locked
+# read-modify-writes per draw and per fault, now a branch when BB_FRAME_STATS is off) and
+# Rasterizer::Draw() asking FilterDrawPasses() three times for one answer.
+echo '== per-draw bookkeeping: gated counters and the repeated draw filter'
+"$cxx" -std=c++20 -O2 -g -march=x86-64-v2 -mavx -mf16c -mno-avx2 -mno-fma -mno-bmi \
+    -mno-bmi2 -mtune=core-avx-i -mprefer-vector-width=128 -Wall -Wextra -Werror \
+    -Igpu/shim tests/bench_cpu.cpp -o "$out/bench-cpu"
+"$out/bench-cpu"
+
 echo '== streaming guest-memory copy'
 "$cxx" -std=c++20 -O2 -g -Wall -Wextra -Werror -mavx -Igpu/shim tests/test_stream_copy.cpp \
     gpu/shim/bbport_memcpy.cpp -o "$out/stream-copy-test"

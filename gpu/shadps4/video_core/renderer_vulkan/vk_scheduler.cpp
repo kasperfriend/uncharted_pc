@@ -14,6 +14,7 @@
 #endif
 #include <functional>
 
+#include "bbport_cpu.h"
 #include "bbport_copy.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/landing_gate.h"
@@ -300,7 +301,7 @@ void Scheduler::WaitDeferredSignals() {
 void Scheduler::WaitHostCopies() {
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
         BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
-        BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
+        BbStats::Count(BbStats::host_copy_waits);
         KickRecording(true);
         u32 spins = 0;
         while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
@@ -470,6 +471,9 @@ void Scheduler::PopPendingOperations() {
 }
 
 void Scheduler::AllocateWorkerCommandBuffers() {
+    // bbport: whichever thread records here (the GPU command thread or the draw recording one)
+    // is on the frame's critical path; see bbport_cpu.h. Cheap after the first call.
+    BbCpu::InitCommandThread();
     const vk::CommandBufferBeginInfo begin_info = {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };

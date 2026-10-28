@@ -1448,7 +1448,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         draw_prep->EndSubmission();
     }
     if (seq != NoSeq && BbStats::enabled) {
-        BbStats::submissions.fetch_add(1, std::memory_order_relaxed);
+        BbStats::Count(BbStats::submissions);
 #ifndef _WIN32 // bbport: per-thread rusage statistics are Linux-only
         if (rusage usage{}; getrusage(RUSAGE_THREAD, &usage) == 0) {
             BbStats::gpu_user_us.store(u64(usage.ru_utime.tv_sec) * 1000000 + usage.ru_utime.tv_usec,

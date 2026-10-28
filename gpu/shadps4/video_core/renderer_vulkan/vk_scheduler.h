@@ -829,11 +829,6 @@ public:
         echo_stats = true;
     }
 
-    /// Returns the current pipeline dynamic state tracking.
-    DynamicState& GetDynamicState() {
-        return dynamic_state;
-    }
-
     /// Returns the current command buffer for recording on the calling thread. With threaded
     /// recording this first waits until all commands passed to Record() are recorded, then
     /// records directly (Record() included, so callers may mix both) until the next

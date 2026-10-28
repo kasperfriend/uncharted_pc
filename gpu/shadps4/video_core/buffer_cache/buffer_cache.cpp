@@ -188,7 +188,10 @@ bool BufferCache::DownloadOnSideQueue(VAddr page, u64 length) {
     if (!side_queue) {
         return false;
     }
-    const auto start_time = std::chrono::steady_clock::now();
+    // bbport: read only for the stall statistics (BB_FRAME_STATS): every side-queue download
+    // would otherwise take two clock reads of a fault handler's path.
+    const auto start_time = BbStats::enabled ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
     // The pages around the fault whose GPU data is complete come along: the guest fills its
     // rings page after page, and each would fault and wait for a round trip of its own.
     constexpr u64 Window = 64_KB;
@@ -316,11 +319,12 @@ bool BufferCache::DownloadOnSideQueue(VAddr page, u64 length) {
         gpu_modified_ranges.Subtract(at, TRACKER_BYTES_PER_PAGE);
         memory_tracker->UnmarkRegionAsGpuModified(at, TRACKER_BYTES_PER_PAGE);
     }
-    BbStats::gpu_side_download_ns.fetch_add(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
-                                                             start_time)
-            .count(),
-        std::memory_order_relaxed);
+    if (BbStats::enabled) {
+        BbStats::Count(BbStats::gpu_side_download_ns,
+                       std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - start_time)
+                           .count());
+    }
     return true;
 }
 
@@ -782,7 +786,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
             const u32 gpu_use = LastGpuUse(page, length);
             if (DownloadOnSideQueue(page, length)) {
                 memory_tracker->MarkRegionAsCpuModified(device_addr, size);
-                BbStats::gpu_side_downloads.fetch_add(1, std::memory_order_relaxed);
+                BbStats::Count(BbStats::gpu_side_downloads);
                 NoteFault(page, length, frames, gpu_write, gpu_use, 4);
                 return;
             }
@@ -791,19 +795,19 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
                 gpu_modified_ranges.Subtract(page, length);
                 memory_tracker->UnmarkRegionAsGpuModified(page, length);
                 memory_tracker->MarkRegionAsCpuModified(device_addr, size);
-                BbStats::dead_gpu_drops.fetch_add(1, std::memory_order_relaxed);
+                BbStats::Count(BbStats::dead_gpu_drops);
                 NoteFault(page, length, frames, gpu_write, gpu_use, 1);
                 return;
             }
             if (merge) {
                 ShadowGpuData(page, length);
                 memory_tracker->MarkRegionAsCpuModified(device_addr, size);
-                BbStats::gpu_merges.fetch_add(1, std::memory_order_relaxed);
+                BbStats::Count(BbStats::gpu_merges);
                 NoteFault(page, length, frames, gpu_write, gpu_use, 2);
                 return;
             }
             ReadMemory(device_addr, size, true, true);
-            BbStats::gpu_read_backs.fetch_add(1, std::memory_order_relaxed);
+            BbStats::Count(BbStats::gpu_read_backs);
             NoteFault(page, length, frames, gpu_write, gpu_use, 3);
         };
         if (assume_locks) {
@@ -1684,7 +1688,7 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
     if (copies.empty()) {
         return nullptr;
     }
-    BbStats::buffer_upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+    BbStats::Count(BbStats::buffer_upload_bytes, total_size_bytes);
     const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
     // bbport: the guest memory is copied into staging on the copy threads, started now in
     // groups of about 1 MiB; submission and guest-visible fences wait for them

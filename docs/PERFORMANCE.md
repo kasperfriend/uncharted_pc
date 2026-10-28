@@ -602,6 +602,37 @@ milliseconds does not need a fresh look every few milliseconds. `Instance::Query
 answer for 4 ms, which is well below the rate at which the collector's own accounting moves (it
 decides about images the frame just used, not about a heap that changed in the last millisecond).
 
+## Bookkeeping a draw should not pay for (`video_core/`, `gpu/shim/`)
+
+Three things in the per-draw path were doing none of the draw's work:
+
+- **The diagnostics.** Every draw bumped six counters (draws, dispatches, the reduced-scene pair,
+  the buffer cache's tracker faults and hot pages), every fault two more and every side-queue
+  download another: each is a locked read-modify-write on a cache line other threads take over
+  too, and all of them are read by nothing but the `BB_FRAME_STATS` print. `BbStats::Count()` is
+  a branch on a constant when the stats are off — `tests/bench_cpu.cpp` measures **30.3 ns/draw
+  against 0.5 ns, ~60 µs per 2000-draw frame**. The counter that is counted down as well as up
+  (`hot_pages`) had to be gated on both sides (`BbStats::Uncount()`), or it drifts below zero
+  with the stats off, and the site that read the clock for its counter
+  (`gpu_side_download_ns`) now only reads it with the stats on.
+- **`Rasterizer::Draw()` asked `FilterDrawPasses()` three times** — the pipelined early-out, its
+  own `if`, and the choice between the draw pipe and the direct path — for one answer that can
+  only change if `FilterDraw()` runs in between, which it does only when the draw is *not*
+  pipelined. It is asked once now: **1.46 ns a call, 2.3 ns a draw** (`tests/bench_cpu.cpp`),
+  ~5 µs per 2000-draw frame.
+- **`Common::Thread::AccurateSleep`**, the presenter's frame pacing, created and closed a waitable
+  timer around every sleep: four kernel calls per frame, and the plain timer only wakes on the
+  system's clock tick. It keeps one high-resolution timer per thread now — one kernel call per
+  sleep, and it sleeps to the requested deadline instead of to the tick.
+
+The process and its command threads also ask the OS for their share of the CPU once, in
+`gpu/shim/bbport_cpu.h` (from `bbgpu_init()` and the first command buffer of a recording thread):
+the execution-speed power throttle (Windows 11's EcoQoS) is off for the process and its threads,
+and the process runs above normal priority. Left on, Windows is free to clock down the
+below-normal threads the command thread waits for — which is exactly what the port's helper
+policy makes them look like. `BB_CPU_PRIORITY=normal|high|realtime` overrides the class
+(default: `above`).
+
 ## Measuring
 
 - `BB_DCB_STATS=1` prints the GPU thread's per-frame counters (see `docs/parallel_gpu.md`).
@@ -622,8 +653,8 @@ same `.github/actions/windows-build` the release uses) and runs the host-side te
 `tools/ci/linux-tests.sh` stages the host-side checks one at a time — the instruction rewriting,
 the guest runtime's synchronization and file layer, the bit arrays, the page-use table, the
 register fold, the per-draw benches, the binding echo (`tests/test_binding_echo.cpp`,
-`tests/bench_echo.cpp`) — then reruns the memory-checking ones under ASan and UBSan and the guest
-synchronization under ThreadSanitizer.
+`tests/bench_echo.cpp`) and the per-draw bookkeeping (`tests/bench_cpu.cpp`) — then reruns the
+memory-checking ones under ASan and UBSan and the guest synchronization under ThreadSanitizer.
 
 A failed build step's log is only reachable through a signed URL, so the Windows build step
 tees the build output and turns the error lines into annotations of the run and the tail into the

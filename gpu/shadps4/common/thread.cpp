@@ -3,6 +3,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <ctime>
 #include <string>
 #include <thread>
@@ -107,17 +108,42 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
     SetThreadPriority(handle, windows_priority);
 }
 
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+// Not every SDK this builds against declares it (Windows 10 1803 and later accept it).
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    const bool interruptible) {
     const auto begin_sleep = std::chrono::high_resolution_clock::now();
 
-    LARGE_INTEGER interval{
-        .QuadPart = -1 * (duration.count() / 100u),
+    // bbport: one timer object per thread, not one per sleep. The presenter sleeps once per
+    // frame; creating and closing a timer around it was four kernel calls (create, set, wait,
+    // close) and the plain timer only woke on the system's clock tick. The high-resolution
+    // variant sleeps on the requested deadline instead, so the frame pacing error shrinks too.
+    struct ThreadTimer {
+        HANDLE handle = ::CreateWaitableTimerExW(nullptr, nullptr,
+                                                 CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                 TIMER_ALL_ACCESS);
+        ThreadTimer() {
+            if (!handle) {
+                handle = ::CreateWaitableTimerW(nullptr, TRUE, nullptr);
+            }
+        }
     };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
-    SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
+    thread_local const ThreadTimer thread_timer;
+    const HANDLE timer = thread_timer.handle;
+    if (!timer) {
+        return false;
+    }
+
+    LARGE_INTEGER interval{
+        .QuadPart = -std::max<long long>(1, duration.count() / 100u),
+    };
+    if (!SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0)) {
+        return false;
+    }
     const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
-    ::CloseHandle(timer);
 
     if (remaining) {
         const auto end_sleep = std::chrono::high_resolution_clock::now();
