@@ -13,6 +13,36 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
+namespace {
+
+/// bbport: copies each run of contiguous descriptor infos into the recording chunk and points the
+/// writes that refer to them at the copies (the chunk is what outlives the vectors here).
+template <typename T>
+void CopyWriteInfos(Scheduler& scheduler, vk::WriteDescriptorSet* writes, size_t count,
+                    const T* vk::WriteDescriptorSet::*member) {
+    for (size_t i = 0; i < count;) {
+        const T* base = writes[i].*member;
+        if (!base) {
+            ++i;
+            continue;
+        }
+        size_t total = writes[i].descriptorCount;
+        size_t j = i + 1;
+        while (j < count && (writes[j].*member) == base + total) {
+            total += writes[j].descriptorCount;
+            ++j;
+        }
+        const auto copied = scheduler.RecordData(std::span{base, total});
+        size_t offset = 0;
+        for (size_t k = i; k < j; ++k) {
+            writes[k].*member = copied.data() + offset;
+            offset += writes[k].descriptorCount;
+        }
+        i = j;
+    }
+}
+
+} // namespace
 
 Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorHeap& desc_heap_,
                    const Shader::Profile& profile_, vk::PipelineCache pipeline_cache,
@@ -61,41 +91,10 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
         // consecutive writes are usually consecutive entries of one vector: copy a run of them
         // with one RecordData() (an allocation in the chunk, its capacity checks and its
         // prefetches cost more than the few dozen bytes they carry) instead of one per write.
-        const size_t count = writes.size();
-        const auto coalesce = [&scheduler, patched, count](auto get, auto set) {
-            for (size_t i = 0; i < count;) {
-                const auto* base = get(patched[i]);
-                if (!base) {
-                    ++i;
-                    continue;
-                }
-                size_t total = patched[i].descriptorCount;
-                size_t j = i + 1;
-                while (j < count && get(patched[j]) == base + total) {
-                    total += patched[j].descriptorCount;
-                    ++j;
-                }
-                const auto copied = scheduler.RecordData(std::span{base, total});
-                size_t offset = 0;
-                for (size_t k = i; k < j; ++k) {
-                    set(patched[k], copied.data() + offset);
-                    offset += patched[k].descriptorCount;
-                }
-                i = j;
-            }
-        };
-        coalesce([](const vk::WriteDescriptorSet& write) { return write.pBufferInfo; },
-                 [](vk::WriteDescriptorSet& write, const vk::DescriptorBufferInfo* infos) {
-                     write.pBufferInfo = infos;
-                 });
-        coalesce([](const vk::WriteDescriptorSet& write) { return write.pImageInfo; },
-                 [](vk::WriteDescriptorSet& write, const vk::DescriptorImageInfo* infos) {
-                     write.pImageInfo = infos;
-                 });
-        coalesce([](const vk::WriteDescriptorSet& write) { return write.pTexelBufferView; },
-                 [](vk::WriteDescriptorSet& write, const vk::BufferView* views) {
-                     write.pTexelBufferView = views;
-                 });
+        CopyWriteInfos(scheduler, patched, writes.size(), &vk::WriteDescriptorSet::pBufferInfo);
+        CopyWriteInfos(scheduler, patched, writes.size(), &vk::WriteDescriptorSet::pImageInfo);
+        CopyWriteInfos(scheduler, patched, writes.size(),
+                       &vk::WriteDescriptorSet::pTexelBufferView);
         scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
             cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
         });
