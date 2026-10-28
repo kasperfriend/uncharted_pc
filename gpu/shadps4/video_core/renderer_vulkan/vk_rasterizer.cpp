@@ -539,13 +539,12 @@ struct PacketStage {
 constexpr u32 AlignPacket(u32 size) {
     return (size + 7) & ~7u;
 }
-u32 VerifyInterval() {
-    static const u32 interval = [] {
-        const char* env = std::getenv("BB_PIPE_VERIFY");
-        return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
-    }();
-    return interval;
-}
+/// bbport: read once, at startup. A function-local static costs its guard variable (an acquire
+/// load and a branch) on every call, and this is asked once per draw.
+const u32 VerifyInterval = [] {
+    const char* env = std::getenv("BB_PIPE_VERIFY");
+    return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+}();
 } // namespace
 
 bool Rasterizer::DrawPipeWanted() {
@@ -759,7 +758,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     if (indirect) {
         size += AlignPacket(sizeof(IndirectDraw));
     }
-    const u32 interval = VerifyInterval();
+    const u32 interval = VerifyInterval;
     const bool verify = interval && (draw_pipe->packets % interval) == 0;
     if (verify) {
         size += sizeof(AmdGpu::Regs);
@@ -1289,6 +1288,11 @@ const char* LiveShaderDebugFile() {
     return path;
 }
 
+/// bbport: whether the live debug file is configured, read once at startup. The draw path asks
+/// this a few times per draw and per buffer binding, and a function-local static answers it with
+/// its guard variable (an acquire load and a branch) every time.
+const bool LiveShaderDebugOn = std::getenv("BB_SHADER_DEBUG_FILE") != nullptr;
+
 LiveShaderDebug& LiveDebug() {
     static LiveShaderDebug state;
     const char* path = LiveShaderDebugFile();
@@ -1350,6 +1354,32 @@ LiveShaderDebug& LiveDebug() {
 }
 } // namespace
 
+namespace {
+/// bbport: a shader hash list from an environment variable, read once at startup.
+std::vector<u64> HashListFromEnv(const char* name, bool truncate) {
+    std::vector<u64> list;
+    const char* env = std::getenv(name);
+    if (!env) {
+        return list;
+    }
+    for (const char* p = env; *p;) {
+        char* end;
+        const u64 value = std::strtoull(p, &end, 16);
+        if (end == p) {
+            break;
+        }
+        list.push_back(truncate ? u64(u32(value)) : value);
+        p = *end == ',' ? end + 1 : end;
+    }
+    return list;
+}
+const std::vector<u64> JitteredShaders = HashListFromEnv("BB_JITTER_PS", true);
+const std::vector<u64> SkippedShaders = HashListFromEnv("BB_SKIP_SHADERS", false);
+/// True when no draw can be skipped: neither list is set nor is the live debug file. Asked twice
+/// per draw, so it is one bool rather than two guarded static vectors.
+const bool SkippingConfigured = !SkippedShaders.empty() || LiveShaderDebugOn;
+} // namespace
+
 // bbport: BB_JITTER_PS=<pixel shader hash>,... (run.py, Uncharted): full-screen passes that
 // rebuild positions from the scene depth through an interpolated texture coordinate, jittered
 // like the scene geometry. Unjittered, they reconstructed each pixel from depth that was
@@ -1357,25 +1387,11 @@ LiveShaderDebug& LiveDebug() {
 // every jitter step and flickered under FSR and TAA, worst on the largest steps (every 4th
 // frame). The live "jitter" line of BB_SHADER_DEBUG_FILE adds shaders for tests.
 static bool JitterFullScreenPass(u64 hash) {
-    static const std::vector<u64> listed = [] {
-        std::vector<u64> list;
-        if (const char* env = std::getenv("BB_JITTER_PS")) {
-            for (const char* p = env; *p;) {
-                char* end;
-                const u64 value = std::strtoull(p, &end, 16);
-                if (end == p) {
-                    break;
-                }
-                list.push_back(u64(u32(value)));
-                p = *end == ',' ? end + 1 : end;
-            }
-        }
-        return list;
-    }();
-    if (std::find(listed.begin(), listed.end(), u64(u32(hash))) != listed.end()) {
+    if (std::find(JitteredShaders.begin(), JitteredShaders.end(), u64(u32(hash))) !=
+        JitteredShaders.end()) {
         return true;
     }
-    if (!LiveShaderDebugFile()) {
+    if (!LiveShaderDebugOn) {
         return false;
     }
     auto& live = LiveDebug();
@@ -1391,7 +1407,10 @@ static bool JitterFullScreenPass(u64 hash) {
 // bbport: BB_SKIP_SHADERS=<hash>,...: draws and dispatches of these pixel/compute shaders
 // are not recorded (diagnostic: which pass of a frame causes a visual problem).
 static bool SkipShader(u64 hash) {
-    if (hash && LiveShaderDebugFile()) {
+    if (!SkippingConfigured) {
+        return false;
+    }
+    if (hash && LiveShaderDebugOn) {
         auto& live = LiveDebug();
         const u32 count = live.num_skipped.load(std::memory_order_acquire);
         for (u32 i = 0; i < count; ++i) {
@@ -1400,22 +1419,8 @@ static bool SkipShader(u64 hash) {
             }
         }
     }
-    static const std::vector<u64> skipped = [] {
-        std::vector<u64> list;
-        if (const char* env = std::getenv("BB_SKIP_SHADERS")) {
-            for (const char* p = env; *p;) {
-                char* end;
-                const u64 value = std::strtoull(p, &end, 16);
-                if (end == p) {
-                    break;
-                }
-                list.push_back(value);
-                p = *end == ',' ? end + 1 : end;
-            }
-        }
-        return list;
-    }();
-    return hash && std::find(skipped.begin(), skipped.end(), hash) != skipped.end();
+    return hash &&
+           std::find(SkippedShaders.begin(), SkippedShaders.end(), hash) != SkippedShaders.end();
 }
 
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
@@ -2945,13 +2950,15 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
 namespace {
 /// bbport diagnosis: BB_WATCH_GPU_WRITE=<address>: GPU writes into the 4 KiB from there are printed.
-VAddr WatchedGpuWrite() {
-    static const VAddr value = [] {
-        const char* env = std::getenv("BB_WATCH_GPU_WRITE");
-        return env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
-    }();
-    return value;
-}
+const VAddr WatchedGpuWrite = [] {
+    const char* env = std::getenv("BB_WATCH_GPU_WRITE");
+    return env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
+}();
+/// bbport: the buffer-binding diagnostics, read once. Each was a function-local static inside the
+/// per-buffer loop, so every binding of every draw paid its guard variable.
+const bool ForceBufferUpload = std::getenv("BB_FORCE_VB_UPLOAD") != nullptr;
+const bool RingCheck = std::getenv("BB_RING_CHECK") != nullptr;
+const bool WarnMetaTexture = std::getenv("BB_WARN_META_TEXTURE") != nullptr;
 } // namespace
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
@@ -2999,8 +3006,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         const RingBinding* ring = num_ring_stages ? FindRingBinding(stage, buffer_index) : nullptr;
         if (ring) {
             // Copied by the GPU command thread into the constant ring (read-only).
-            static const bool ring_check = std::getenv("BB_RING_CHECK") != nullptr;
-            if (ring_check && !desc.IsSpecial() && memory->IsValidGpuMapping(ring->address, 0)) {
+            if (RingCheck && !desc.IsSpecial() && memory->IsValidGpuMapping(ring->address, 0)) {
                 const u8* copied = constant_ring->Data(ring->offset);
                 const u8* now = reinterpret_cast<const u8*>(ring->address);
                 if (std::memcmp(copied, now, ring->size) != 0) {
@@ -3117,10 +3123,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
-                static const bool force_upload = std::getenv("BB_FORCE_VB_UPLOAD") != nullptr;
-                if ((force_upload || (ForceUploadVs(false) &&
-                                      ForceUploadVs(false) == u32(stage.pgm_hash))) &&
-                    !desc.is_written) {
+                // One setting read, not two: the value is the shader hash this pull applies to.
+                const u32 force_upload_vs = desc.is_written ? 0 : ForceUploadVs(false);
+                if (!desc.is_written &&
+                    (ForceBufferUpload ||
+                     (force_upload_vs != 0 && force_upload_vs == u32(stage.pgm_hash)))) {
                     buffer_cache.ForceUpload(vsharp.base_address, size);
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
@@ -3143,7 +3150,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
-                if (const VAddr watch = WatchedGpuWrite();
+                if (const VAddr watch = WatchedGpuWrite;
                     watch && desc.is_written && vsharp.base_address < watch + 0x1000 &&
                     watch < vsharp.base_address + size) {
                     static std::atomic<u32> reported{0};
@@ -3220,7 +3227,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
     }();
     u64 trace_hash = env_trace_hash;
     u32 trace_generation = 0;
-    if (LiveShaderDebugFile()) {
+    if (LiveShaderDebugOn) {
         auto& live = LiveDebug();
         if (const u64 live_hash = live.trace.load(std::memory_order_relaxed)) {
             trace_hash = live_hash;
@@ -3338,8 +3345,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         const auto tsharp =
             prepared ? prepared->image_sharps[image_index] : image_desc.GetSharp(stage);
         // bbport: a hash lookup per texture per draw for a diagnostic only.
-        static const bool warn_meta = std::getenv("BB_WARN_META_TEXTURE") != nullptr;
-        if (warn_meta && texture_cache.IsMeta(tsharp.Address())) {
+        if (WarnMetaTexture && texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
 
@@ -4195,7 +4201,8 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
     DrainDrawPipe();
-    if (const VAddr watch = WatchedGpuWrite(); watch && !dst_gds && dst < watch + 0x1000 && watch < dst + num_bytes) {
+    if (const VAddr watch = WatchedGpuWrite;
+        watch && !dst_gds && dst < watch + 0x1000 && watch < dst + num_bytes) {
         static std::atomic<u32> reported{0};
         if (reported.fetch_add(1, std::memory_order_relaxed) < 20) {
             std::printf("Watch: DMA copy 0x%llx <- 0x%llx (%u bytes), dst gpu modified %d, src gpu "
