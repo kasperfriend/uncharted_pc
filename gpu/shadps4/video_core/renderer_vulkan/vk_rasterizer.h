@@ -418,7 +418,7 @@ private:
     //
     // The key is the concatenation of exactly the bytes the call was given, stored at the size
     // of the call's parts: it used to be a zero-filled 256-byte array, which cost a 256-byte
-    // store (and on a miss a hash over all 256 bytes) per attachment per draw.
+    // store per attachment per draw and kept 256 bytes in every memo entry.
     // Entries live as long as the image they resolved to: an *unrelated* image being registered
     // or collected used to invalidate all of them (RegistryGeneration), several times a frame
     // while streaming.

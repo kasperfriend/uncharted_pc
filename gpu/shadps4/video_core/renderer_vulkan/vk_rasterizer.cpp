@@ -3768,9 +3768,13 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                     (unsigned long long)texture_set_why[2], (unsigned long long)texture_set_why[3]);
         std::printf("  scene proxies sampled directly: %llu bindings\n",
                     static_cast<unsigned long long>(proxy_samples));
+        std::printf("  render targets: %llu memo hits, %llu misses\n",
+                    static_cast<unsigned long long>(target_memo_hits),
+                    static_cast<unsigned long long>(target_memo_misses));
         proxy_samples = 0;
         texture_set_why = {};
         begin_memo_hits = begin_memo_misses = texture_set_hits = texture_set_misses = 0;
+        target_memo_hits = target_memo_misses = 0;
     }
     BeginSignature signature;
     if (memo_on) {

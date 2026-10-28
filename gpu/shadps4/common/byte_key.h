@@ -11,12 +11,12 @@ namespace Common {
 
 /// bbport: a memo key that is exactly the bytes of the values it was given, in order.
 ///
-/// The render-target and render-state memos key on a handful of guest registers (a C# or Z#
-/// register, its extent hint, the depth view: 20 to 80 bytes). They used to build the key in a
-/// zero-filled 256-byte array -- a 256-byte store per attachment per draw, and a hash over all
-/// 256 bytes on a miss, most of which had never been written. This stores only the bytes that
-/// were appended and compares only those. `bytes` is never read past `size`, so it needs no
-/// zero fill; a fresh key is empty and matches nothing.
+/// The render-target memos key on a handful of guest registers (a C# or Z# register, its extent
+/// hint, the depth view: 56 to 68 bytes). They used to build the key in a zero-filled 256-byte
+/// array -- a 256-byte store per attachment per draw, and the same 256 bytes copied into the
+/// memo entries on a miss. This stores only the bytes that were appended and compares only
+/// those. `bytes` is never read past `size`, so it needs no zero fill; a fresh key is empty and
+/// matches nothing.
 template <std::size_t MaxBytes>
 struct ByteKey {
     static constexpr std::size_t Capacity = MaxBytes;
