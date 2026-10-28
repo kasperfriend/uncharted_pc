@@ -27,6 +27,9 @@ std::array<u64, 4> g_gpu_crash_addresses{};
 u32 g_gpu_crash_address_count = 0;
 // bbport: the draws and dispatches the GPU last reached (BB_GPU_CHECKPOINTS=1).
 void (*g_gpu_checkpoint_report)() = nullptr;
+// bbport: subsystem records for a device lost (the tiling dispatches and the buffers they were
+// given, video_core/texture_cache/tile_manager.cpp).
+void (*g_gpu_crash_detail)() = nullptr;
 extern bool g_device_fault_ext;
 } // namespace Vulkan
 namespace VideoCore {
@@ -89,6 +92,9 @@ namespace Vulkan {
     }
     if (g_gpu_crash_context) {
         g_gpu_crash_context();
+    }
+    if (g_gpu_crash_detail) {
+        g_gpu_crash_detail();
     }
     if (g_gpu_stall_report) {
         g_gpu_stall_report();

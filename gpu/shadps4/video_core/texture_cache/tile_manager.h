@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <unordered_map>
 #include <utility>
 #include <boost/container_hash/hash.hpp>
@@ -52,10 +54,24 @@ public:
     std::pair<const Buffer*, u64> DetileImage(const VideoCore::Buffer* in_buffer, u64 in_offset,
                                               const ImageInfo& info);
 
+    /// bbport: what the last tiling dispatches were given (device lost reports). A write outside
+    /// a buffer is otherwise only visible as "the nearest tracked buffer was N bytes below the
+    /// faulting address"; with this, the dispatch whose output range does not hold its own texels
+    /// is named.
+    struct DispatchRecord {
+        u64 tiled_address{}, tiled_size{}, linear_address{}, linear_size{};
+        u64 covered{}, guest_size{};
+        u32 dim_x{}, texels{}, num_mips{}, num_bits{};
+        bool tiler{};
+    };
+    static constexpr u32 DispatchRecords = 32;
+
 private:
     void RecordTilingDispatch(vk::Pipeline pipeline, const vk::DescriptorBufferInfo& tiled,
                               const vk::DescriptorBufferInfo& linear,
                               const vk::DescriptorBufferInfo& params, u32 dim_x);
+    void NoteDispatch(const DispatchRecord& record);
+    void DumpDispatches() const;
 
     vk::Pipeline GetTilingPipeline(const ImageInfo& info, bool is_tiler);
 
@@ -67,6 +83,8 @@ private:
     vk::UniqueDescriptorSetLayout desc_layout;
     vk::UniquePipelineLayout pl_layout;
     std::unordered_map<TilingKey, vk::UniquePipeline, TilingKey::Hash> tiling_pipelines;
+    std::array<DispatchRecord, DispatchRecords> dispatches{};
+    std::atomic<u64> dispatch_seq{0};
 };
 
 } // namespace VideoCore

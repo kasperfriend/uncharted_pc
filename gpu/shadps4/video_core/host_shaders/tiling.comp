@@ -103,6 +103,9 @@ layout (set = 0, binding = 2, scalar) uniform TilingInfo {
     uint bank_swizzle;
     uint num_slices;
     uint num_mips;
+    // bbport: the texels the filled mips hold, so a dispatch of whole workgroups cannot address
+    // past them (VideoCore::TilingInfo has the same field in the same place).
+    uint num_texels;
     MipInfo mips[16];
 } info;
 
@@ -413,10 +416,16 @@ uint32_t ComputeSurfaceAddrFromCoordMacroTiled(uint32_t x, uint32_t y, uint32_t 
 }
 #endif
 
+// bbport: the loop stops on the last mip it was given. It used to also stop when the walk
+// reached info.num_mips, but only after stepping onto mips[num_mips] - an entry the host does
+// not fill - and then addressed the surface with that entry's pitch, height and offset. A
+// dispatch whose texels put it there (a guest size that does not match the mips filled, or a
+// mip list truncated to the arena) wrote a garbage offset into the output buffer: a device
+// lost. Texels past the last mip stay on it now.
 uint GetMipLevel(inout uint texel) {
     uint mip = 0;
     uint mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
-    while (texel >= mip_size && mip < info.num_mips) {
+    while (texel >= mip_size && mip + 1 < info.num_mips) {
         texel -= mip_size;
         ++mip;
         mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
@@ -426,10 +435,16 @@ uint GetMipLevel(inout uint texel) {
 
 void main() {
     uint texel = gl_GlobalInvocationID.x;
+    if (texel >= info.num_texels) {
+        return;
+    }
     uint mip = GetMipLevel(texel);
     uint pitch = info.mips[mip].pitch;
     uint height = info.mips[mip].height;
     uint tiled_offset = info.mips[mip].offset;
+    if (pitch == 0 || height == 0) {
+        return;
+    }
     uint x = texel % pitch;
     uint y = (texel / pitch) % height;
     uint slice = texel / (pitch * height);

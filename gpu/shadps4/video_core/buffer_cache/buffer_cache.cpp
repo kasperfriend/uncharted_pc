@@ -1859,10 +1859,14 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
         if (arena_offset + mip_info.offset + mip_info.size > arena->size_bytes) {
             break;
         }
+        // bbport: a row length below the extent the copy writes makes the transfer undefined
+        // (Vulkan requires the buffer row to hold the whole row of the image), and the extent
+        // comes from the image size while the pitch comes from the tiling maths: they disagree
+        // for block-compressed and rounded mips. The copy is bounded by the larger of the two.
         buffer_copies.push_back(vk::BufferImageCopy{
             .bufferOffset = mip_info.offset,
-            .bufferRowLength = mip_info.pitch,
-            .bufferImageHeight = mip_info.height,
+            .bufferRowLength = std::max(mip_info.pitch, width),
+            .bufferImageHeight = std::max(mip_info.height, height),
             .imageSubresource{
                 .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
                 .mipLevel = mip,

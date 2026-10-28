@@ -23,8 +23,16 @@
 #include "video_core/host_shaders/tiling_micro_8_comp.h"
 #include "video_core/host_shaders/tiling_micro_96_comp.h"
 
+#include <atomic>
+#include <cstdio>
+#include <limits>
 #include <magic_enum/magic_enum.hpp>
 #include <vk_mem_alloc.h>
+
+namespace Vulkan {
+/// bbport: printed by the device-lost report (vk_semaphore.cpp).
+extern void (*g_gpu_crash_detail)();
+} // namespace Vulkan
 
 namespace VideoCore {
 
@@ -32,12 +40,48 @@ struct TilingInfo {
     u32 bank_swizzle;
     u32 num_slices;
     u32 num_mips;
+    u32 num_texels; ///< the texels the filled mips hold (the shader's hard bound)
     std::array<ImageInfo::MipInfo, 16> mips;
 };
+
+namespace {
+/// bbport: the bytes the filled mips of a tiling dispatch cover. The dispatch is sized from this
+/// and not from the image's guest size: the shader walks the mip list by subtracting mip sizes,
+/// so a texel past the last filled mip used to step onto the entry after it - which the host does
+/// not fill - and address the surface with that entry's pitch, height and offset (a write to a
+/// garbage offset, i.e. a device lost). Clamping the shader's walk fixes the addressing; sizing
+/// the dispatch from the covered mips makes the mismatch impossible in the first place.
+u64 CoveredBytes(const TilingInfo& params) {
+    u64 covered = 0;
+    for (u32 mip = 0; mip < params.num_mips && mip < params.mips.size(); ++mip) {
+        covered += params.mips[mip].size;
+    }
+    return covered;
+}
+
+/// bbport: the parameters of a tiling dispatch that does not fit its buffer, printed a few times
+/// (the crash report of a device lost then names the dispatch that could write outside it).
+void ReportTilingMismatch(const char* what, const ImageInfo& info, const TilingInfo& params,
+                          u64 covered) {
+    static std::atomic<u32> printed{0};
+    if (printed.fetch_add(1, std::memory_order_relaxed) >= 8) {
+        return;
+    }
+    std::printf("Tiling: %s of a %ux%u image (%u levels, %u filled, %u bits): the filled mips "
+                "cover 0x%llx bytes of the 0x%llx-byte guest size; dispatching the covered bytes\n",
+                what, info.size.width, info.size.height, info.resources.levels, params.num_mips,
+                info.num_bits, static_cast<unsigned long long>(covered),
+                static_cast<unsigned long long>(info.guest_size));
+}
+} // namespace
 
 TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, StreamBuffer& stream_buffer_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, stream_buffer{stream_buffer_} {
+    // bbport: a device lost prints the tiling dispatches recorded so far (see DispatchRecord).
+    static TileManager* crash_report;
+    crash_report = this;
+    Vulkan::g_gpu_crash_detail = [] { crash_report->DumpDispatches(); };
     const auto device = instance.GetDevice();
     const std::array<vk::DescriptorSetLayoutBinding, 3> bindings = {{
         {
@@ -193,6 +237,36 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
     return handle;
 }
 
+void TileManager::NoteDispatch(const DispatchRecord& record) {
+    dispatches[dispatch_seq.fetch_add(1, std::memory_order_relaxed) % DispatchRecords] = record;
+}
+
+void TileManager::DumpDispatches() const {
+    const u64 total = dispatch_seq.load(std::memory_order_relaxed);
+    if (total == 0) {
+        return;
+    }
+    std::printf("GPU crash: last tiling dispatches (%llu recorded):\n",
+                static_cast<unsigned long long>(total));
+    const u64 oldest = total > DispatchRecords ? total - DispatchRecords : 0;
+    u32 printed = 0;
+    for (u64 n = total; n > oldest && printed < 8; --n) {
+        const auto& r = dispatches[(n - 1) % DispatchRecords];
+        std::printf("GPU crash:   %s #%llu %u mips %u bits %u texels (%u groups): tiled "
+                    "0x%llx+0x%llx, linear 0x%llx+0x%llx, covers 0x%llx of guest 0x%llx%s\n",
+                    r.tiler ? "tile" : "detile", static_cast<unsigned long long>(n - 1),
+                    r.num_mips, r.num_bits, r.texels, r.dim_x,
+                    static_cast<unsigned long long>(r.tiled_address),
+                    static_cast<unsigned long long>(r.tiled_size),
+                    static_cast<unsigned long long>(r.linear_address),
+                    static_cast<unsigned long long>(r.linear_size),
+                    static_cast<unsigned long long>(r.covered),
+                    static_cast<unsigned long long>(r.guest_size),
+                    r.covered > r.tiled_size ? " OUT OF THE TILED BUFFER" : "");
+        ++printed;
+    }
+}
+
 void TileManager::RecordTilingDispatch(vk::Pipeline pipeline, const vk::DescriptorBufferInfo& tiled,
                                        const vk::DescriptorBufferInfo& linear,
                                        const vk::DescriptorBufferInfo& params, u32 dim_x) {
@@ -235,7 +309,9 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     TilingInfo params{};
     params.bank_swizzle = info.bank_swizzle;
     params.num_slices = info.props.is_volume ? info.size.depth : info.resources.layers;
-    params.num_mips = info.resources.levels;
+    // bbport: the mip array of the shader's parameter block is 16 entries; an image with more
+    // levels wrote past it (the stack of this function) and the shader read whatever followed.
+    params.num_mips = std::min<u32>(info.resources.levels, static_cast<u32>(params.mips.size()));
     for (u32 mip = 0; mip < params.num_mips; ++mip) {
         auto& mip_info = params.mips[mip];
         mip_info = info.mips_layout[mip];
@@ -244,6 +320,21 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
             mip_info.height = std::max((mip_info.height + 3) / 4, 1U);
         }
     }
+
+    // bbport: the texels the filled mips hold, not the image's guest size (see CoveredBytes).
+    const u64 covered = CoveredBytes(params);
+    if (covered != info.guest_size) {
+        ReportTilingMismatch("detile", info, params, covered);
+    }
+    if (covered == 0 || info.num_bits == 0) {
+        return {in_buffer, in_offset};
+    }
+    // bbport: every texel of the filled mips, and no texel past the last one (the shader stops
+    // at num_texels), so the dispatch cannot address outside the buffers it was given.
+    const u32 texels = static_cast<u32>(
+        std::min<u64>(covered / (info.num_bits / 8), std::numeric_limits<u32>::max()));
+    const u32 dim_x = (texels + 63) / 64;
+    params.num_texels = texels;
 
     const vk::DescriptorBufferInfo params_buffer_info{
         .buffer = stream_buffer.Handle(),
@@ -266,7 +357,17 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         .offset = staging.offset,
         .range = info.guest_size,
     };
-    const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
+    NoteDispatch({.tiled_address = in_buffer->BufferDeviceAddress(),
+                  .tiled_size = in_buffer->SizeBytes(),
+                  .linear_address = staging.buffer->BufferDeviceAddress(),
+                  .linear_size = staging.buffer->SizeBytes(),
+                  .covered = covered,
+                  .guest_size = info.guest_size,
+                  .dim_x = dim_x,
+                  .texels = texels,
+                  .num_mips = params.num_mips,
+                  .num_bits = info.num_bits,
+                  .tiler = false});
     // bbport: recorded with copies of the descriptor infos (threaded recording).
     RecordTilingDispatch(GetTilingPipeline(info, false), tiled_buffer_info, linear_buffer_info,
                          params_buffer_info, dim_x);
@@ -292,7 +393,9 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     TilingInfo params{};
     params.bank_swizzle = info.bank_swizzle;
     params.num_slices = info.props.is_volume ? info.size.depth : info.resources.layers;
-    params.num_mips = static_cast<u32>(buffer_copies.size());
+    // bbport: 16 mips is what the shader's parameter block holds (see DetileImage).
+    params.num_mips = std::min<u32>(static_cast<u32>(buffer_copies.size()),
+                                    static_cast<u32>(params.mips.size()));
     for (u32 mip = 0; mip < params.num_mips; ++mip) {
         auto& mip_info = params.mips[mip];
         mip_info = info.mips_layout[mip];
@@ -301,6 +404,20 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
             mip_info.height = std::max((mip_info.height + 3) / 4, 1U);
         }
     }
+
+    // bbport: the texels the filled mips hold, not the image's guest size (see CoveredBytes).
+    const u64 covered = CoveredBytes(params);
+    if (covered != info.guest_size) {
+        ReportTilingMismatch("tile", info, params, covered);
+    }
+    if (covered == 0 || info.num_bits == 0) {
+        return;
+    }
+    // bbport: every texel of the filled mips, and no texel past the last one (see DetileImage).
+    const u32 texels = static_cast<u32>(
+        std::min<u64>(covered / (info.num_bits / 8), std::numeric_limits<u32>::max()));
+    const u32 dim_x = (texels + 63) / 64;
+    params.num_texels = texels;
 
     const vk::DescriptorBufferInfo params_buffer_info{
         .buffer = stream_buffer.Handle(),
@@ -326,7 +443,17 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         .offset = staging.offset,
         .range = info.guest_size,
     };
-    const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
+    NoteDispatch({.tiled_address = out_buffer->BufferDeviceAddress(),
+                  .tiled_size = out_buffer->SizeBytes(),
+                  .linear_address = staging.buffer->BufferDeviceAddress(),
+                  .linear_size = staging.buffer->SizeBytes(),
+                  .covered = covered,
+                  .guest_size = info.guest_size,
+                  .dim_x = dim_x,
+                  .texels = texels,
+                  .num_mips = params.num_mips,
+                  .num_bits = info.num_bits,
+                  .tiler = true});
     // bbport: recorded with copies of the descriptor infos (threaded recording).
     RecordTilingDispatch(GetTilingPipeline(info, true), tiled_buffer_info, linear_buffer_info,
                          params_buffer_info, dim_x);

@@ -643,3 +643,75 @@ Verified without a GPU by replaying the reported address against the arena, resi
 arithmetic (`/tmp/crash_logic.cpp`, checks the guest-range verdict, the would-be device address and
 that a clamped gap never publishes an entry outside its arena). The full report and the clamp run
 only on faults, residency and the crash path: nothing here is on the per-draw path.
+
+## Second device lost: the tiling shader walked past its mip list (2026-10-28)
+
+The next log (same machine) came with the new report and ruled the arena theory out on its own
+terms: `0 clamped resident ranges`, `459 residency events`, and the faulting write
+`0x10e7622000` was **not** in any arena's device range, with no residency decision covering its
+page. So no page-table entry of the port produced it. The driver also named the buffers it knows:
+`nearest 0x10e6400000-0x10e7400000 aliveDeviceLocal, 0x222000 away` - a 16 MiB `DeviceLocal`
+buffer (the staging pool's ring blocks for tiled images are 16 MiB) written 2.1 MiB past its end.
+
+That the write lands *just* past a buffer the port allocates, in a frame that also streamed
+thousands of pages, points at the compute shader that converts between tiled and linear images -
+the one place where a shader indexes a buffer by an address computed from a mip table. Reading it,
+the table walk was:
+
+```glsl
+uint GetMipLevel(inout uint texel) {
+    uint mip = 0;
+    uint mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
+    while (texel >= mip_size && mip < info.num_mips) {   // checked *after* stepping
+        texel -= mip_size;
+        ++mip;
+        mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
+    }
+    return mip;
+}
+```
+
+A texel past the last filled mip leaves `mip == num_mips` and `main()` then addresses the surface
+with `mips[num_mips]` - an entry the host never fills. Its pitch, height and offset are zeros, so
+`x = texel % 0`, `y = (texel / 0) % 0` and `tiled_offset = 0` go through the tiling arithmetic as
+undefined values; whatever they multiply out to is used as a buffer index. With a real mip list
+those entries are stack garbage instead: either way the address is arbitrary, and the write lands
+wherever it lands - a few MiB past a buffer is exactly the shape of it.
+
+Two ways a dispatch asks for texels the mips do not cover:
+
+* `dim_x` was computed from the image's guest size (`guest_size / bytes_per_pixel / 64`), but the
+  shader subtracts *mip sizes* to find the mip of a texel. The two agree only when `guest_size` is
+  the sum of the filled mips. It is not when the mip list is truncated to fit the arena
+  (`SynchronizeMemoryFromImage` stops at a mip that does not fit), when an image has more than 16
+  levels (the parameters hold 16), or for a linear array whose later `mips_layout` entries were
+  never filled.
+* The parameter block held `num_mips` entries of which the shader happily read one more.
+
+Changed:
+
+* the shader's walk stops on the last filled mip (`mip + 1 < info.num_mips`), so a stray texel
+  stays on the last mip and addresses a real surface instead of an unfilled entry;
+* the parameter block carries `num_texels` (a `uint` after `num_mips`, both sides of the copy in
+  the same order) and the shader returns before computing an address when its texel is past it:
+  the dispatch can now be a whole number of workgroups without ever asking for a texel beyond the
+  data;
+* `num_mips` is clamped to the 16 entries the block holds on the CPU side too, both when it comes
+  from `resources.levels` and from the number of copies (it was an out-of-bounds write to
+  `TilingInfo::mips` - the stack of `DetileImage`/`TileImage` - for an image with more levels);
+* the dispatch is sized from the bytes the *filled mips* cover, not from `guest_size`, and a
+  mismatch between the two is printed (at most 8 times) with the image size, levels, filled mips
+  and both sizes - the case that used to over-dispatch silently;
+* image-to-buffer copies take `bufferRowLength`/`bufferImageHeight` as the larger of the mip's
+  pitch/height and the extent they copy (a row length below the extent makes the transfer
+  undefined, and the two come from different places for block-compressed and rounded mips);
+* the staging pool no longer dereferences `StreamBuffer::Reserve`'s optional without checking it
+  (a garbage offset handed to a shader would be the same kind of fault);
+* the device-lost report prints the last 32 tiling dispatches - tiled and linear buffer addresses
+  and sizes, covered bytes against guest size, workgroup count - so the next one of these names
+  the dispatch whose output range cannot hold its own texels.
+
+All of it is on the tiling and crash paths; nothing was added to a draw. Checked without a GPU by
+replaying the walk and the bound (`/tmp/chk_tile.cpp`): no texel, dispatched or not, leaves the
+filled mip list, the last texel stays on the last mip, and a truncated list covers only its own
+mips.
