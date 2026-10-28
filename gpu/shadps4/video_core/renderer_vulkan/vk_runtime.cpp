@@ -722,6 +722,11 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
 }
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
+    if (mip >= dst->info.mips_layout.size()) {
+        // bbport: the mip list is 16 entries; a guest mip index past it indexed the array.
+        ReportTransferDrop("image mip copy", "mip list");
+        return;
+    }
     const auto dst_dim = dst->info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(dst->info.size.width >> (mip + dst_dim), 1u);
     const auto mip_block_h = std::max(dst->info.size.height >> (mip + dst_dim), 1u);
