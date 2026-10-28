@@ -425,9 +425,13 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     TilingInfo params{};
     params.bank_swizzle = info.bank_swizzle;
     params.num_slices = info.props.is_volume ? info.size.depth : info.resources.layers;
-    // bbport: 16 mips is what the shader's parameter block holds (see DetileImage).
-    params.num_mips = std::min<u32>(static_cast<u32>(buffer_copies.size()),
-                                    static_cast<u32>(params.mips.size()));
+    // bbport: 16 mips is what the shader's parameter block holds, and the image describes
+    // `resources.levels` of them: a caller that hands more copies than levels used to have the
+    // entries past the image's own read from mips_layout uninitialized, and their garbage pitch,
+    // height and offset (and their sizes, which the dispatch is sized from) reached the shader.
+    params.num_mips = std::min<u32>(
+        std::min<u32>(static_cast<u32>(buffer_copies.size()), info.resources.levels),
+        static_cast<u32>(params.mips.size()));
     for (u32 mip = 0; mip < params.num_mips; ++mip) {
         auto& mip_info = params.mips[mip];
         mip_info = info.mips_layout[mip];
@@ -453,12 +457,22 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     const u64 tiled_bytes = std::min<u64>(info.guest_size, out_buffer->SizeBytes() - out_offset);
     params.tiled_bytes = static_cast<u32>(std::min<u64>(tiled_bytes, ~u32{0}));
 
-    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
-    if (staging.size < info.guest_size) {
+    // bbport: the download below fills this dispatch's linear side and the shader reads all the
+    // covered texels from it, so the scratch is sized from the copies as well as from the covered
+    // texels. A copy's geometry is as wide as the image's *pitch* (the caller bounds the row by
+    // max(pitch, width)), which is more than the mip's own size for the levels it rounds up; the
+    // reservation used to be the guest size alone, so the widest copies wrote past it - into the
+    // next reservation of the block, or past the block when it ended near it (a write a few MiB
+    // past a 16 MiB device-local block, which is what the crash reports showed).
+    u64 needed = info.guest_size;
+    for (const auto& copy : buffer_copies) {
+        needed = std::max<u64>(needed, copy.bufferOffset + Vulkan::Runtime::BufferImageCopyBytes(
+                                                                 copy, info.pixel_format));
+    }
+    const auto staging = runtime.GetStagingPool().Request(needed, MemoryType::DeviceLocal);
+    if (staging.size < needed) {
         return;
     }
-    // bbport: the download below fills this dispatch's linear side and the shader reads all the
-    // covered texels from it, so both are sized from what the pool granted (see DetileImage).
     if (covered > staging.size) {
         static std::atomic<u32> printed{0};
         if (printed.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -485,7 +499,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         copy.bufferOffset += staging.offset;
     }
 
-    runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);
+    runtime.DownloadImage(&in_image, staging.buffer, buffer_copies, staging.offset, staging.size);
     runtime.FlushBarriers();
 
     const vk::DescriptorBufferInfo tiled_buffer_info{

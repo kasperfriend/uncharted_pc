@@ -776,6 +776,24 @@ device-local staging block* - the detiling scratch pool's own memory - and was p
 the draw timeline, four on the present one, a chain of submissions behind them. Two separate
 things were left to find: what can index past that scratch, and what the stall is waiting for.
 
+**The tiling download wrote past its reservation.** `TileManager::TileImage` fills the detiling
+scratch with `Runtime::DownloadImage` and then runs the tiling dispatch over it. The scratch was
+reserved for the image's *guest size*, but the copies handed to the download are as wide as the
+image's *pitch* - `buffer_cache` bounds each copy's row by `max(mip_pitch, width)`, because a row
+length below the extent the copy writes is undefined - so a copy can be wider than the mip's own
+size (the pitch is rounded up per level). Round 13 cut a copy to the *whole buffer* it names; the
+16 MiB staging *block* is bigger than the reservation inside it, so a copy that reached past the
+reservation but not past the block passed the check and wrote into the block's next allocation, or
+past the end of the block when the reservation ended near it. That is a write a few MiB past a
+16 MiB device-local block: the driver does not map it, the device is lost, and the crash report
+could not name the copy because it never left the host as an out-of-range region.
+
+Two things fix it. The scratch is now reserved for `max(guest_size, widest copy end)`, so a copy
+never needs to be dropped, and `Runtime::DownloadImage` takes the reservation (`offset`, `size`)
+and cuts any copy that would still reach past it (naming it, "image download"). The same function
+also answers `BufferImageCopyBytes` - the copy geometry the driver uses - which is what the reserve
+is computed with, so the two cannot drift apart.
+
 **The tiling scratch had a bound on one side only.** Round 13 bounded the *tiled* side
 (`tiled_bytes`, computed by the host from the buffer the guest data sits in) but the *linear* side
 was bounded by nothing at all in the shader: `linear_data[gl_GlobalInvocationID.x]` with the index
@@ -801,7 +819,10 @@ Both are gone now, and neither fix depends on the host being right:
 * `TileManager` sizes the dispatch from what the staging pool *granted* (`linear_bytes =
   min(covered, staging.size)`, and `staging.size` is the reservation, not the request), sets both
   descriptor ranges to the same span (`staging.size`, `tiled_bytes`), and prints a line if the
-  covered texels ever do not fit the scratch (8 times) instead of silently overrunning it.
+  covered texels ever do not fit the scratch (8 times) instead of silently overrunning it;
+* `params.num_mips` is bounded by the image's own level count as well as by the 16-entry array, so
+  a caller that hands more copies than levels cannot have the entries past the image's own read
+  from `mips_layout` uninitialized (and their sizes reach the dispatch as its texel count).
 * the dispatch record of a crash report now holds the *bound* addresses (`buffer device address +
   bind offset`) and each buffer's remaining size, so the dump's `tiled .../linear ...` ranges can be
   compared with the fault address directly, and a covered span that does not fit either side is

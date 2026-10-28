@@ -136,13 +136,17 @@ void ReportTransferDrop(const char* what, const char* resource) {
     std::printf("Transfer: %s: a region names no part of its %s; dropped\n", what, resource);
 }
 
-/// The bytes a copy reads or writes at `bufferOffset`, or the reason it cannot fit.
+/// The bytes a copy reads or writes at `bufferOffset`, or the reason it cannot fit. `base` and
+/// `span_limit`: the reservation inside the buffer the copy may use (0 = the whole buffer), so a
+/// copy cannot reach into the next reservation of a staging block or past the block itself.
 [[nodiscard]] bool CopyFitsBuffer(const char* what, const vk::BufferImageCopy& copy,
-                                  const VideoCore::Buffer* buffer, vk::Format format) {
+                                  const VideoCore::Buffer* buffer, vk::Format format,
+                                  u64 base = 0, u64 span_limit = 0) {
     if (!buffer) {
         return true;
     }
-    const u64 limit = buffer->SizeBytes();
+    const u64 limit = span_limit != 0 ? std::min<u64>(buffer->SizeBytes(), base + span_limit)
+                                      : buffer->SizeBytes();
     if (copy.bufferOffset >= limit) {
         ReportTransferCut(what, "buffer", copy.bufferOffset, 0, limit);
         return false;
@@ -458,14 +462,32 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     }
 }
 
+u64 Runtime::BufferImageCopyBytes(const vk::BufferImageCopy& copy, vk::Format format) {
+    return BufferImageCopySize(copy, format);
+}
+
 void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
-                            std::span<const vk::BufferImageCopy> download_copies) {
+                            std::span<const vk::BufferImageCopy> download_copies,
+                            u64 limit_base, u64 limit_size) {
     SetBackingSamples(src, src->info.num_samples);
     scheduler.EndRendering();
     const TransferMark mark{*this, "image download", *src};
-    // bbport: cut to the buffer and to the image's own levels and layers (see FitCopies).
-    const auto fitted = FitCopies<boost::container::small_vector<vk::BufferImageCopy, 16>>(
-        "image download", download_copies, dst, src->CreateInfo(), src->info.pixel_format);
+    // bbport: cut to the buffer, to the reservation inside it and to the image's own levels and
+    // layers (see FitCopies). The copy geometry of a tiled image is as wide as its pitch, which
+    // can be larger than the mip's own size: the widest copies reached past the reservation of
+    // the staging block they were given, and a reservation that ends near the end of the block
+    // put that write past the block - a lost device, reported as a write a few MiB past a 16 MiB
+    // device-local block, which no log line named.
+    boost::container::small_vector<vk::BufferImageCopy, 16> fitted;
+    const vk::ImageCreateInfo& image_ci = src->CreateInfo();
+    for (vk::BufferImageCopy copy : download_copies) {
+        if (!CopyFitsBuffer("image download", copy, dst, src->info.pixel_format, limit_base,
+                            limit_size) ||
+            !FitCopyToImage("image download", copy, image_ci, src->info.pixel_format)) {
+            continue;
+        }
+        fitted.push_back(copy);
+    }
     if (fitted.empty()) {
         return;
     }
