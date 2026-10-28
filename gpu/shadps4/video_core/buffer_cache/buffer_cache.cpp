@@ -1611,6 +1611,16 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
+    // bbport: a read-only binding whose range holds no CPU-modified page needs no copy at all, and
+    // the tracker answers that with one bitmap scan over the range. Without this the call walked
+    // the range a page at a time (a 4 MiB storage buffer: 1024 pages, each with a lock-free check
+    // and a lambda), built the copy list and reached the upload callback with nothing to upload.
+    // A written binding, a texel buffer (whose image may hold the data) and a range with modified
+    // pages take the path below unchanged.
+    if (!is_written && !is_texel_buffer &&
+        !memory_tracker->IsRegionCpuModified(device_addr, size)) {
+        return false;
+    }
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     const Buffer* src_buffer{};

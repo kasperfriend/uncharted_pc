@@ -343,6 +343,16 @@ handful of instructions done a few thousand times a frame.
   straddles a step, in both toggle states and over random frames — inverting its store condition
   fails 2 494 of its 2 801 checks.
 
+- **Nothing to upload.** `SynchronizeMemory` runs for every read-only binding, and the answer is
+  usually that the guest has not touched the range since the GPU last read it: no page of it is
+  CPU-modified. The call used to reach that answer by walking the range a page at a time (a 4 MiB
+  storage buffer is 1 024 pages, each a region lookup, a lock-free bitmap test and a lambda),
+  filling a copy list that stayed empty and calling the upload callback with nothing to upload. It
+  now asks the tracker once over the whole range -- the same bitmap, scanned 64 pages at a time
+  by `BitArray::AnyInRange` (see the bit-array section) -- and returns before the copy list
+  exists: 16 words for that 4 MiB binding, one for a 4 KiB one. Written bindings and texel buffers
+  (whose data an image may hold) take the old path, as does any range with a modified page.
+
 Both can be switched off at runtime (`BB_TOGGLE_FILE`): `GpuUseStamp` for the stamping; the
 residency span has no toggle because it changes nothing observable, only how the same answer is
 reached.
